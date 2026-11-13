@@ -1,5 +1,5 @@
 import { LANGUAGES, detectInitialLang, tr } from './i18n.js';
-import { buildMiniAreaChart, fmtBytes, fmtRate, renderDetailChart } from './charts.js';
+import { buildMiniAreaChart, fmtRate, renderDetailChart } from './charts.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -26,6 +26,11 @@ function svgIcon(paths, viewBox = '0 0 24 24', fill = 'none') {
 }
 
 const ICONS = {
+  menu: () => svgIcon([
+    { d: 'M4 7h16' },
+    { d: 'M4 12h16' },
+    { d: 'M4 17h16' }
+  ]),
   wake: () => svgIcon([{ tag: 'polygon', points: '13 2 3 14 12 14 11 22 21 10 12 10 13 2' }]),
   suspend: () => svgIcon([
     { tag: 'rect', x: '6', y: '4', width: '4', height: '16', rx: '1' },
@@ -76,11 +81,6 @@ const ICONS = {
     { tag: 'rect', x: '2', y: '3', width: '20', height: '14', rx: '2' },
     { d: 'M8 21h8m-4-4v4' }
   ]),
-  download: () => svgIcon([
-    { d: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4' },
-    { d: 'M7 10l5 5 5-5' },
-    { d: 'M12 15V3' }
-  ]),
   close: () => svgIcon([{ d: 'M18 6 6 18M6 6l12 12' }]),
   trash: () => svgIcon([
     { d: 'M3 6h18' },
@@ -119,18 +119,7 @@ const state = {
   editingAccountId: null
 };
 
-let deferredInstallPrompt = null;
-const supportsWebInstall = typeof Navigator !== 'undefined' && typeof Navigator.prototype.install === 'function';
-const supportsInterestFor = typeof HTMLButtonElement !== 'undefined' && 'interestForElement' in HTMLButtonElement.prototype;
-const supportsHintPopover = (() => {
-  try {
-    const d = document.createElement('div');
-    d.popover = 'hint';
-    return d.popover === 'hint';
-  } catch {
-    return false;
-  }
-})();
+const vmCardRegistry = new Map();
 
 function readPref(key, def) {
   try {
@@ -167,13 +156,6 @@ function applyTheme(mode) {
   }
 }
 
-function cycleTheme() {
-  const order = ['system', 'light', 'dark'];
-  const next = order[(order.indexOf(state.theme) + 1) % order.length];
-  applyTheme(next);
-  render();
-}
-
 function t(key, vars) {
   return tr(state.lang, key, vars);
 }
@@ -197,6 +179,11 @@ function fmtCompactDuration(totalSeconds) {
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m`;
   return `${s}s`;
+}
+
+function setTextIfChanged(node, next) {
+  const s = String(next);
+  if (node && node.textContent !== s) node.textContent = s;
 }
 
 function el(tag, attrs = {}, children = []) {
@@ -319,8 +306,8 @@ function updateLiveClocks() {
     const vm = state.machines.find((m) => `${m.accountId}:${m.id}` === key);
     if (!vm) continue;
     const { text, mode } = formatClockDisplay(vm);
-    node.textContent = text;
-    node.dataset.mode = mode;
+    if (node.textContent !== text) node.textContent = text;
+    if (node.dataset.mode !== mode) node.dataset.mode = mode;
   }
 }
 
@@ -355,8 +342,7 @@ function createPasswordField({ id, name, label, hint, autocomplete, errorText, r
       input.type = showing ? 'password' : 'text';
       toggleBtn.setAttribute('aria-pressed', showing ? 'false' : 'true');
       toggleBtn.setAttribute('aria-label', showing ? t('showPassword') : t('hidePassword'));
-      toggleBtn.textContent = '';
-      toggleBtn.append(showing ? ICONS.eye() : ICONS.eyeOff());
+      toggleBtn.replaceChildren(showing ? ICONS.eye() : ICONS.eyeOff());
     }
   }, [ICONS.eye()]);
 
@@ -381,56 +367,227 @@ function createPasswordField({ id, name, label, hint, autocomplete, errorText, r
   return { field, input, sync };
 }
 
-function renderTopbar() {
-  const header = el('header', { className: 'topbar' });
-  const inner = el('div', { className: 'topbar-inner' });
+// ============================================================
+// Corner Hamburger Navigation Drawer (modern-web-guidance: navigation-drawer)
+// ============================================================
+let navDrawer = null;
+let drawerScroller = null;
+let drawerSheet = null;
+let drawerObserver = null;
+let drawerState = 'closed'; // 'closed' | 'opening' | 'open' | 'closing'
 
-  const brand = el('div', { className: 'brand' }, [
-    el('img', { className: 'brand-logo', src: '/assets/logo.svg', alt: '', width: '36', height: '36' }),
-    el('div', {}, [
-      el('div', { className: 'brand-title', textContent: t('appName') }),
-      el('div', { className: 'brand-sub', textContent: t('appSubtitle') })
-    ])
+function syncHamburgerExpanded(expanded) {
+  const openBtn = document.getElementById('drawer-open');
+  if (openBtn) openBtn.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+}
+
+function ensureNavDrawer() {
+  if (navDrawer) return navDrawer;
+
+  navDrawer = el('dialog', {
+    className: 'Drawer',
+    id: 'nav-drawer',
+    'aria-label': t('menuOpen')
+  });
+  drawerScroller = el('div', { className: 'Drawer-scroller' });
+  drawerSheet = el('nav', { className: 'Drawer-sheet' });
+
+  drawerScroller.append(drawerSheet);
+  navDrawer.append(drawerScroller);
+  document.body.append(navDrawer);
+
+  const visibleThreshold = 1 / Math.max(window.innerWidth, 320);
+  drawerObserver = new IntersectionObserver(
+    (entries) => {
+      const entry = entries.at(-1);
+      if (!entry || !navDrawer.open) return;
+      if (entry.intersectionRatio >= 0.1 && drawerState === 'opening') {
+        drawerState = 'open';
+      }
+      if (entry.intersectionRatio >= 0.98) {
+        drawerState = 'open';
+        syncHamburgerExpanded(true);
+      }
+      if (entry.intersectionRatio < visibleThreshold && (drawerState === 'open' || drawerState === 'closing')) {
+        drawerState = 'closed';
+        navDrawer.close();
+        syncHamburgerExpanded(false);
+      }
+    },
+    { root: navDrawer, threshold: [visibleThreshold, 0.1, 1] }
+  );
+  drawerObserver.observe(drawerSheet);
+
+  // Fallback for browsers without scroll-driven animations
+  if (!CSS.supports('animation-timeline: scroll()')) {
+    drawerScroller.addEventListener('scroll', () => {
+      const w = drawerSheet.offsetWidth || 1;
+      const ratio = Math.max(0, Math.min(1, 1 - drawerScroller.scrollLeft / w));
+      navDrawer.style.setProperty('--drawer-backdrop', String(ratio));
+    }, { passive: true });
+  }
+
+  // Light dismiss on backdrop tap outside the sheet
+  navDrawer.addEventListener('click', (event) => {
+    if (event.target.isConnected && !drawerSheet.contains(event.target)) {
+      closeDrawer();
+    }
+  });
+
+  // Escape key fires cancel -> animate slide-out instead of sudden snap
+  navDrawer.addEventListener('cancel', (event) => {
+    if (event.cancelable) {
+      event.preventDefault();
+      closeDrawer();
+    }
+  });
+
+  navDrawer.addEventListener('close', () => {
+    drawerState = 'closed';
+    syncHamburgerExpanded(false);
+  });
+
+  renderDrawerContent();
+  return navDrawer;
+}
+
+async function openDrawer() {
+  ensureNavDrawer();
+  renderDrawerContent();
+  drawerState = 'opening';
+  if (!navDrawer.open) {
+    navDrawer.showModal();
+  }
+  if (!CSS.supports('scroll-initial-target', 'nearest')) {
+    drawerScroller.scrollTo({ left: drawerScroller.offsetWidth, behavior: 'instant' });
+    await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+  }
+  drawerScroller.scrollTo({ left: 0, behavior: 'auto' });
+  syncHamburgerExpanded(true);
+}
+
+function closeDrawer() {
+  if (!navDrawer || !navDrawer.open) return;
+  drawerState = 'closing';
+  drawerScroller.scrollTo({ left: drawerScroller.offsetWidth, behavior: 'auto' });
+  setTimeout(() => {
+    if (navDrawer.open && drawerState === 'closing' && drawerScroller.scrollLeft >= (drawerSheet.offsetWidth - 4)) {
+      drawerState = 'closed';
+      navDrawer.close();
+      syncHamburgerExpanded(false);
+    }
+  }, 420);
+}
+
+async function triggerSyncAll() {
+  try {
+    const data = await apiFetch('/api/sync', { method: 'POST' });
+    applyMachinesPayload(data);
+    updateDashboardInPlace();
+    renderDrawerContent();
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+}
+
+function renderDrawerContent() {
+  if (!drawerSheet) return;
+  navDrawer.setAttribute('aria-label', t('menuOpen'));
+
+  const closeBtn = el('button', {
+    id: 'drawer-close',
+    type: 'button',
+    className: 'btn btn-icon-only',
+    'aria-label': t('closeMenu'),
+    autofocus: true,
+    onClick: closeDrawer
+  }, [ICONS.close()]);
+
+  const head = el('div', { className: 'drawer-head' }, [
+    el('div', { className: 'drawer-brand' }, [
+      el('img', { className: 'brand-logo', src: '/assets/logo.svg', alt: '', width: '32', height: '32' }),
+      el('div', { style: 'min-inline-size:0;' }, [
+        el('div', { className: 'brand-title', textContent: t('appName') }),
+        state.authenticated && state.username
+          ? el('div', { className: 'drawer-user mono', textContent: `@${state.username}` })
+          : el('div', { className: 'drawer-user', textContent: t('appSubtitle') })
+      ])
+    ]),
+    closeBtn
   ]);
 
-  const actions = el('div', { className: 'topbar-actions' });
+  const body = el('div', { className: 'drawer-body' });
 
-  // Progressive enhancement PWA Install button
-  const installBtn = el('button', {
-    id: 'install-app',
-    type: 'button',
-    className: 'btn',
-    hidden: !(supportsWebInstall || deferredInstallPrompt),
-    onClick: async () => {
-      if (installBtn.getAttribute('aria-disabled') === 'true') return;
-      installBtn.setAttribute('aria-disabled', 'true');
-      try {
-        if (supportsWebInstall) {
-          await navigator.install();
-          installBtn.hidden = true;
-        } else if (deferredInstallPrompt) {
-          const ev = deferredInstallPrompt;
-          deferredInstallPrompt = null;
-          await ev.prompt();
-          await ev.userChoice;
-          installBtn.hidden = true;
+  if (state.authenticated) {
+    body.append(
+      el('button', {
+        type: 'button',
+        className: 'drawer-item',
+        onClick: () => {
+          closeDrawer();
+          setTimeout(() => openAccountsDialog(), 160);
         }
-      } catch {} finally {
-        installBtn.removeAttribute('aria-disabled');
-      }
-    }
-  }, [ICONS.download(), el('span', { textContent: t('installApp') })]);
-  actions.append(installBtn);
+      }, [
+        ICONS.accounts(),
+        el('span', { textContent: t('accountsBtn') }),
+        el('span', { className: 'drawer-item-badge', textContent: String(state.accounts.length) })
+      ]),
+      el('button', {
+        type: 'button',
+        className: 'drawer-item',
+        onClick: () => {
+          closeDrawer();
+          triggerSyncAll();
+        }
+      }, [
+        ICONS.refresh(),
+        el('span', { textContent: t('refreshAll') })
+      ]),
+      el('hr', { className: 'drawer-sep' })
+    );
+  }
 
-  // Language switcher (11 languages)
+  // Appearance segmented selector (updates aria-pressed in-place without detaching buttons)
+  body.append(el('div', { className: 'drawer-section-label', textContent: t('themeLabel') }));
+  const themeGroup = el('div', { className: 'drawer-theme-group', role: 'group', 'aria-label': t('themeLabel') });
+  const themeButtons = [];
+  for (const [mode, iconNode, lbl] of [
+    ['system', ICONS.monitor(), t('themeSystem')],
+    ['light', ICONS.sun(), t('themeLight')],
+    ['dark', ICONS.moon(), t('themeDark')]
+  ]) {
+    const tBtn = el('button', {
+      type: 'button',
+      className: 'drawer-theme-btn',
+      'aria-pressed': state.theme === mode ? 'true' : 'false',
+      onClick: () => {
+        applyTheme(mode);
+        for (const item of themeButtons) {
+          item.btn.setAttribute('aria-pressed', item.mode === mode ? 'true' : 'false');
+        }
+      }
+    }, [iconNode, el('span', { textContent: lbl })]);
+    themeButtons.push({ mode, btn: tBtn });
+    themeGroup.append(tBtn);
+  }
+  body.append(themeGroup);
+
+  // Language selector (11 languages)
+  body.append(el('label', {
+    className: 'drawer-section-label',
+    for: 'drawer-lang-select',
+    style: 'margin-block-start:0.55rem;',
+    textContent: t('language')
+  }));
   const langSelect = el('select', {
-    className: 'select-compact',
-    'aria-label': t('language'),
+    id: 'drawer-lang-select',
+    className: 'drawer-select',
     onChange: (e) => {
       state.lang = e.target.value;
       document.documentElement.lang = state.lang;
       writePref('ibmon-lang', state.lang);
       render();
+      renderDrawerContent();
     }
   });
   for (const l of LANGUAGES) {
@@ -438,45 +595,16 @@ function renderTopbar() {
     if (l.code === state.lang) opt.selected = true;
     langSelect.append(opt);
   }
-  actions.append(langSelect);
+  body.append(langSelect);
 
-  // Theme toggle (System -> Light -> Dark)
-  const themeIcon = state.theme === 'dark' ? ICONS.moon() : state.theme === 'light' ? ICONS.sun() : ICONS.monitor();
-  const themeLabel = state.theme === 'dark' ? t('themeDark') : state.theme === 'light' ? t('themeLight') : t('themeSystem');
-  actions.append(el('button', {
-    type: 'button',
-    className: 'btn',
-    'aria-label': themeLabel,
-    onClick: cycleTheme
-  }, [themeIcon, el('span', { textContent: themeLabel })]));
-
+  const footer = el('div', { className: 'drawer-footer' });
   if (state.authenticated) {
-    actions.append(el('button', {
+    footer.append(el('button', {
       type: 'button',
-      className: 'btn',
+      className: 'drawer-item btn-danger',
+      style: 'border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--border));',
       onClick: async () => {
-        try {
-          const data = await apiFetch('/api/sync', { method: 'POST' });
-          applyMachinesPayload(data);
-          render();
-        } catch (err) {
-          showToast(err.message, 'error');
-        }
-      }
-    }, [ICONS.refresh(), el('span', { textContent: t('refreshAll') })]));
-
-    actions.append(el('button', {
-      type: 'button',
-      className: 'btn btn-primary',
-      onClick: () => openAccountsDialog()
-    }, [ICONS.accounts(), el('span', { textContent: `${t('accountsBtn')} (${state.accounts.length})` })]));
-
-    actions.append(el('button', {
-      type: 'button',
-      className: 'btn btn-icon-only',
-      'aria-label': t('logout'),
-      title: t('logout'),
-      onClick: async () => {
+        closeDrawer();
         try {
           await apiFetch('/api/auth/logout', { method: 'POST' });
         } catch {}
@@ -485,12 +613,37 @@ function renderTopbar() {
         state.csrfToken = '';
         state.accounts = [];
         state.machines = [];
+        vmCardRegistry.clear();
         render();
       }
-    }, [ICONS.logout()]));
+    }, [ICONS.logout(), el('span', { textContent: t('logout') })]));
   }
 
-  inner.append(brand, actions);
+  drawerSheet.replaceChildren(head, body, footer);
+}
+
+function renderTopbar() {
+  const header = el('header', { className: 'topbar' });
+  const inner = el('div', { className: 'topbar-inner' });
+
+  const menuBtn = el('button', {
+    id: 'drawer-open',
+    type: 'button',
+    className: 'hamburger-btn',
+    'aria-label': t('menuOpen'),
+    'aria-expanded': navDrawer?.open ? 'true' : 'false',
+    'aria-controls': 'nav-drawer',
+    onClick: () => openDrawer()
+  }, [ICONS.menu()]);
+
+  const brand = el('div', { className: 'brand' }, [
+    el('img', { className: 'brand-logo', src: '/assets/logo.svg', alt: '', width: '32', height: '32' }),
+    el('span', { className: 'brand-title', textContent: t('appName') })
+  ]);
+
+  const left = el('div', { className: 'topbar-left' }, [menuBtn, brand]);
+  inner.append(left);
+
   header.append(inner);
   return header;
 }
@@ -509,7 +662,6 @@ function renderAuthView() {
 
   const form = el('form', { novalidate: true });
 
-  // Username field
   const uField = el('div', { className: 'field', dataset: { invalid: 'false' } });
   uField.append(el('label', { for: 'auth-username', textContent: t('username') }));
   if (isSetup) {
@@ -625,37 +777,52 @@ function renderAuthView() {
   return shell;
 }
 
-function makeActionButton(vm, actionKey, tooltipText, enabled, iconNode) {
-  const vmComposite = `${vm.accountId}:${vm.id}`;
-  const pendingKey = `${vmComposite}:${actionKey}`;
-  const isPending = state.pendingActions.has(pendingKey);
-  const tipId = `tip-${vm.accountId.slice(0, 6)}-${vm.id}-${actionKey}`.replace(/[^a-zA-Z0-9_-]/g, '');
+// ============================================================
+// Keyed VM Action Button (updates state in-place without destroying focus)
+// ============================================================
+function createActionButton(initialVm, actionKey, iconNode) {
+  let currentVm = initialVm;
+  const tipId = `tip-${initialVm.accountId.slice(0, 6)}-${initialVm.id}-${actionKey}`.replace(/[^a-zA-Z0-9_-]/g, '');
 
   const slot = el('div', { className: 'vm-action-slot' });
+  const tip = el('div', {
+    id: tipId,
+    className: 'action-tooltip',
+    role: 'tooltip',
+    popover: 'manual'
+  });
+
+  let openTimer = null;
+  let closeTimer = null;
+
   const btn = el('button', {
     type: 'button',
-    className: `vm-action-btn${isPending ? ' is-pending' : ''}`,
+    className: 'vm-action-btn',
     dataset: { action: actionKey },
-    'aria-label': tooltipText,
-    interestfor: tipId,
-    disabled: !enabled || isPending,
+    'aria-describedby': tipId,
     onClick: async (ev) => {
       ev.stopPropagation();
       if (btn.disabled) return;
       hideTooltip();
+      const vmComposite = `${currentVm.accountId}:${currentVm.id}`;
+      const pendingKey = `${vmComposite}:${actionKey}`;
       state.pendingActions.add(pendingKey);
-      render();
+      const ctrl = vmCardRegistry.get(vmComposite);
+      if (ctrl) ctrl.update(currentVm);
+
       try {
         const res = await apiFetch(
-          `/api/machines/${encodeURIComponent(vm.accountId)}/${encodeURIComponent(vm.id)}/actions/${actionKey}`,
+          `/api/machines/${encodeURIComponent(currentVm.accountId)}/${encodeURIComponent(currentVm.id)}/actions/${actionKey}`,
           { method: 'POST' }
         );
-        showToast(`${t('actionSent')}: ${vm.name} (${actionKey})`);
+        showToast(`${t('actionSent')}: ${currentVm.name} (${actionKey})`);
         if (res?.machine) {
-          const idx = state.machines.findIndex((x) => x.accountId === vm.accountId && x.id === vm.id);
-          if (idx >= 0) state.machines[idx] = res.machine;
+          const idx = state.machines.findIndex((x) => x.accountId === currentVm.accountId && x.id === currentVm.id);
+          if (idx >= 0) {
+            state.machines[idx] = res.machine;
+            currentVm = res.machine;
+          }
         }
-        // Poll quickly to reflect state transition
         setTimeout(() => refreshMachinesSilently(), 1800);
         setTimeout(() => refreshMachinesSilently(), 4500);
       } catch (err) {
@@ -663,21 +830,14 @@ function makeActionButton(vm, actionKey, tooltipText, enabled, iconNode) {
         showToast(`${err.message}${waitTxt}`, 'error');
       } finally {
         state.pendingActions.delete(pendingKey);
-        render();
+        const latestVm = state.machines.find((x) => x.accountId === currentVm.accountId && x.id === currentVm.id) || currentVm;
+        updateDashboardInPlace();
+        const activeCtrl = vmCardRegistry.get(vmComposite);
+        if (activeCtrl) activeCtrl.update(latestVm);
       }
     }
   }, [iconNode]);
 
-  const tip = el('div', {
-    id: tipId,
-    className: 'action-tooltip',
-    role: 'tooltip',
-    popover: 'manual',
-    textContent: tooltipText
-  });
-
-  let openTimer = null;
-  let closeTimer = null;
   const positionTip = () => {
     const r = btn.getBoundingClientRect();
     const trRect = tip.getBoundingClientRect();
@@ -687,6 +847,7 @@ function makeActionButton(vm, actionKey, tooltipText, enabled, iconNode) {
     tip.style.top = `${top}px`;
     tip.style.left = `${left}px`;
   };
+
   const showTooltip = () => {
     clearTimeout(closeTimer);
     document.querySelectorAll('.action-tooltip').forEach((other) => {
@@ -701,6 +862,7 @@ function makeActionButton(vm, actionKey, tooltipText, enabled, iconNode) {
       positionTip();
     } catch {}
   };
+
   const hideTooltip = () => {
     clearTimeout(openTimer);
     clearTimeout(closeTimer);
@@ -711,8 +873,6 @@ function makeActionButton(vm, actionKey, tooltipText, enabled, iconNode) {
     } catch {}
   };
 
-  btn.removeAttribute('interestfor');
-  btn.setAttribute('aria-describedby', tipId);
   btn.addEventListener('mouseenter', () => {
     clearTimeout(openTimer);
     openTimer = setTimeout(showTooltip, 70);
@@ -732,7 +892,22 @@ function makeActionButton(vm, actionKey, tooltipText, enabled, iconNode) {
   btn.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideTooltip(); });
 
   slot.append(btn, tip);
-  return slot;
+
+  return {
+    slot,
+    hideTooltip,
+    update(vm, tooltipText, enabled) {
+      currentVm = vm;
+      const pendingKey = `${vm.accountId}:${vm.id}:${actionKey}`;
+      const isPending = state.pendingActions.has(pendingKey);
+      btn.classList.toggle('is-pending', isPending);
+      btn.disabled = !enabled || isPending;
+      if (btn.getAttribute('aria-label') !== tooltipText) {
+        btn.setAttribute('aria-label', tooltipText);
+      }
+      setTextIfChanged(tip, tooltipText);
+    }
+  };
 }
 
 function getVmDiskPct(vm) {
@@ -747,153 +922,356 @@ function getVmDiskPct(vm) {
   return 0;
 }
 
-function renderVmCard(vm) {
+function metricsSignature(vm, diskPct) {
+  const samples = vm.recentMetrics || [];
+  const last = samples.length ? samples[samples.length - 1] : null;
+  return `${samples.length}|${last ? `${last.ts}:${last.cpuPct}:${last.memUsed}:${last.diskUsed}` : 'none'}|${diskPct.toFixed(1)}`;
+}
+
+// ============================================================
+// Keyed VM Card Controller (in-place DOM diffing; zero node loss)
+// ============================================================
+function createVmCardController(initialVm) {
+  let vm = initialVm;
   const wrap = el('div', { className: 'vm-card-wrap' });
   const card = el('article', { className: 'vm-card' });
-  const { tone, label } = getVmToneAndLabel(vm);
 
-  // Column 1: Status Point Checker + Identity + Clock
   const col1 = el('div', { className: 'vm-col-meta' });
   const head = el('div', { className: 'vm-head' });
 
+  const statusPoint = el('span', { className: 'status-point', 'aria-hidden': 'true' });
+  const nameBtn = el('button', {
+    type: 'button',
+    className: 'vm-name-btn',
+    onClick: () => openTelemetryDialog(vm)
+  });
+
+  const aliasBadge = el('span', { className: 'badge' });
+  const idBadge = el('span', { className: 'badge mono' });
+  const tplBadge = el('span', { className: 'badge' });
+  const freeBadge = el('span', { className: 'badge' });
+
   const ident = el('div', { className: 'vm-identity' }, [
-    el('span', { className: 'status-point', dataset: { tone }, 'aria-hidden': 'true' }),
+    statusPoint,
     el('div', { className: 'vm-title-block' }, [
-      el('button', {
-        type: 'button',
-        className: 'vm-name-btn',
-        textContent: vm.name,
-        onClick: () => openTelemetryDialog(vm)
-      }),
-      el('div', { className: 'vm-submeta' }, [
-        el('span', { className: 'badge', textContent: vm.accountAlias || vm.accountId }),
-        el('span', { className: 'mono', textContent: vm.id }),
-        vm.templateId ? el('span', { className: 'badge', textContent: vm.templateId }) : null,
-        vm.free ? el('span', { className: 'badge', textContent: t('freePlan') }) : null
-      ])
+      nameBtn,
+      el('div', { className: 'vm-submeta' }, [aliasBadge, idBadge, tplBadge, freeBadge])
     ])
   ]);
 
-  const statusBadge = el('span', { className: 'badge', dataset: { tone }, textContent: label });
+  const statusBadge = el('span', { className: 'badge' });
   head.append(ident, statusBadge);
   col1.append(head);
 
-  const specTxt = t('specFmt', {
-    vcpu: vm.vcpus,
-    ram: `${(vm.memMiB / 1024).toFixed(vm.memMiB % 1024 === 0 ? 0 : 1)} GiB`,
-    disk: vm.persistentDiskGiB
-  });
-  const policyTxt = vm.autoSuspendAfterSeconds
-    ? `${t('idlePolicy')}: ${Math.round(vm.autoSuspendAfterSeconds / 60)}m`
-    : t('alwaysOn');
-  col1.append(el('div', { className: 'vm-submeta', textContent: `${specTxt} · ${policyTxt}` }));
+  const specEl = el('div', { className: 'vm-submeta' });
 
-  // Live Runtime Clock row (consistent 2-line layout across all states)
-  const clockInfo = formatClockDisplay(vm);
-  const clockRow = el('div', { className: 'vm-clock-row' });
+  const clockLabelEl = el('span', { className: 'hint' });
+  const clockValueEl = el('span', {
+    className: 'clock-value mono',
+    dataset: { clockVm: `${vm.accountId}:${vm.id}` }
+  });
+  const clockLimitEl = el('span', { className: 'clock-limit mono' });
   const clockLeft = el('div', { className: 'clock-group' }, [
-    el('span', { className: 'clock-label-wrap' }, [
-      ICONS.clock(),
-      el('span', { className: 'hint', textContent: clockInfo.mode === 'cooldown' ? t('cooldownLeft') : t('runtimeClock') })
+    el('span', { className: 'clock-label-wrap' }, [ICONS.clock(), clockLabelEl]),
+    el('span', { className: 'clock-readout-wrap' }, [clockValueEl, clockLimitEl])
+  ]);
+  const clockRight = el('div', { className: 'clock-limit mono' });
+  const clockRow = el('div', { className: 'vm-clock-row' }, [clockLeft, clockRight]);
+  const errEl = el('div', { className: 'account-err', hidden: true });
+  const metaBottom = el('div', { className: 'vm-meta-bottom' }, [specEl, clockRow, errEl]);
+  col1.append(metaBottom);
+
+  // Column 2: Mini Beszel Charts
+  const cpuLbl = el('span', { className: 'mini-chart-lbl' });
+  const cpuVal = el('span', { className: 'mini-chart-val mono' });
+  const cpuSvgHost = el('div');
+
+  const ramLbl = el('span', { className: 'mini-chart-lbl' });
+  const ramVal = el('span', { className: 'mini-chart-val mono' });
+  const ramSvgHost = el('div');
+
+  const diskLbl = el('span', { className: 'mini-chart-lbl' });
+  const diskVal = el('span', { className: 'mini-chart-val mono' });
+  const diskSvgHost = el('div');
+
+  const miniGrid = el('div', { className: 'mini-charts-grid' }, [
+    el('button', { type: 'button', className: 'mini-chart-box', onClick: () => openTelemetryDialog(vm) }, [
+      el('div', { className: 'mini-chart-top' }, [cpuLbl, cpuVal]),
+      cpuSvgHost
     ]),
-    el('span', { className: 'clock-readout-wrap' }, [
-      el('span', {
-        className: 'clock-value mono',
-        dataset: { clockVm: `${vm.accountId}:${vm.id}`, mode: clockInfo.mode },
-        textContent: clockInfo.text
-      }),
-      vm.maxRunMinutes > 0 && clockInfo.mode === 'running'
-        ? el('span', { className: 'clock-limit mono', textContent: `/ ${fmtHMS(vm.maxRunMinutes * 60)}` })
-        : null
+    el('button', { type: 'button', className: 'mini-chart-box', onClick: () => openTelemetryDialog(vm) }, [
+      el('div', { className: 'mini-chart-top' }, [ramLbl, ramVal]),
+      ramSvgHost
+    ]),
+    el('button', { type: 'button', className: 'mini-chart-box', onClick: () => openTelemetryDialog(vm) }, [
+      el('div', { className: 'mini-chart-top' }, [diskLbl, diskVal]),
+      diskSvgHost
     ])
   ]);
-  const clockRight = el('div', { className: 'clock-limit mono', textContent: `${t('monthlyUsage')}: ${fmtCompactDuration(vm.monthlyRunningSeconds || 0)}` });
-  clockRow.append(clockLeft, clockRight);
-  col1.append(clockRow);
 
-  if (vm.lastErrorMsg) {
-    col1.append(el('div', { className: 'account-err', textContent: `${vm.lastErrorCode || 'error'}: ${vm.lastErrorMsg}` }));
-  }
-
-  // Column 2: Mini Beszel Charts (CPU / RAM / Disk)
-  const samples = vm.recentMetrics || [];
-  const latest = vm.latestMetric || null;
-  const cpuVals = samples.map((s) => s.cpuPct || 0);
-  const ramVals = samples.map((s) => (s.memTotal > 0 ? (s.memUsed / s.memTotal) * 100 : 0));
-  const diskVals = samples.map((s) => (s.diskTotal > 0 && s.diskUsed > 0 ? (s.diskUsed / s.diskTotal) * 100 : getVmDiskPct(vm)));
-
-  const cpuNow = latest ? `${latest.cpuPct.toFixed(1)}%` : '--';
-  const ramNow = latest && latest.memTotal > 0 ? `${((latest.memUsed / latest.memTotal) * 100).toFixed(0)}%` : '--';
-  const diskPct = getVmDiskPct(vm);
-  const diskNow = diskPct > 0 ? `${diskPct.toFixed(0)}%` : '--';
-
-  const miniGrid = el('div', { className: 'mini-charts-grid' });
-  for (const [lbl, valTxt, series, color] of [
-    [t('cpuLabel'), cpuNow, cpuVals, '#2563eb'],
-    [t('ramLabel'), ramNow, ramVals, '#10b981'],
-    [t('diskLabel'), diskNow, diskVals, '#f59e0b']
-  ]) {
-    const box = el('button', {
-      type: 'button',
-      className: 'mini-chart-box',
-      onClick: () => openTelemetryDialog(vm)
-    }, [
-      el('div', { className: 'mini-chart-top' }, [
-        el('span', { className: 'mini-chart-lbl', textContent: lbl }),
-        el('span', { className: 'mini-chart-val mono', textContent: valTxt })
-      ]),
-      buildMiniAreaChart(series, color, 100)
-    ]);
-    miniGrid.append(box);
-  }
-
-  // Column 3: 4 Icon-Only SVG Action Buttons (Wake, Pause, Start, Stop — Stop executes immediately!)
-  const cooldownActive = vm.cooldownUntil && Date.parse(vm.cooldownUntil) > upstreamNowMs();
-  const canWake = vm.state === 'suspended' && !cooldownActive;
-  const canSuspend = vm.state === 'running';
-  const canStart = (vm.state === 'stopped' || vm.state === 'suspended') && !cooldownActive;
-  const canStop = vm.state === 'running';
-
+  // Column 3: 4 Icon-Only SVG Action Buttons
+  const wakeCtrl = createActionButton(vm, 'wake', ICONS.wake());
+  const suspendCtrl = createActionButton(vm, 'suspend', ICONS.suspend());
+  const startCtrl = createActionButton(vm, 'start', ICONS.start());
+  const stopCtrl = createActionButton(vm, 'stop', ICONS.stop());
   const actionsBar = el('div', { className: 'vm-actions' }, [
-    makeActionButton(vm, 'wake', t('actWake'), canWake, ICONS.wake()),
-    makeActionButton(vm, 'suspend', t('actPause'), canSuspend, ICONS.suspend()),
-    makeActionButton(vm, 'start', t('actStart'), canStart, ICONS.start()),
-    makeActionButton(vm, 'stop', t('actStop'), canStop, ICONS.stop())
+    wakeCtrl.slot, suspendCtrl.slot, startCtrl.slot, stopCtrl.slot
   ]);
 
   card.append(col1, miniGrid, actionsBar);
   wrap.append(card);
-  return wrap;
+
+  let lastChartSig = '';
+
+  const update = (nextVm) => {
+    vm = nextVm;
+    const { tone, label } = getVmToneAndLabel(vm);
+
+    if (statusPoint.dataset.tone !== tone) statusPoint.dataset.tone = tone;
+    if (statusBadge.dataset.tone !== tone) statusBadge.dataset.tone = tone;
+    setTextIfChanged(statusBadge, label);
+
+    setTextIfChanged(nameBtn, vm.name);
+    setTextIfChanged(aliasBadge, vm.accountAlias || vm.accountId);
+    setTextIfChanged(idBadge, vm.id);
+
+    if (vm.templateId) {
+      tplBadge.hidden = false;
+      setTextIfChanged(tplBadge, vm.templateId);
+    } else {
+      tplBadge.hidden = true;
+    }
+
+    if (vm.free) {
+      freeBadge.hidden = false;
+      setTextIfChanged(freeBadge, t('freePlan'));
+    } else {
+      freeBadge.hidden = true;
+    }
+
+    const specTxt = t('specFmt', {
+      vcpu: vm.vcpus,
+      ram: `${(vm.memMiB / 1024).toFixed(vm.memMiB % 1024 === 0 ? 0 : 1)} GiB`,
+      disk: vm.persistentDiskGiB
+    });
+    const policyTxt = vm.autoSuspendAfterSeconds
+      ? `${t('idlePolicy')}: ${Math.round(vm.autoSuspendAfterSeconds / 60)}m`
+      : t('alwaysOn');
+    setTextIfChanged(specEl, `${specTxt} · ${policyTxt}`);
+
+    const clockInfo = formatClockDisplay(vm);
+    setTextIfChanged(clockLabelEl, clockInfo.mode === 'cooldown' ? t('cooldownLeft') : t('runtimeClock'));
+    setTextIfChanged(clockValueEl, clockInfo.text);
+    if (clockValueEl.dataset.mode !== clockInfo.mode) clockValueEl.dataset.mode = clockInfo.mode;
+
+    if (vm.maxRunMinutes > 0 && clockInfo.mode === 'running') {
+      clockLimitEl.hidden = false;
+      setTextIfChanged(clockLimitEl, `/ ${fmtHMS(vm.maxRunMinutes * 60)}`);
+    } else {
+      clockLimitEl.hidden = true;
+    }
+    setTextIfChanged(clockRight, `${t('monthlyUsage')}: ${fmtCompactDuration(vm.monthlyRunningSeconds || 0)}`);
+
+    if (vm.lastErrorMsg) {
+      errEl.hidden = false;
+      setTextIfChanged(errEl, `${vm.lastErrorCode || 'error'}: ${vm.lastErrorMsg}`);
+    } else {
+      errEl.hidden = true;
+    }
+
+    setTextIfChanged(cpuLbl, t('cpuLabel'));
+    setTextIfChanged(ramLbl, t('ramLabel'));
+    setTextIfChanged(diskLbl, t('diskLabel'));
+
+    const samples = vm.recentMetrics || [];
+    const latest = vm.latestMetric || null;
+    const diskPct = getVmDiskPct(vm);
+    const sig = metricsSignature(vm, diskPct);
+
+    setTextIfChanged(cpuVal, latest ? `${latest.cpuPct.toFixed(1)}%` : '--');
+    setTextIfChanged(ramVal, latest && latest.memTotal > 0 ? `${((latest.memUsed / latest.memTotal) * 100).toFixed(0)}%` : '--');
+    setTextIfChanged(diskVal, diskPct > 0 ? `${diskPct.toFixed(0)}%` : '--');
+
+    if (sig !== lastChartSig) {
+      lastChartSig = sig;
+      const cpuVals = samples.map((s) => s.cpuPct || 0);
+      const ramVals = samples.map((s) => (s.memTotal > 0 ? (s.memUsed / s.memTotal) * 100 : 0));
+      const diskVals = samples.map((s) => (s.diskTotal > 0 && s.diskUsed > 0 ? (s.diskUsed / s.diskTotal) * 100 : diskPct));
+      cpuSvgHost.replaceChildren(buildMiniAreaChart(cpuVals, '#2563eb', 100));
+      ramSvgHost.replaceChildren(buildMiniAreaChart(ramVals, '#10b981', 100));
+      diskSvgHost.replaceChildren(buildMiniAreaChart(diskVals, '#f59e0b', 100));
+    }
+
+    const cooldownActive = vm.cooldownUntil && Date.parse(vm.cooldownUntil) > upstreamNowMs();
+    wakeCtrl.update(vm, t('actWake'), vm.state === 'suspended' && !cooldownActive);
+    suspendCtrl.update(vm, t('actPause'), vm.state === 'running');
+    startCtrl.update(vm, t('actStart'), (vm.state === 'stopped' || vm.state === 'suspended') && !cooldownActive);
+    stopCtrl.update(vm, t('actStop'), vm.state === 'running');
+  };
+
+  update(initialVm);
+
+  return {
+    wrap,
+    update,
+    hideTooltips() {
+      wakeCtrl.hideTooltip();
+      suspendCtrl.hideTooltip();
+      startCtrl.hideTooltip();
+      stopCtrl.hideTooltip();
+    }
+  };
+}
+
+// ============================================================
+// Modern KPI Cards (Subgrid-aligned, in-place updates)
+// ============================================================
+function ensureKpiCards(strip) {
+  if (strip._kpi) return strip._kpi;
+
+  const makeCard = ({ tone = '', showLivePill = false }) => {
+    const card = el('article', { className: 'kpi-card' });
+
+    const rule = el('span', { className: 'kpi-accent-rule', dataset: tone ? { tone } : {} });
+    const lbl = el('span', { className: 'kpi-label' });
+    const eyebrow = el('div', { className: 'kpi-eyebrow' }, [rule, lbl]);
+
+    const head = el('header', { className: 'kpi-head' }, [eyebrow]);
+    if (showLivePill) {
+      const liveText = el('span');
+      const pill = el('span', { className: 'live-pill' }, [
+        el('span', { className: 'live-pill-dot', 'aria-hidden': 'true' }),
+        liveText
+      ]);
+      head.append(pill);
+      card._liveText = liveText;
+    }
+
+    const val = el('div', { className: 'kpi-value', dataset: tone ? { tone } : {} });
+    const track = el('div', { className: 'kpi-track' });
+    const foot = el('p', { className: 'kpi-foot' });
+
+    card.append(head, val, track, foot);
+    return { card, lbl, val, track, foot, liveText: card._liveText };
+  };
+
+  const cTotal = makeCard({ showLivePill: true });
+  const segRun = el('span', { className: 'kpi-fill', dataset: { tone: 'running' } });
+  const segIdle = el('span', { className: 'kpi-fill', dataset: { tone: 'idle' } });
+  const segStop = el('span', { className: 'kpi-fill', dataset: { tone: 'stopped' } });
+  const segErr = el('span', { className: 'kpi-fill', dataset: { tone: 'error' } });
+  cTotal.track.append(segRun, segIdle, segStop, segErr);
+
+  const cRun = makeCard({ tone: 'running' });
+  const runFill = el('span', { className: 'kpi-fill', dataset: { tone: 'running' } });
+  cRun.track.append(runFill);
+
+  const cPause = makeCard({ tone: 'idle' });
+  const pauseFill = el('span', { className: 'kpi-fill', dataset: { tone: 'idle' } });
+  cPause.track.append(pauseFill);
+
+  const cStop = makeCard({ tone: 'stopped' });
+  const stopFill = el('span', { className: 'kpi-fill', dataset: { tone: 'stopped' } });
+  cStop.track.append(stopFill);
+
+  strip.replaceChildren(cTotal.card, cRun.card, cPause.card, cStop.card);
+  strip._kpi = { cTotal, segRun, segIdle, segStop, segErr, cRun, runFill, cPause, pauseFill, cStop, stopFill };
+  return strip._kpi;
 }
 
 function populateStatsStrip(strip) {
-  strip.textContent = '';
+  const kpi = ensureKpiCards(strip);
   const total = state.machines.length;
   const running = state.machines.filter((m) => m.state === 'running').length;
   const paused = state.machines.filter((m) => m.state === 'suspended').length;
   const stopped = state.machines.filter((m) => m.state === 'stopped').length;
-  for (const [lbl, val, tone] of [
-    [t('totalVMs'), total, ''],
-    [t('runningVMs'), running, 'running'],
-    [t('pausedVMs'), paused, 'idle'],
-    [t('stoppedVMs'), stopped, 'stopped']
-  ]) {
-    const tile = el('div', { className: 'stat-tile' }, [
-      el('span', { className: 'stat-tile-label', textContent: lbl }),
-      el('span', {
-        className: 'stat-tile-value mono',
-        style: tone === 'running' ? 'color:var(--ok)' : tone === 'idle' ? 'color:var(--warn)' : '',
-        textContent: String(val)
-      })
-    ]);
-    strip.append(tile);
-  }
+  const errored = Math.max(0, total - running - paused - stopped);
+
+  const activeVcpu = state.machines
+    .filter((m) => m.state === 'running')
+    .reduce((acc, m) => acc + (m.vcpus || 0), 0);
+  const autoPaused = state.machines.filter((m) => m.state === 'suspended' && !!m.autoSuspendedAt).length;
+  const manualPaused = Math.max(0, paused - autoPaused);
+  const totalMonthlySec = state.machines.reduce((acc, m) => acc + (m.monthlyRunningSeconds || 0), 0);
+
+  const pct = (n) => (total > 0 ? Math.round((n / total) * 100) : 0);
+  const widthPct = (n) => (total > 0 && n > 0 ? `${Math.max(3, (n / total) * 100)}%` : '0%');
+
+  setTextIfChanged(kpi.cTotal.lbl, t('totalVMs'));
+  setTextIfChanged(kpi.cTotal.liveText, t('liveBadge'));
+  setTextIfChanged(kpi.cTotal.val, String(total));
+  kpi.segRun.style.width = widthPct(running);
+  kpi.segIdle.style.width = widthPct(paused);
+  kpi.segStop.style.width = widthPct(stopped);
+  kpi.segErr.style.width = widthPct(errored);
+  setTextIfChanged(kpi.cTotal.foot, t('kpiAccountsFmt', { accounts: state.accounts.length, vcpu: activeVcpu }));
+
+  setTextIfChanged(kpi.cRun.lbl, t('runningVMs'));
+  setTextIfChanged(kpi.cRun.val, String(running));
+  kpi.runFill.style.width = widthPct(running);
+  setTextIfChanged(kpi.cRun.foot, t('kpiShareFmt', { pct: pct(running) }));
+
+  setTextIfChanged(kpi.cPause.lbl, t('pausedVMs'));
+  setTextIfChanged(kpi.cPause.val, String(paused));
+  kpi.pauseFill.style.width = widthPct(paused);
+  setTextIfChanged(kpi.cPause.foot, t('kpiIdleSplit', { auto: autoPaused, manual: manualPaused }));
+
+  setTextIfChanged(kpi.cStop.lbl, t('stoppedVMs'));
+  setTextIfChanged(kpi.cStop.val, String(stopped));
+  kpi.stopFill.style.width = widthPct(stopped);
+  setTextIfChanged(kpi.cStop.foot, t('kpiMonthlyFleet', { dur: fmtCompactDuration(totalMonthlySec) }));
+}
+
+function updateDashboardHero(heroEl) {
+  const hero = heroEl || document.getElementById('dashboard-hero');
+  if (!hero || !hero._refs) return;
+  const { titleText, metaEl, accBtnText, syncBtnText } = hero._refs;
+
+  const total = state.machines.length;
+  const running = state.machines.filter((m) => m.state === 'running').length;
+  let heading = t('heroAllStable');
+  if (state.accounts.length === 0) heading = t('heroNoAccounts');
+  else if (running > 0) heading = t('heroActive', { count: running });
+
+  setTextIfChanged(titleText, heading.replace(/\.+$/, ''));
+  setTextIfChanged(metaEl, t('heroMeta', { accounts: state.accounts.length, machines: total }));
+  setTextIfChanged(accBtnText, `${t('accountsBtn')} (${state.accounts.length})`);
+  setTextIfChanged(syncBtnText, `${t('refreshAll')} →`);
 }
 
 function renderDashboard() {
   const main = el('main', { className: 'main-wrap' });
 
-  // Summary Metrics Strip
+  // Editorial Hero Header + Pill Actions (CLIProxyAPI-inspired)
+  const titleText = el('span');
+  const heroTitle = el('h1', { className: 'hero-title' }, [
+    titleText,
+    el('span', { className: 'hero-dot', textContent: '.' })
+  ]);
+  const metaEl = el('p', { className: 'hero-meta mono' });
+  const accBtnText = el('span');
+  const syncBtnText = el('span');
+
+  const hero = el('section', { id: 'dashboard-hero', className: 'dashboard-hero' }, [
+    el('div', { className: 'hero-text' }, [heroTitle, metaEl]),
+    el('div', { className: 'hero-actions' }, [
+      el('button', {
+        type: 'button',
+        className: 'btn-pill-dark',
+        onClick: () => openAccountsDialog()
+      }, [ICONS.accounts(), accBtnText]),
+      el('button', {
+        type: 'button',
+        className: 'btn-ghost-link',
+        onClick: () => triggerSyncAll()
+      }, [syncBtnText])
+    ])
+  ]);
+  hero._refs = { titleText, metaEl, accBtnText, syncBtnText };
+  updateDashboardHero(hero);
+  main.append(hero);
+
+  // Modern KPI Cards Strip
   const strip = el('section', { id: 'stats-strip', className: 'stats-strip' });
   populateStatsStrip(strip);
   main.append(strip);
@@ -934,7 +1312,7 @@ function renderDashboard() {
     'aria-label': t('allAccounts'),
     onChange: (e) => {
       state.filterAccount = e.target.value;
-      render();
+      renderVmListOnly();
     }
   }, [el('option', { value: 'all', textContent: t('allAccounts') })]);
   for (const a of state.accounts) {
@@ -948,7 +1326,7 @@ function renderDashboard() {
     'aria-label': t('allStates'),
     onChange: (e) => {
       state.filterState = e.target.value;
-      render();
+      renderVmListOnly();
     }
   }, [
     el('option', { value: 'all', textContent: t('allStates') }),
@@ -958,28 +1336,33 @@ function renderDashboard() {
   ]);
   stateSelect.value = state.filterState;
 
-  const viewSeg = el('div', { className: 'segmented', role: 'group' }, [
-    el('button', {
-      type: 'button',
-      'aria-pressed': state.viewMode === 'grid' ? 'true' : 'false',
-      'aria-label': t('viewGrid'),
-      onClick: () => {
-        state.viewMode = 'grid';
-        writePref('ibmon-view', 'grid');
-        render();
-      }
-    }, [ICONS.grid(), el('span', { textContent: t('viewGrid') })]),
-    el('button', {
-      type: 'button',
-      'aria-pressed': state.viewMode === 'cards' ? 'true' : 'false',
-      'aria-label': t('viewCards'),
-      onClick: () => {
-        state.viewMode = 'cards';
-        writePref('ibmon-view', 'cards');
-        render();
-      }
-    }, [ICONS.cards(), el('span', { textContent: t('viewCards') })])
-  ]);
+  const gridBtn = el('button', {
+    type: 'button',
+    'aria-pressed': state.viewMode === 'grid' ? 'true' : 'false',
+    'aria-label': t('viewGrid')
+  }, [ICONS.grid(), el('span', { textContent: t('viewGrid') })]);
+  const cardsBtn = el('button', {
+    type: 'button',
+    'aria-pressed': state.viewMode === 'cards' ? 'true' : 'false',
+    'aria-label': t('viewCards')
+  }, [ICONS.cards(), el('span', { textContent: t('viewCards') })]);
+
+  gridBtn.addEventListener('click', () => {
+    state.viewMode = 'grid';
+    writePref('ibmon-view', 'grid');
+    gridBtn.setAttribute('aria-pressed', 'true');
+    cardsBtn.setAttribute('aria-pressed', 'false');
+    renderVmListOnly();
+  });
+  cardsBtn.addEventListener('click', () => {
+    state.viewMode = 'cards';
+    writePref('ibmon-view', 'cards');
+    cardsBtn.setAttribute('aria-pressed', 'true');
+    gridBtn.setAttribute('aria-pressed', 'false');
+    renderVmListOnly();
+  });
+
+  const viewSeg = el('div', { className: 'segmented', role: 'group' }, [gridBtn, cardsBtn]);
 
   toolbar.append(searchWrap, accSelect, stateSelect, viewSeg);
   main.append(toolbar);
@@ -1004,25 +1387,70 @@ function getFilteredMachines() {
 }
 
 function populateVmList(host) {
-  document.querySelectorAll('.action-tooltip').forEach((tip) => {
-    try { if (tip.matches(':popover-open')) tip.hidePopover(); } catch {}
-  });
-  host.textContent = '';
   const items = getFilteredMachines();
   if (items.length === 0) {
-    host.append(el('div', { className: 'empty-state' }, [
+    document.querySelectorAll('.action-tooltip').forEach((tip) => {
+      try { if (tip.matches(':popover-open')) tip.hidePopover(); } catch {}
+    });
+    vmCardRegistry.clear();
+    host.replaceChildren(el('div', { className: 'empty-state' }, [
       el('h3', { textContent: t('noMachinesTitle') }),
       el('p', { textContent: t('noMachinesDesc') })
     ]));
+    host._renderedKeys = null;
+    host._container = null;
     return;
   }
-  const container = el('div', {
-    className: state.viewMode === 'cards' ? 'vm-container-cards' : 'vm-container-grid'
-  });
-  for (const vm of items) {
-    container.append(renderVmCard(vm));
+
+  const targetClass = state.viewMode === 'cards' ? 'vm-container-cards' : 'vm-container-grid';
+  let container = host._container;
+  if (!container || !host.contains(container)) {
+    container = el('div', { className: targetClass });
+    host._container = container;
+    host._renderedKeys = [];
+    host.replaceChildren(container);
+  } else if (container.className !== targetClass) {
+    container.className = targetClass;
   }
-  host.append(container);
+
+  const nextKeys = items.map((vm) => `${vm.accountId}:${vm.id}`);
+  const prevKeys = host._renderedKeys || [];
+  const sameOrder =
+    prevKeys.length === nextKeys.length &&
+    prevKeys.every((k, idx) => k === nextKeys[idx]);
+
+  if (sameOrder) {
+    // Pure in-place update: never removes or re-inserts any DOM nodes!
+    for (let i = 0; i < items.length; i++) {
+      const ctrl = vmCardRegistry.get(nextKeys[i]);
+      if (ctrl) ctrl.update(items[i]);
+    }
+    return;
+  }
+
+  // Reconcile cards atomically while preserving existing node instances
+  const keepSet = new Set(nextKeys);
+  for (const [k, ctrl] of vmCardRegistry.entries()) {
+    if (!keepSet.has(k)) {
+      ctrl.hideTooltips();
+      vmCardRegistry.delete(k);
+    }
+  }
+
+  const nodes = items.map((vm) => {
+    const key = `${vm.accountId}:${vm.id}`;
+    let ctrl = vmCardRegistry.get(key);
+    if (!ctrl) {
+      ctrl = createVmCardController(vm);
+      vmCardRegistry.set(key, ctrl);
+    } else {
+      ctrl.update(vm);
+    }
+    return ctrl.wrap;
+  });
+
+  container.replaceChildren(...nodes);
+  host._renderedKeys = nextKeys;
 }
 
 function renderVmListOnly() {
@@ -1030,7 +1458,21 @@ function renderVmListOnly() {
   if (host) populateVmList(host);
 }
 
+function updateDashboardInPlace() {
+  const strip = document.getElementById('stats-strip');
+  const host = document.getElementById('vm-list-host');
+  if (strip && host) {
+    updateDashboardHero();
+    populateStatsStrip(strip);
+    populateVmList(host);
+    return true;
+  }
+  return false;
+}
+
+// ============================================================
 // Accounts Manager Dialog
+// ============================================================
 let accountsDialog = null;
 function openAccountsDialog() {
   if (!accountsDialog) {
@@ -1043,7 +1485,6 @@ function openAccountsDialog() {
 
 function renderAccountsDialogContent() {
   if (!accountsDialog) return;
-  accountsDialog.textContent = '';
 
   const inner = el('div', { className: 'dialog-inner' });
   const header = el('div', { className: 'dialog-header' }, [
@@ -1083,7 +1524,7 @@ function renderAccountsDialogContent() {
             const data = await apiFetch(`/api/accounts/${encodeURIComponent(acc.id)}/sync`, { method: 'POST' });
             applyMachinesPayload(data);
             renderAccountsDialogContent();
-            render();
+            if (!updateDashboardInPlace()) render();
           } catch (err) {
             showToast(err.message, 'error');
           }
@@ -1123,7 +1564,6 @@ function renderAccountsDialogContent() {
   }
   body.append(list);
 
-  // Add / Edit Account form
   const editing = state.editingAccountId ? state.accounts.find((a) => a.id === state.editingAccountId) : null;
   const formTitle = el('h3', { style: 'margin-block-end:0.75rem;', textContent: editing ? t('editAliasTitle') : t('addAccount') });
   const errBanner = el('div', { className: 'form-error-banner', hidden: true });
@@ -1195,6 +1635,7 @@ function renderAccountsDialogContent() {
     if (saveBtn.getAttribute('aria-disabled') === 'true') return;
     saveBtn.setAttribute('aria-disabled', 'true');
     try {
+      const hadZeroAccounts = state.accounts.length === 0;
       if (editing) {
         await apiFetch(`/api/accounts/${encodeURIComponent(editing.id)}`, {
           method: 'PATCH',
@@ -1209,7 +1650,8 @@ function renderAccountsDialogContent() {
       }
       await loadDashboardData();
       renderAccountsDialogContent();
-      render();
+      if (hadZeroAccounts || !updateDashboardInPlace()) render();
+      renderDrawerContent();
     } catch (err) {
       errBanner.textContent = err.message;
       errBanner.hidden = false;
@@ -1220,18 +1662,82 @@ function renderAccountsDialogContent() {
 
   body.append(formTitle, errBanner, form);
   inner.append(header, body);
-  accountsDialog.append(inner);
+  accountsDialog.replaceChildren(inner);
 }
 
-// Beszel-style Telemetry Detail Modal
+// ============================================================
+// Beszel-style Telemetry Detail Modal (persistent scroll container!)
+// ============================================================
 let telemetryDialog = null;
 let telemetrySeq = 0;
-async function openTelemetryDialog(vm) {
-  state.telemetryTarget = { accountId: vm.accountId, machineId: vm.id };
+
+function ensureTelemetryDialogShell() {
   if (!telemetryDialog) {
     telemetryDialog = el('dialog', { className: 'app-dialog' });
+    telemetryDialog.addEventListener('close', () => {
+      state.telemetryTarget = null;
+    });
     document.body.append(telemetryDialog);
   }
+  if (telemetryDialog._shell) return telemetryDialog._shell;
+
+  const titleEl = el('h2');
+  const subtitleEl = el('div', { className: 'hint mono' });
+  const header = el('div', { className: 'dialog-header' }, [
+    el('div', {}, [titleEl, subtitleEl]),
+    el('button', {
+      type: 'button',
+      className: 'btn btn-icon-only',
+      'aria-label': t('close'),
+      onClick: () => {
+        telemetryDialog.close();
+        state.telemetryTarget = null;
+      }
+    }, [ICONS.close()])
+  ]);
+
+  const body = el('div', { className: 'dialog-body' });
+  const toolbar = el('div', { className: 'telemetry-toolbar' });
+  const seg = el('div', { className: 'segmented' });
+  const rangeBtns = {};
+  for (const r of ['15m', '1h', '6h', '24h', '7d']) {
+    const b = el('button', {
+      type: 'button',
+      'aria-pressed': state.telemetryRange === r ? 'true' : 'false',
+      textContent: r,
+      onClick: async () => {
+        state.telemetryRange = r;
+        Object.entries(rangeBtns).forEach(([k, btn]) => {
+          btn.setAttribute('aria-pressed', k === r ? 'true' : 'false');
+        });
+        await fetchAndRenderTelemetry();
+      }
+    });
+    rangeBtns[r] = b;
+    seg.append(b);
+  }
+  toolbar.append(seg);
+
+  const cpuBox = el('div');
+  const ramBox = el('div');
+  const diskBox = el('div');
+  const netBox = el('div');
+  const grid = el('div', { className: 'telemetry-grid' }, [cpuBox, ramBox, diskBox, netBox]);
+
+  body.append(toolbar, grid);
+  const inner = el('div', { className: 'dialog-inner' }, [header, body]);
+  telemetryDialog.replaceChildren(inner);
+
+  telemetryDialog._shell = { titleEl, subtitleEl, body, rangeBtns, cpuBox, ramBox, diskBox, netBox };
+  return telemetryDialog._shell;
+}
+
+async function openTelemetryDialog(vm) {
+  state.telemetryTarget = { accountId: vm.accountId, machineId: vm.id };
+  const shell = ensureTelemetryDialogShell();
+  setTextIfChanged(shell.titleEl, `${vm.name} · ${t('telemetryTitle')}`);
+  setTextIfChanged(shell.subtitleEl, `${vm.accountAlias || vm.accountId} · ${vm.id}`);
+  shell.body.scrollTop = 0;
   if (!telemetryDialog.open) telemetryDialog.showModal();
   await fetchAndRenderTelemetry();
 }
@@ -1263,42 +1769,15 @@ async function fetchAndRenderTelemetry() {
 }
 
 function renderTelemetryDialogContent(vm) {
-  telemetryDialog.textContent = '';
-  const inner = el('div', { className: 'dialog-inner' });
-  const header = el('div', { className: 'dialog-header' }, [
-    el('div', {}, [
-      el('h2', { textContent: `${vm.name} · ${t('telemetryTitle')}` }),
-      el('div', { className: 'hint mono', textContent: `${vm.accountAlias || vm.accountId} · ${vm.id}` })
-    ]),
-    el('button', {
-      type: 'button',
-      className: 'btn btn-icon-only',
-      'aria-label': t('close'),
-      onClick: () => {
-        telemetryDialog.close();
-        state.telemetryTarget = null;
-      }
-    }, [ICONS.close()])
-  ]);
+  const shell = ensureTelemetryDialogShell();
+  const prevScrollTop = shell.body.scrollTop;
 
-  const body = el('div', { className: 'dialog-body' });
-  const toolbar = el('div', { className: 'telemetry-toolbar' });
-  const seg = el('div', { className: 'segmented' });
-  for (const r of ['15m', '1h', '6h', '24h', '7d']) {
-    seg.append(el('button', {
-      type: 'button',
-      'aria-pressed': state.telemetryRange === r ? 'true' : 'false',
-      textContent: r,
-      onClick: async () => {
-        state.telemetryRange = r;
-        await fetchAndRenderTelemetry();
-      }
-    }));
-  }
-  toolbar.append(seg);
-  body.append(toolbar);
+  setTextIfChanged(shell.titleEl, `${vm.name} · ${t('telemetryTitle')}`);
+  setTextIfChanged(shell.subtitleEl, `${vm.accountAlias || vm.accountId} · ${vm.id}`);
+  Object.entries(shell.rangeBtns).forEach(([k, btn]) => {
+    btn.setAttribute('aria-pressed', state.telemetryRange === k ? 'true' : 'false');
+  });
 
-  const grid = el('div', { className: 'telemetry-grid' });
   const chartLabels = {
     now: t('currentVal'),
     avg: t('avgVal'),
@@ -1306,8 +1785,7 @@ function renderTelemetryDialogContent(vm) {
     empty: t('noMetricsYet')
   };
 
-  const cpuBox = el('div');
-  renderDetailChart(cpuBox, {
+  renderDetailChart(shell.cpuBox, {
     title: `${t('cpuLabel')} (%)`,
     unit: '%',
     samples: state.telemetrySamples,
@@ -1317,8 +1795,7 @@ function renderTelemetryDialogContent(vm) {
     locale: state.lang
   });
 
-  const ramBox = el('div');
-  renderDetailChart(ramBox, {
+  renderDetailChart(shell.ramBox, {
     title: `${t('ramLabel')} (%)`,
     unit: '%',
     samples: state.telemetrySamples,
@@ -1333,8 +1810,7 @@ function renderTelemetryDialogContent(vm) {
     locale: state.lang
   });
 
-  const diskBox = el('div');
-  renderDetailChart(diskBox, {
+  renderDetailChart(shell.diskBox, {
     title: `${t('diskLabel')} (/data & /)`,
     unit: '%',
     samples: state.telemetrySamples,
@@ -1357,8 +1833,7 @@ function renderTelemetryDialogContent(vm) {
     locale: state.lang
   });
 
-  const netBox = el('div');
-  renderDetailChart(netBox, {
+  renderDetailChart(shell.netBox, {
     title: `${t('netLabel')} & ${t('diskIoLabel')}`,
     unit: 'rate',
     samples: state.telemetrySamples,
@@ -1373,10 +1848,7 @@ function renderTelemetryDialogContent(vm) {
     locale: state.lang
   });
 
-  grid.append(cpuBox, ramBox, diskBox, netBox);
-  body.append(grid);
-  inner.append(header, body);
-  telemetryDialog.append(inner);
+  shell.body.scrollTop = prevScrollTop;
 }
 
 function applyMachinesPayload(data) {
@@ -1397,6 +1869,7 @@ async function loadDashboardData() {
 }
 
 function closeOpenDialogs() {
+  try { if (navDrawer?.open) navDrawer.close(); } catch {}
   try { if (accountsDialog?.open) accountsDialog.close(); } catch {}
   try { if (telemetryDialog?.open) telemetryDialog.close(); } catch {}
   state.telemetryTarget = null;
@@ -1407,12 +1880,7 @@ async function refreshMachinesSilently() {
   if (!state.authenticated || document.hidden) return;
   try {
     await loadDashboardData();
-    const strip = document.getElementById('stats-strip');
-    const host = document.getElementById('vm-list-host');
-    if (strip && host) {
-      populateStatsStrip(strip);
-      populateVmList(host);
-    } else {
+    if (!updateDashboardInPlace()) {
       render();
     }
     if (state.telemetryTarget && telemetryDialog?.open) {
@@ -1422,6 +1890,7 @@ async function refreshMachinesSilently() {
     if (err.status === 401) {
       state.authenticated = false;
       closeOpenDialogs();
+      vmCardRegistry.clear();
       render();
     }
   }
@@ -1434,26 +1903,20 @@ function render() {
   document.documentElement.lang = state.lang;
   const app = document.getElementById('app');
   if (!app) return;
-  app.textContent = '';
-  app.append(renderTopbar());
-  app.append(state.authenticated ? renderDashboard() : renderAuthView());
+  vmCardRegistry.clear();
+  app.replaceChildren(renderTopbar(), state.authenticated ? renderDashboard() : renderAuthView());
+  renderDrawerContent();
 }
 
 async function boot() {
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(() => {});
   }
-  window.addEventListener('beforeinstallprompt', (e) => {
-    e.preventDefault();
-    deferredInstallPrompt = e;
-    const btn = document.getElementById('install-app');
-    if (btn && !supportsWebInstall) btn.hidden = false;
-  });
 
   window.addEventListener('storage', (e) => {
     if (e.key === 'color-scheme') {
       applyTheme(readTheme());
-      render();
+      renderDrawerContent();
     }
   });
 
