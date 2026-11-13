@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="ibmon-bg" x1="6" y1="4" x2="58" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1e40af"/>
+      <stop offset="55%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+    <linearGradient id="ibmon-pulse" x1="14" y1="36" x2="50" y2="28" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#67e8f9"/>
+      <stop offset="50%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#6ee7b7"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="56" height="56" rx="15" fill="url(#ibmon-bg)"/>
+  <g opacity="0.38">
+    <path d="M32 13L49 22.5V41.5L32 51L15 41.5V22.5L32 13ZM15 22.5L32 32L49 22.5M32 32V51" stroke="#e0f2fe" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <path d="M12 34H22L26.5 23.5L32 41L37 28L41 34H52" stroke="url(#ibmon-pulse)" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="49" cy="15" r="4" fill="#10b981" stroke="#ffffff" stroke-width="1.5"/>
+</svg>

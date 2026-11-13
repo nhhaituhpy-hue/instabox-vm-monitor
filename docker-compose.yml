@@ -1,0 +1,22 @@
+services:
+  instabox-vm-monitor:
+    build: .
+    container_name: instabox-vm-monitor
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - instabox_monitor_data:/data
+    environment:
+      PORT: "8080"
+      DATA_DIR: "/data"
+      POLL_INTERVAL_SECONDS: "30"
+      METRICS_RETENTION_DAYS: "7"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  instabox_monitor_data:

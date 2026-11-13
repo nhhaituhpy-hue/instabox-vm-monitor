@@ -1,0 +1,22 @@
+# Binaries & build outputs
+bin/
+dist/
+instabox-vm-monitor
+*.exe
+*.test
+*.out
+coverage.out
+
+# Local data & secrets
+data/
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.bak
+
+# OS & editors
+.DS_Store
+.vscode/
+.idea/
