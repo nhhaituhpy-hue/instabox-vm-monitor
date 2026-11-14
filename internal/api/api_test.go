@@ -887,7 +887,19 @@ func TestMachineTerminalWebSocketProxyAndOriginChecks(t *testing.T) {
 		t.Fatalf("resize echo mismatch: op=%d ctrl=%q err=%v", op, string(ctrlEcho), err)
 	}
 
-	// 6. Upstream 409 surfaces as structured JSON error frame over WS
+	// 6. Reverse-proxy X-Forwarded-Proto: wss with https Origin is accepted as same-origin
+	proxyConn, err := ws.DialContext(ctx, termURL, http.Header{
+		"Origin":            {"https://instabox.hainh.io.vn"},
+		"X-Forwarded-Proto": {"wss"},
+		"X-Forwarded-Host":  {"instabox.hainh.io.vn"},
+		"Cookie":            {cookieHeader},
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("dial terminal WS behind wss proxy: %v", err)
+	}
+	_ = proxyConn.Close()
+
+	// 7. Upstream 409 surfaces as structured JSON error frame over WS
 	errConn, err := ws.DialContext(ctx, termURL+"&wake=0", http.Header{
 		"Origin": {srv.URL},
 		"Cookie": {cookieHeader},

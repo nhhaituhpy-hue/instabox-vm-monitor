@@ -383,7 +383,10 @@ func isHTTPS(r *http.Request) bool {
 	}
 	if isTrustedProxy(remoteHostIP(r.RemoteAddr)) {
 		proto := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")))
-		return proto == "https"
+		if idx := strings.IndexByte(proto, ','); idx >= 0 {
+			proto = strings.TrimSpace(proto[:idx])
+		}
+		return proto == "https" || proto == "wss"
 	}
 	return false
 }
@@ -1194,6 +1197,10 @@ func (s *Server) handleGetOperation(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleMachineTerminal(w http.ResponseWriter, r *http.Request) {
 	if !isSameOriginWebSocket(r) {
+		log.Printf("terminal ws origin_forbidden %s/%s: origin=%q expected=%v://%q xfProto=%q host=%q",
+			r.PathValue("accountId"), r.PathValue("machineId"),
+			r.Header.Get("Origin"), isHTTPS(r), requestOriginHost(r),
+			r.Header.Get("X-Forwarded-Proto"), r.Host)
 		writeError(w, http.StatusForbidden, "origin_forbidden", "cross-origin WebSocket rejected")
 		return
 	}
