@@ -3291,18 +3291,23 @@ async function openTerminalDialog(vm) {
     stateObj.ws = sock;
 
     let gotServerErr = false;
+    let isSessionReady = false;
 
     sock.onopen = () => {
       if (stateObj.disposed || stateObj.ws !== sock) return;
       safeFit();
       sock.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
-      setStatus('connected', t('terminalStatusConnected'));
       term.focus();
     };
 
     sock.onmessage = (ev) => {
       if (stateObj.disposed || stateObj.ws !== sock) return;
       if (ev.data instanceof ArrayBuffer) {
+        if (!isSessionReady && !gotServerErr) {
+          isSessionReady = true;
+          setStatus('connected', t('terminalStatusConnected'));
+          hideBanner();
+        }
         term.write(new Uint8Array(ev.data));
         return;
       }
@@ -3310,6 +3315,7 @@ async function openTerminalDialog(vm) {
         try {
           const msg = JSON.parse(ev.data);
           if (msg.type === 'session') {
+            isSessionReady = true;
             setStatus('connected', t('terminalStatusConnected'));
             hideBanner();
             term.focus();

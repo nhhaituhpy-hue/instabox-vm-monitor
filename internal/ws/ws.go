@@ -35,7 +35,7 @@ const (
 	CloseInternalError   uint16 = 1011
 	maxControlPayload           = 125
 	defaultMaxMessageLen        = 8 << 20 // 8 MiB
-	wsGUID                      = "258EAFA5-E914-47D6-95CA-C5AB0DC85B11"
+	wsGUID                      = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 )
 
 type HandshakeError struct {
@@ -84,7 +84,15 @@ func (c *Conn) Close() error {
 	return err
 }
 
+func sanitizeCloseCode(code uint16) uint16 {
+	if code < 1000 || code == 1004 || code == 1005 || code == 1006 || code == 1015 || code >= 5000 {
+		return CloseNormalClosure
+	}
+	return code
+}
+
 func (c *Conn) CloseWithCode(code uint16, reason string) error {
+	code = sanitizeCloseCode(code)
 	payload := make([]byte, 2+len(reason))
 	binary.BigEndian.PutUint16(payload[:2], code)
 	copy(payload[2:], reason)

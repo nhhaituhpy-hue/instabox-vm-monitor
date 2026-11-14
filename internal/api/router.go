@@ -1261,6 +1261,7 @@ func (s *Server) handleMachineTerminal(w http.ResponseWriter, r *http.Request) {
 
 	clientWS, err := ws.Upgrade(w, r, nil)
 	if err != nil {
+		log.Printf("terminal ws upgrade %s/%s error: %v", accountID, machineID, err)
 		writeError(w, http.StatusBadRequest, "websocket_upgrade_failed", err.Error())
 		return
 	}
@@ -1277,6 +1278,7 @@ func (s *Server) handleMachineTerminal(w http.ResponseWriter, r *http.Request) {
 	cancel()
 
 	if dialErr != nil {
+		log.Printf("terminal dial %s/%s error: %v", accountID, machineID, dialErr)
 		msg := "failed to connect to machine terminal"
 		code := "upstream_error"
 		if apiErr != nil {

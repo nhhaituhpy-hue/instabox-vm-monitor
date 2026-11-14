@@ -105,6 +105,11 @@ func TestWebSocketRoundTripPingPongAndRelay(t *testing.T) {
 		t.Fatalf("ctrl echo mismatch: op=%d msg=%q", op, string(ctrlEcho))
 	}
 
+	// Verify RFC 6455 Section 1.3 Sec-WebSocket-Accept test vector.
+	if got := computeAcceptKey("dGhlIHNhbXBsZSBub25jZQ=="); got != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" {
+		t.Fatalf("RFC 6455 Sec-WebSocket-Accept vector mismatch: got %q", got)
+	}
+
 	// Verify HandshakeError when upstream rejects with 409
 	rejectSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusConflict)
