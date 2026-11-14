@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -378,6 +380,139 @@ func (p *Poller) syncSingleMachine(ctx context.Context, accountID string, m inst
 		updated = append(updated, toMachineRecord(accountID, m))
 	}
 	return p.store.SyncAccountMachines(ctx, accountID, updated)
+}
+
+type TemplateOption struct {
+	ID          string               `json:"id"`
+	Version     string               `json:"version"`
+	Description string               `json:"description,omitempty"`
+	Arch        string               `json:"arch"`
+	DefaultSpec instabox.MachineSpec `json:"defaultSpec"`
+	Default     bool                 `json:"default,omitempty"`
+	PlanAllowed bool                 `json:"planAllowed"`
+}
+
+type AccountMachineOptions struct {
+	AccountID               string                 `json:"accountId"`
+	OrgTier                 string                 `json:"orgTier"`
+	AllowedSpecs            []instabox.MachineSpec `json:"allowedSpecs"`
+	ManualLifecycle         bool                   `json:"manualLifecycle"`
+	AlwaysOnAllowed         bool                   `json:"alwaysOnAllowed"`
+	FixedAutoSuspendSeconds int                    `json:"fixedAutoSuspendSeconds,omitempty"`
+	IdleChoicesSeconds      []int                  `json:"idleChoicesSeconds,omitempty"`
+	Templates               []TemplateOption       `json:"templates"`
+}
+
+func isFreeAllowedTemplate(id string) bool {
+	switch strings.ToLower(strings.TrimSpace(id)) {
+	case "agent-browser", "android", "omarchy", "ci":
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *Poller) GetAccountMachineOptions(ctx context.Context, accountID string) (*AccountMachineOptions, error) {
+	acc, err := p.store.GetAccount(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	apiKey, err := p.store.GetAccountAPIKey(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	me, err := p.client.GetMe(ctx, apiKey)
+	if err != nil {
+		return nil, err
+	}
+	rawTemplates, err := p.client.ListTemplates(ctx, apiKey)
+	if err != nil {
+		return nil, err
+	}
+
+	orgTier := acc.OrgTier
+	if me.Org != nil && me.Org.Tier != "" {
+		orgTier = me.Org.Tier
+	}
+	if orgTier == "" {
+		orgTier = "free"
+	}
+
+	byID := make(map[string]instabox.Template)
+	for _, tpl := range rawTemplates {
+		creatable := !tpl.Hidden
+		if tpl.Creatable != nil {
+			creatable = *tpl.Creatable
+		}
+		if !creatable || tpl.GPU || tpl.Restricted {
+			continue
+		}
+		if tpl.OS != "" && !strings.EqualFold(tpl.OS, "linux") {
+			continue
+		}
+		prev, exists := byID[tpl.ID]
+		if !exists || (tpl.Latest && !prev.Latest) || (tpl.Latest == prev.Latest) {
+			byID[tpl.ID] = tpl
+		}
+	}
+
+	templates := make([]TemplateOption, 0, len(byID))
+	for _, tpl := range byID {
+		planAllowed := !strings.EqualFold(orgTier, "free") || isFreeAllowedTemplate(tpl.ID)
+		templates = append(templates, TemplateOption{
+			ID:          tpl.ID,
+			Version:     tpl.Version,
+			Description: tpl.Description,
+			Arch:        tpl.Arch,
+			DefaultSpec: tpl.DefaultSpec,
+			Default:     tpl.Default,
+			PlanAllowed: planAllowed,
+		})
+	}
+	sort.Slice(templates, func(i, j int) bool {
+		if templates[i].Default != templates[j].Default {
+			return templates[i].Default
+		}
+		if templates[i].PlanAllowed != templates[j].PlanAllowed {
+			return templates[i].PlanAllowed
+		}
+		return templates[i].ID < templates[j].ID
+	})
+
+	specs := me.AllowedSpecs
+	if len(specs) == 0 {
+		specs = []instabox.MachineSpec{{VCPUs: 4, MemMiB: 8192, PersistentDiskGiB: 20}}
+	}
+
+	return &AccountMachineOptions{
+		AccountID:               accountID,
+		OrgTier:                 orgTier,
+		AllowedSpecs:            specs,
+		ManualLifecycle:         me.ManualLifecycle,
+		AlwaysOnAllowed:         me.AlwaysOnAllowed,
+		FixedAutoSuspendSeconds: me.FixedAutoSuspendSeconds,
+		IdleChoicesSeconds:      me.IdleChoicesSeconds,
+		Templates:               templates,
+	}, nil
+}
+
+func (p *Poller) CreateMachine(ctx context.Context, accountID string, in instabox.CreateMachineInput) (*instabox.ActionResult, error) {
+	apiKey, err := p.store.GetAccountAPIKey(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	res, err := p.client.CreateMachine(ctx, apiKey, in)
+	if err != nil {
+		return nil, err
+	}
+	syncCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	_ = p.SyncAccount(syncCtx, accountID)
+
+	if res.Operation != nil && res.Operation.ID != "" && res.Operation.State != "succeeded" && res.Operation.State != "failed" {
+		p.trackOperation(accountID, apiKey, res.Operation.ID)
+	}
+	return res, nil
 }
 
 func (p *Poller) trackOperation(accountID, apiKey, opID string) {

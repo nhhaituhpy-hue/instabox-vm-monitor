@@ -74,16 +74,50 @@ type OrgRef struct {
 }
 
 type Me struct {
-	UserID         int64    `json:"userId"`
-	Login          string   `json:"login"`
-	Name           string   `json:"name"`
-	AvatarURL      string   `json:"avatarUrl"`
-	Email          string   `json:"email"`
-	Admin          bool     `json:"admin"`
-	MachineMetrics bool     `json:"machineMetrics"`
-	OrgID          string   `json:"orgId"`
-	Org            *OrgRef  `json:"org"`
-	Workspaces     []OrgRef `json:"workspaces,omitempty"`
+	UserID                  int64         `json:"userId"`
+	Login                   string        `json:"login"`
+	Name                    string        `json:"name"`
+	AvatarURL               string        `json:"avatarUrl"`
+	Email                   string        `json:"email"`
+	Admin                   bool          `json:"admin"`
+	MachineMetrics          bool          `json:"machineMetrics"`
+	OrgID                   string        `json:"orgId"`
+	Org                     *OrgRef       `json:"org"`
+	Workspaces              []OrgRef      `json:"workspaces,omitempty"`
+	AllowedSpecs            []MachineSpec `json:"allowedSpecs,omitempty"`
+	AlwaysOnAllowed         bool          `json:"alwaysOnAllowed,omitempty"`
+	ManualLifecycle         bool          `json:"manualLifecycle,omitempty"`
+	FixedAutoSuspendSeconds int           `json:"fixedAutoSuspendSeconds,omitempty"`
+	IdleChoicesSeconds      []int         `json:"idleChoicesSeconds,omitempty"`
+}
+
+type Template struct {
+	ID          string      `json:"id"`
+	Version     string      `json:"version"`
+	Description string      `json:"description,omitempty"`
+	Arch        string      `json:"arch"`
+	DefaultSpec MachineSpec `json:"defaultSpec"`
+	OS          string      `json:"os,omitempty"`
+	GPU         bool        `json:"gpu,omitempty"`
+	Hidden      bool        `json:"hidden,omitempty"`
+	Creatable   *bool       `json:"creatable,omitempty"`
+	Latest      bool        `json:"latest,omitempty"`
+	Default     bool        `json:"default,omitempty"`
+	Restricted  bool        `json:"restricted,omitempty"`
+}
+
+type TemplateList struct {
+	Templates []Template `json:"templates"`
+}
+
+type CreateMachineInput struct {
+	Name                    string `json:"name,omitempty"`
+	TemplateID              string `json:"templateId,omitempty"`
+	VCPUs                   int    `json:"vcpus,omitempty"`
+	MemMiB                  int    `json:"memMiB,omitempty"`
+	DesiredState            string `json:"desiredState,omitempty"`
+	AutoSuspendAfterSeconds *int   `json:"autoSuspendAfterSeconds,omitempty"`
+	MaxRunMinutes           *int   `json:"maxRunMinutes,omitempty"`
 }
 
 type TemplateRef struct {
@@ -331,6 +365,24 @@ func (c *Client) GetMachineUsage(ctx context.Context, apiKey, machineID string) 
 		return nil, err
 	}
 	return &out, nil
+}
+
+func (c *Client) ListTemplates(ctx context.Context, apiKey string) ([]Template, error) {
+	var out TemplateList
+	_, err := c.doJSON(ctx, http.MethodGet, "/v1/templates", apiKey, nil, false, &out)
+	if err != nil {
+		return nil, err
+	}
+	return out.Templates, nil
+}
+
+func (c *Client) CreateMachine(ctx context.Context, apiKey string, in CreateMachineInput) (*ActionResult, error) {
+	var op Operation
+	_, err := c.doJSON(ctx, http.MethodPost, "/v1/machines", apiKey, in, true, &op)
+	if err != nil {
+		return nil, err
+	}
+	return &ActionResult{Operation: &op}, nil
 }
 
 func (c *Client) GetOperation(ctx context.Context, apiKey, opID string, wait string) (*Operation, error) {

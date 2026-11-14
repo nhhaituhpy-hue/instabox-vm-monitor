@@ -300,3 +300,86 @@ func TestBackfillMetricsSinceNeverExceeds24Hours(t *testing.T) {
 		t.Fatalf("expected 1 metric sample with CPU & Root disk persisted, got err=%v samples=%+v", err, samples)
 	}
 }
+
+func TestGetAccountMachineOptionsAndCreateMachine(t *testing.T) {
+	dir := t.TempDir()
+	key, _ := crypto.LoadOrCreateMasterKey(dir, "")
+	st, _ := store.Open(filepath.Join(dir, "mon.db"), key)
+	t.Cleanup(func() { _ = st.Close() })
+
+	var created atomic.Bool
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/me":
+			_, _ = w.Write([]byte(`{"userId":1,"login":"u","org":{"id":"org_1","name":"P","tier":"free","kind":"personal"},"allowedSpecs":[{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/templates":
+			_, _ = w.Write([]byte(`{"templates":[
+				{"id":"base","version":"1","arch":"x86_64","hidden":true,"creatable":false,"defaultSpec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20}},
+				{"id":"agent-browser","version":"1","arch":"x86_64","creatable":true,"latest":false,"defaultSpec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20,"rootDiskGiB":16}},
+				{"id":"agent-browser","version":"2","description":"Default browser","arch":"x86_64","creatable":true,"latest":true,"default":true,"defaultSpec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20,"rootDiskGiB":16}},
+				{"id":"universal","version":"2","description":"Paid universal","arch":"x86_64","creatable":true,"latest":true,"defaultSpec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20,"rootDiskGiB":16}},
+				{"id":"macos","version":"1","arch":"arm64","os":"macos","creatable":true,"latest":true,"defaultSpec":{"vcpus":12,"memMiB":24576,"persistentDiskGiB":64}},
+				{"id":"gpu","version":"1","arch":"x86_64","gpu":true,"creatable":true,"latest":true,"defaultSpec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20}}
+			]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines":
+			created.Store(true)
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"id":"op_create_99","machineId":"m_new_99","type":"create","state":"succeeded"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines":
+			if created.Load() {
+				_, _ = w.Write([]byte(`{"machines":[{"id":"m_new_99","name":"box-99","state":"running","desiredState":"running","template":{"id":"agent-browser"},"spec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20,"rootDiskGiB":16},"storage":{"sizeGiB":20,"mountPath":"/data","persistent":true,"synced":true},"runtime":{"ready":true},"maxRunMinutes":120,"free":true}],"nextCursor":null}`))
+			} else {
+				_, _ = w.Write([]byte(`{"machines":[],"nextCursor":null}`))
+			}
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/usage":
+			_, _ = w.Write([]byte(`{"machines":1}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_new_99/usage":
+			_, _ = w.Write([]byte(`{"runningSeconds":10}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_new_99/metrics":
+			_, _ = w.Write([]byte(`{"metrics":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	hc := srv.Client()
+	hc.Transport = &rt{u: u, t: srv.Client().Transport}
+	client, _ := instabox.NewClient("https://api.instabox.sh", hc)
+
+	acc, _ := st.CreateAccount(context.Background(), store.AccountInput{Alias: "A", APIKey: "ibk_a...9", OrgTier: "free"})
+	p := monitor.NewPoller(st, client, 30*time.Second, 7)
+
+	opts, err := p.GetAccountMachineOptions(context.Background(), acc.ID)
+	if err != nil {
+		t.Fatalf("GetAccountMachineOptions err = %v", err)
+	}
+	if opts.OrgTier != "free" || len(opts.AllowedSpecs) != 1 {
+		t.Fatalf("unexpected opts: %+v", opts)
+	}
+	// Should deduplicate agent-browser (latest version 2), exclude hidden base, macos, gpu, and mark universal !PlanAllowed on free
+	if len(opts.Templates) != 2 {
+		t.Fatalf("expected 2 standard templates, got %d: %+v", len(opts.Templates), opts.Templates)
+	}
+	if opts.Templates[0].ID != "agent-browser" || !opts.Templates[0].PlanAllowed || !opts.Templates[0].Default {
+		t.Fatalf("expected agent-browser default & allowed, got %+v", opts.Templates[0])
+	}
+	if opts.Templates[1].ID != "universal" || opts.Templates[1].PlanAllowed {
+		t.Fatalf("expected universal !PlanAllowed on free tier, got %+v", opts.Templates[1])
+	}
+
+	res, err := p.CreateMachine(context.Background(), acc.ID, instabox.CreateMachineInput{Name: "box-99", TemplateID: "agent-browser"})
+	if err != nil {
+		t.Fatalf("CreateMachine err = %v", err)
+	}
+	if res.Operation == nil || res.Operation.MachineID != "m_new_99" {
+		t.Fatalf("unexpected create op: %+v", res)
+	}
+	m, err := st.GetMachine(context.Background(), acc.ID, "m_new_99")
+	if err != nil || m.Name != "box-99" {
+		t.Fatalf("expected newly created machine to be synced into store, err=%v m=%+v", err, m)
+	}
+}

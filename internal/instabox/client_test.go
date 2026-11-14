@@ -155,3 +155,51 @@ func TestClientRejectsRedirectsToProtectAPIKey(t *testing.T) {
 		t.Fatalf("API key leaked across HTTP redirect")
 	}
 }
+
+func TestListTemplatesAndCreateMachine(t *testing.T) {
+	var seenIdem string
+	var seenBody map[string]any
+	client, _ := newMockClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/templates":
+			_, _ = w.Write([]byte(`{"templates":[{"id":"base","version":"2026-10-07.1","arch":"x86_64","hidden":true,"creatable":false,"defaultSpec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20}},{"id":"agent-browser","version":"2026-11-01.3","description":"Browser box","arch":"x86_64","creatable":true,"latest":true,"default":true,"defaultSpec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20,"rootDiskGiB":16}},{"id":"android","version":"2026-11-02.7","description":"Android 14","arch":"x86_64","creatable":true,"latest":true,"defaultSpec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20,"rootDiskGiB":24}}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines":
+			seenIdem = r.Header.Get("Idempotency-Key")
+			_ = json.NewDecoder(r.Body).Decode(&seenBody)
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"id":"op_create_1","machineId":"m_new_1","type":"create","state":"queued","phase":"scheduling"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	ctx := context.Background()
+	tpls, err := client.ListTemplates(ctx, "ibk_test")
+	if err != nil {
+		t.Fatalf("ListTemplates err = %v", err)
+	}
+	if len(tpls) != 3 || !tpls[1].Default || !tpls[1].Latest || tpls[1].DefaultSpec.RootDiskGiB != 16 {
+		t.Fatalf("unexpected templates: %+v", tpls)
+	}
+
+	res, err := client.CreateMachine(ctx, "ibk_test", instabox.CreateMachineInput{
+		Name:       "my-box-2",
+		TemplateID: "android",
+	})
+	if err != nil {
+		t.Fatalf("CreateMachine err = %v", err)
+	}
+	if seenIdem == "" {
+		t.Fatalf("expected Idempotency-Key header on POST /v1/machines")
+	}
+	if seenBody["name"] != "my-box-2" || seenBody["templateId"] != "android" {
+		t.Fatalf("unexpected create payload: %+v", seenBody)
+	}
+	if _, hasVCPUs := seenBody["vcpus"]; hasVCPUs {
+		t.Fatalf("expected zero vcpus to be omitted, got %+v", seenBody)
+	}
+	if res.Operation == nil || res.Operation.ID != "op_create_1" || res.Operation.MachineID != "m_new_1" {
+		t.Fatalf("unexpected create result: %+v", res)
+	}
+}

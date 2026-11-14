@@ -78,8 +78,10 @@ func NewRouter(st *store.Store, client *instabox.Client, poller *monitor.Poller,
 	mux.HandleFunc("PATCH /api/accounts/{id}", s.withAuth(true, s.handleUpdateAccount))
 	mux.HandleFunc("DELETE /api/accounts/{id}", s.withAuth(true, s.handleDeleteAccount))
 	mux.HandleFunc("POST /api/accounts/{id}/sync", s.withAuth(true, s.handleSyncAccount))
+	mux.HandleFunc("GET /api/accounts/{id}/machine-options", s.withAuth(false, s.handleAccountMachineOptions))
 
 	mux.HandleFunc("GET /api/machines", s.withAuth(false, s.handleListMachines))
+	mux.HandleFunc("POST /api/machines", s.withAuth(true, s.handleCreateMachine))
 	mux.HandleFunc("POST /api/sync", s.withAuth(true, s.handleSyncAll))
 	mux.HandleFunc("GET /api/machines/{accountId}/{machineId}/telemetry", s.withAuth(false, s.handleMachineTelemetry))
 	mux.HandleFunc("POST /api/machines/{accountId}/{machineId}/actions/{action}", s.withAuth(true, s.handleMachineAction))
@@ -571,6 +573,126 @@ func (s *Server) handleSyncAccount(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSyncAll(w http.ResponseWriter, r *http.Request) {
 	s.poller.SyncAll(r.Context())
 	s.handleListMachines(w, r)
+}
+
+func isValidMachineName(name string) bool {
+	if len(name) == 0 || len(name) > 63 {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		isAlphaNum := (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+		if i == 0 {
+			if !isAlphaNum {
+				return false
+			}
+			continue
+		}
+		if !isAlphaNum && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) handleAccountMachineOptions(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	opts, err := s.poller.GetAccountMachineOptions(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, store.ErrAccountNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "account not found")
+			return
+		}
+		var apiErr *instabox.APIError
+		if errors.As(err, &apiErr) {
+			writeError(w, clampUpstreamStatus(apiErr.Status), apiErr.Code, apiErr.Message)
+			return
+		}
+		log.Printf("machine options %s error: %v", id, err)
+		writeError(w, http.StatusBadGateway, "upstream_error", "failed to load machine options from instabox.sh")
+		return
+	}
+	writeJSON(w, http.StatusOK, opts)
+}
+
+func (s *Server) handleCreateMachine(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		AccountID  string `json:"accountId"`
+		Name       string `json:"name"`
+		TemplateID string `json:"templateId"`
+		VCPUs      int    `json:"vcpus"`
+		MemMiB     int    `json:"memMiB"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	req.AccountID = strings.TrimSpace(req.AccountID)
+	req.Name = strings.TrimSpace(req.Name)
+	req.TemplateID = strings.TrimSpace(req.TemplateID)
+	if req.AccountID == "" {
+		writeError(w, http.StatusBadRequest, "invalid_account", "accountId is required")
+		return
+	}
+	if req.Name != "" && !isValidMachineName(req.Name) {
+		writeError(w, http.StatusBadRequest, "invalid_name", "machine name must be 1-63 lowercase letters, digits or hyphens, starting with a letter or digit")
+		return
+	}
+	if len(req.TemplateID) > 64 {
+		writeError(w, http.StatusBadRequest, "invalid_template", "templateId is too long")
+		return
+	}
+	if req.VCPUs < 0 || req.MemMiB < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_spec", "vcpus and memMiB must be non-negative")
+		return
+	}
+
+	in := instabox.CreateMachineInput{
+		Name:       req.Name,
+		TemplateID: req.TemplateID,
+		VCPUs:      req.VCPUs,
+		MemMiB:     req.MemMiB,
+	}
+	res, err := s.poller.CreateMachine(r.Context(), req.AccountID, in)
+	if err != nil {
+		if errors.Is(err, store.ErrAccountNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "account not found")
+			return
+		}
+		var apiErr *instabox.APIError
+		if errors.As(err, &apiErr) {
+			writeJSON(w, clampUpstreamStatus(apiErr.Status), map[string]any{
+				"error": map[string]any{
+					"code":              apiErr.Code,
+					"message":           apiErr.Message,
+					"retryable":         apiErr.Retryable,
+					"operationId":       apiErr.OperationID,
+					"retryAfterSeconds": apiErr.RetryAfterSeconds,
+					"reason":            apiErr.Reason,
+					"hint":              apiErr.Hint,
+				},
+			})
+			return
+		}
+		log.Printf("create machine %s error: %v", req.AccountID, err)
+		writeError(w, http.StatusBadGateway, "upstream_error", "failed to create machine with instabox.sh")
+		return
+	}
+
+	accounts, accErr := s.store.ListAccounts(r.Context())
+	machines, machErr := s.store.ListMachines(r.Context())
+	resp := map[string]any{
+		"ok":            true,
+		"operation":     res.Operation,
+		"serverTimeMs":  time.Now().UTC().UnixMilli(),
+		"clockOffsetMs": s.poller.ClockOffsetMs(),
+	}
+	if accErr == nil && accounts != nil {
+		resp["accounts"] = accounts
+	}
+	if machErr == nil && machines != nil {
+		resp["machines"] = machines
+	}
+	writeJSON(w, http.StatusAccepted, resp)
 }
 
 func (s *Server) handleListMachines(w http.ResponseWriter, r *http.Request) {

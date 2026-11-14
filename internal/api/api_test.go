@@ -55,10 +55,24 @@ func setupTestServer(t *testing.T) (http.Handler, *store.Store) {
 		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
 		switch r.URL.Path {
 		case "/v1/me":
-			_, _ = w.Write([]byte(`{"userId":9,"login":"hainh","org":{"id":"org_1","name":"Personal","tier":"free","kind":"personal"}}`))
+			_, _ = w.Write([]byte(`{"userId":9,"login":"hainh","org":{"id":"org_1","name":"Personal","tier":"free","kind":"personal"},"allowedSpecs":[{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20}]}`))
+		case "/v1/templates":
+			_, _ = w.Write([]byte(`{"templates":[{"id":"agent-browser","version":"2026-11-01.3","description":"Browser box","arch":"x86_64","creatable":true,"latest":true,"default":true,"defaultSpec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20,"rootDiskGiB":16}},{"id":"android","version":"2026-11-02.7","description":"Android 14","arch":"x86_64","creatable":true,"latest":true,"defaultSpec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20,"rootDiskGiB":24}}]}`))
 		case "/v1/usage":
 			_, _ = w.Write([]byte(`{"machines":1,"limits":{"maxMachines":1}}`))
 		case "/v1/machines":
+			if r.Method == http.MethodPost {
+				var body map[string]any
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				if body["templateId"] == "forbidden-tpl" {
+					w.WriteHeader(http.StatusForbidden)
+					_, _ = w.Write([]byte(`{"error":{"code":"template_not_allowed","message":"template requires paid plan"}}`))
+					return
+				}
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte(`{"id":"op_create_2","machineId":"m_2","type":"create","state":"succeeded"}`))
+				return
+			}
 			_, _ = w.Write([]byte(`{"machines":[{"id":"m_1","name":"vm-one","state":"running","desiredState":"running","spec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20,"rootDiskGiB":16},"storage":{"sizeGiB":20,"mountPath":"/data","persistent":true,"synced":true},"runtime":{"ready":true},"runStartedAt":"2026-11-13T10:00:00Z","maxRunMinutes":480,"free":true}],"nextCursor":null}`))
 		case "/v1/machines/m_1/usage":
 			_, _ = w.Write([]byte(`{"from":"2026-11-01T00:00:00Z","to":"2026-11-13T12:00:00Z","runningSeconds":1200,"vcpuSeconds":4800,"memGiBSeconds":9600,"diskGiBSeconds":24000,"egressBytes":0}`))
@@ -273,5 +287,103 @@ func TestLoginRateLimiterRejectsUntrustedXFFSpoofingAndSetsNoStore(t *testing.T)
 	}
 	if !got429 {
 		t.Fatalf("expected spoofed leftmost XFF behind trusted proxy to still hit rate-limiter via true client hop")
+	}
+}
+
+func TestMachineOptionsAndCreateMachineEndpoints(t *testing.T) {
+	h, _ := setupTestServer(t)
+
+	// Setup admin
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/setup", bytes.NewBufferString(`{"username":"admin","password":"SuperSecret!123"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("setup HTTP %d", rec.Code)
+	}
+	cookies := rec.Result().Cookies()
+	var setupResp struct {
+		CSRFToken string `json:"csrfToken"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &setupResp)
+
+	// Unauthenticated /api/accounts/{id}/machine-options -> 401
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/accounts/acc1/machine-options", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauthenticated machine-options, got %d", rec.Code)
+	}
+
+	// Add account
+	req = httptest.NewRequest(http.MethodPost, "/api/accounts", bytes.NewBufferString(`{"alias":"Box 1","apiKey":"ibk_valid_secret_key_9999"}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("add account HTTP %d", rec.Code)
+	}
+	var accResp struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &accResp)
+
+	// Fetch machine-options -> 200 with templates & specs
+	req = httptest.NewRequest(http.MethodGet, "/api/accounts/"+accResp.ID+"/machine-options", nil)
+	req.AddCookie(cookies[0])
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("machine-options HTTP %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"agent-browser"`) || !strings.Contains(rec.Body.String(), `"android"`) {
+		t.Fatalf("expected templates in machine-options, got %s", rec.Body.String())
+	}
+
+	// POST /api/machines without CSRF -> 403
+	req = httptest.NewRequest(http.MethodPost, "/api/machines", bytes.NewBufferString(`{"accountId":"`+accResp.ID+`","templateId":"agent-browser"}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without CSRF, got %d", rec.Code)
+	}
+
+	// Invalid machine name -> 400
+	req = httptest.NewRequest(http.MethodPost, "/api/machines", bytes.NewBufferString(`{"accountId":"`+accResp.ID+`","name":"Bad Name!","templateId":"agent-browser"}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid name, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Upstream 403 propagation
+	req = httptest.NewRequest(http.MethodPost, "/api/machines", bytes.NewBufferString(`{"accountId":"`+accResp.ID+`","name":"box-two","templateId":"forbidden-tpl"}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 from upstream template_not_allowed, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Valid create -> 202
+	req = httptest.NewRequest(http.MethodPost, "/api/machines", bytes.NewBufferString(`{"accountId":"`+accResp.ID+`","name":"box-two","templateId":"android","vcpus":4,"memMiB":8192}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 on create machine, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"op_create_2"`) {
+		t.Fatalf("expected operation id in response, got %s", rec.Body.String())
 	}
 }

@@ -94,6 +94,10 @@ const ICONS = {
   clock: () => svgIcon([
     { tag: 'circle', cx: '12', cy: '12', r: '10' },
     { d: 'M12 6v6l4 2' }
+  ]),
+  plus: () => svgIcon([
+    { d: 'M12 5v14' },
+    { d: 'M5 12h14' }
   ])
 };
 
@@ -108,6 +112,7 @@ const state = {
   serverDriftMs: 0,
   accounts: [],
   machines: [],
+  machineOptionsCache: new Map(),
   viewMode: readPref('ibmon-view', 'grid'),
   filterAccount: 'all',
   filterState: 'all',
@@ -350,19 +355,22 @@ function createPasswordField({ id, name, label, hint, autocomplete, errorText, r
   const errEl = el('div', { id: `${id}-err`, className: 'error-msg', textContent: errorText });
   field.append(wrap, errEl);
 
-  const sync = () => {
-    const invalid = input.matches(':user-invalid') || field.dataset.customInvalid === 'true';
+  const sync = (forceCheck = false) => {
+    const invalid =
+      (forceCheck ? !input.checkValidity() : input.matches(':user-invalid')) ||
+      field.dataset.customInvalid === 'true';
     input.setAttribute('aria-invalid', invalid ? 'true' : 'false');
     field.dataset.invalid = invalid ? 'true' : 'false';
     const ids = [hint ? `${id}-hint` : '', invalid ? `${id}-err` : ''].filter(Boolean);
     if (ids.length) input.setAttribute('aria-describedby', ids.join(' '));
     else input.removeAttribute('aria-describedby');
+    return !invalid;
   };
-  input.addEventListener('blur', sync);
+  input.addEventListener('blur', () => sync(false));
   input.addEventListener('input', () => {
     delete field.dataset.customInvalid;
     input.setCustomValidity('');
-    if (input.hasAttribute('aria-invalid')) sync();
+    if (field.dataset.invalid === 'true' || input.getAttribute('aria-invalid') === 'true') sync(false);
   });
   return { field, input, sync };
 }
@@ -481,6 +489,7 @@ function closeDrawer() {
 
 async function triggerSyncAll() {
   try {
+    state.machineOptionsCache.clear();
     const data = await apiFetch('/api/sync', { method: 'POST' });
     applyMachinesPayload(data);
     updateDashboardInPlace();
@@ -520,6 +529,17 @@ function renderDrawerContent() {
 
   if (state.authenticated) {
     body.append(
+      el('button', {
+        type: 'button',
+        className: 'drawer-item',
+        onClick: () => {
+          closeDrawer();
+          setTimeout(() => openAddMachineDialog(), 160);
+        }
+      }, [
+        ICONS.plus(),
+        el('span', { textContent: t('addMachineBtn') })
+      ]),
       el('button', {
         type: 'button',
         className: 'drawer-item',
@@ -613,6 +633,7 @@ function renderDrawerContent() {
         state.csrfToken = '';
         state.accounts = [];
         state.machines = [];
+        state.machineOptionsCache.clear();
         vmCardRegistry.clear();
         render();
       }
@@ -1272,7 +1293,7 @@ function populateStatsStrip(strip) {
 function updateDashboardHero(heroEl) {
   const hero = heroEl || document.getElementById('dashboard-hero');
   if (!hero || !hero._refs) return;
-  const { titleText, metaEl, accBtnText, syncBtnText } = hero._refs;
+  const { titleText, metaEl, addBtnText, syncBtnText } = hero._refs;
 
   const total = state.machines.length;
   const running = state.machines.filter((m) => m.state === 'running').length;
@@ -1282,7 +1303,7 @@ function updateDashboardHero(heroEl) {
 
   setTextIfChanged(titleText, heading.replace(/\.+$/, ''));
   setTextIfChanged(metaEl, t('heroMeta', { accounts: state.accounts.length, machines: total }));
-  setTextIfChanged(accBtnText, `${t('accountsBtn')} (${state.accounts.length})`);
+  setTextIfChanged(addBtnText, t('addMachineBtn'));
   setTextIfChanged(syncBtnText, `${t('refreshAll')} →`);
 }
 
@@ -1296,7 +1317,7 @@ function renderDashboard() {
     el('span', { className: 'hero-dot', textContent: '.' })
   ]);
   const metaEl = el('p', { className: 'hero-meta mono' });
-  const accBtnText = el('span');
+  const addBtnText = el('span');
   const syncBtnText = el('span');
 
   const hero = el('section', { id: 'dashboard-hero', className: 'dashboard-hero' }, [
@@ -1305,8 +1326,8 @@ function renderDashboard() {
       el('button', {
         type: 'button',
         className: 'btn-pill-dark',
-        onClick: () => openAccountsDialog()
-      }, [ICONS.accounts(), accBtnText]),
+        onClick: () => openAddMachineDialog()
+      }, [ICONS.plus(), addBtnText]),
       el('button', {
         type: 'button',
         className: 'btn-ghost-link',
@@ -1314,7 +1335,7 @@ function renderDashboard() {
       }, [syncBtnText])
     ])
   ]);
-  hero._refs = { titleText, metaEl, accBtnText, syncBtnText };
+  hero._refs = { titleText, metaEl, addBtnText, syncBtnText };
   updateDashboardHero(hero);
   main.append(hero);
 
@@ -1331,8 +1352,8 @@ function renderDashboard() {
       el('button', {
         type: 'button',
         className: 'btn btn-primary',
-        textContent: t('addFirstAccount'),
-        onClick: () => openAccountsDialog()
+        textContent: t('addMachineBtn'),
+        onClick: () => openAddMachineDialog('connect')
       })
     ]));
     return main;
@@ -1355,18 +1376,15 @@ function renderDashboard() {
   searchWrap.append(searchInput);
 
   const accSelect = el('select', {
+    id: 'filter-account-select',
     className: 'select-compact',
     'aria-label': t('allAccounts'),
     onChange: (e) => {
       state.filterAccount = e.target.value;
       renderVmListOnly();
     }
-  }, [el('option', { value: 'all', textContent: t('allAccounts') })]);
-  for (const a of state.accounts) {
-    const opt = el('option', { value: a.id, textContent: a.alias });
-    if (state.filterAccount === a.id) opt.selected = true;
-    accSelect.append(opt);
-  }
+  });
+  syncAccountFilterSelect(accSelect);
 
   const stateSelect = el('select', {
     className: 'select-compact',
@@ -1505,16 +1523,555 @@ function renderVmListOnly() {
   if (host) populateVmList(host);
 }
 
+function syncAccountFilterSelect(accSelect) {
+  const sel = accSelect || document.getElementById('filter-account-select');
+  if (!sel) return;
+  const sig = state.accounts.map((a) => `${a.id}:${a.alias}`).join('|') + `|${state.lang}`;
+  if (sel.dataset.sig === sig) return;
+  sel.dataset.sig = sig;
+  const opts = [el('option', { value: 'all', textContent: t('allAccounts') })];
+  for (const a of state.accounts) {
+    opts.push(el('option', { value: a.id, textContent: a.alias }));
+  }
+  sel.replaceChildren(...opts);
+  if (state.filterAccount !== 'all' && !state.accounts.some((a) => a.id === state.filterAccount)) {
+    state.filterAccount = 'all';
+  }
+  sel.value = state.filterAccount;
+}
+
 function updateDashboardInPlace() {
   const strip = document.getElementById('stats-strip');
   const host = document.getElementById('vm-list-host');
   if (strip && host) {
     updateDashboardHero();
+    syncAccountFilterSelect();
     populateStatsStrip(strip);
     populateVmList(host);
     return true;
   }
   return false;
+}
+
+function enableDialogLightDismiss(dialog) {
+  dialog.setAttribute('closedby', 'any');
+  if (!('closedBy' in HTMLDialogElement.prototype)) {
+    const outside = (e) => {
+      if (e.target !== dialog) return false;
+      const r = dialog.getBoundingClientRect();
+      return e.clientX < r.left || e.clientX > r.right || e.clientY < r.top || e.clientY > r.bottom;
+    };
+    let pressedOutside = false;
+    dialog.addEventListener('pointerdown', (e) => { pressedOutside = outside(e); });
+    dialog.addEventListener('pointerup', (e) => { if (pressedOutside && outside(e)) dialog.close(); });
+  }
+}
+
+// ============================================================
+// Add Machine Dialog (Create New VM OR Attach New API Key)
+// ============================================================
+let addMachineDialog = null;
+function openAddMachineDialog(initialTab) {
+  if (!addMachineDialog) {
+    addMachineDialog = el('dialog', {
+      className: 'app-dialog app-dialog-narrow',
+      'aria-labelledby': 'add-machine-title'
+    });
+    enableDialogLightDismiss(addMachineDialog);
+    addMachineDialog.addEventListener('close', () => {
+      const apiKeyInput = addMachineDialog.querySelector('#addm-apikey');
+      if (apiKeyInput) apiKeyInput.value = '';
+    });
+    document.body.append(addMachineDialog);
+  }
+  const activeTab = initialTab || (state.accounts.length > 0 ? 'create' : 'connect');
+  renderAddMachineDialogContent(activeTab);
+  if (!addMachineDialog.open) {
+    addMachineDialog.showModal();
+  } else {
+    addMachineDialog.querySelector('[autofocus]')?.focus();
+  }
+}
+
+function renderAddMachineDialogContent(initialTab) {
+  if (!addMachineDialog) return;
+
+  let activeTab = initialTab === 'connect' || state.accounts.length === 0 ? 'connect' : 'create';
+
+  const header = el('div', { className: 'dialog-header' }, [
+    el('h2', { id: 'add-machine-title', textContent: t('addMachineTitle') }),
+    el('button', {
+      type: 'button',
+      className: 'btn btn-icon-only',
+      'aria-label': t('close'),
+      onClick: () => addMachineDialog.close()
+    }, [ICONS.close()])
+  ]);
+
+  const body = el('div', { className: 'dialog-body' });
+  body.append(el('p', { className: 'hint', style: 'margin-block-end:0.85rem;', textContent: t('addMachineDesc') }));
+
+  const tabsWrap = el('div', { className: 'dialog-tabs' });
+  const tabCreateBtn = el('button', {
+    type: 'button',
+    role: 'tab',
+    id: 'tab-create-vm',
+    'aria-selected': activeTab === 'create' ? 'true' : 'false',
+    textContent: t('tabCreateVm')
+  });
+  const tabConnectBtn = el('button', {
+    type: 'button',
+    role: 'tab',
+    id: 'tab-connect-key',
+    'aria-selected': activeTab === 'connect' ? 'true' : 'false',
+    textContent: t('tabConnectKey')
+  });
+  if (activeTab === 'create') tabCreateBtn.setAttribute('focusgroupstart', '');
+  else tabConnectBtn.setAttribute('focusgroupstart', '');
+
+  const tablist = el('div', {
+    className: 'dialog-tablist',
+    role: 'tablist',
+    focusgroup: 'tablist nomemory',
+    'aria-label': t('addMachineTitle')
+  }, [tabCreateBtn, tabConnectBtn]);
+
+  const panelCreate = el('div', {
+    role: 'tabpanel',
+    'aria-labelledby': 'tab-create-vm',
+    hidden: activeTab !== 'create'
+  });
+  const panelConnect = el('div', {
+    role: 'tabpanel',
+    'aria-labelledby': 'tab-connect-key',
+    hidden: activeTab !== 'connect'
+  });
+
+  const tabs = [
+    { id: 'create', btn: tabCreateBtn, panel: panelCreate },
+    { id: 'connect', btn: tabConnectBtn, panel: panelConnect }
+  ];
+
+  const syncRovingTabindex = () => {
+    if ('focusGroup' in HTMLElement.prototype) return;
+    for (const item of tabs) {
+      item.btn.tabIndex = item.id === activeTab ? 0 : -1;
+    }
+  };
+
+  const setActiveTab = (nextId, moveFocus = false) => {
+    activeTab = nextId;
+    for (const item of tabs) {
+      const sel = item.id === nextId;
+      item.btn.setAttribute('aria-selected', sel ? 'true' : 'false');
+      item.btn.toggleAttribute('focusgroupstart', sel);
+      item.panel.hidden = !sel;
+      if (sel) {
+        item.btn.scrollIntoView({ block: 'nearest', inline: 'nearest', container: 'nearest' });
+        if (moveFocus) item.btn.focus();
+      }
+    }
+    syncRovingTabindex();
+  };
+
+  syncRovingTabindex();
+  tabCreateBtn.addEventListener('click', () => setActiveTab('create'));
+  tabConnectBtn.addEventListener('click', () => setActiveTab('connect'));
+
+  tablist.addEventListener('keydown', (e) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+    e.preventDefault();
+    const cur = tabs.findIndex((x) => x.id === activeTab);
+    let next = cur;
+    if (e.key === 'ArrowRight') next = (cur + 1) % tabs.length;
+    else if (e.key === 'ArrowLeft') next = (cur - 1 + tabs.length) % tabs.length;
+    else if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = tabs.length - 1;
+    setActiveTab(tabs[next].id, true);
+  });
+
+  // --- Panel 1: Create New VM ---
+  const createInner = el('div', { className: 'tabpanel-inner' });
+  if (state.accounts.length === 0) {
+    createInner.append(
+      el('p', { className: 'hint', textContent: t('needAccountFirst') }),
+      el('div', {}, [
+        el('button', {
+          type: 'button',
+          className: 'btn btn-primary',
+          textContent: t('switchToAttachKey'),
+          onClick: () => {
+            setActiveTab('connect');
+            document.getElementById('addm-alias')?.focus();
+          }
+        })
+      ])
+    );
+  } else {
+    const createErrBanner = el('div', { className: 'form-error-banner', role: 'alert', hidden: true });
+    const createForm = el('form', { novalidate: true, 'aria-labelledby': 'tab-create-vm' });
+
+    const defaultAccId =
+      state.filterAccount !== 'all' && state.accounts.some((a) => a.id === state.filterAccount)
+        ? state.filterAccount
+        : state.accounts[0].id;
+
+    const accSelect = el('select', {
+      id: 'addm-account',
+      name: 'accountId',
+      className: 'input',
+      autofocus: activeTab === 'create'
+    });
+    for (const acc of state.accounts) {
+      const label = `${acc.alias}${acc.instaboxLogin ? ` (${acc.instaboxLogin}` : ''}${acc.orgTier ? ` · ${acc.orgTier}` : ''}${acc.instaboxLogin ? ')' : ''}`;
+      const opt = el('option', { value: acc.id, textContent: label });
+      if (acc.id === defaultAccId) opt.selected = true;
+      accSelect.append(opt);
+    }
+    const accField = el('div', { className: 'field', style: 'margin-block-end:0;' }, [
+      el('label', { for: 'addm-account', textContent: t('targetAccountLabel') }),
+      accSelect
+    ]);
+
+    const nameHint = el('span', { id: 'addm-name-hint', className: 'hint', textContent: t('machineNameHint') });
+    const nameInput = el('input', {
+      className: 'input',
+      id: 'addm-name',
+      name: 'name',
+      type: 'text',
+      maxlength: '63',
+      pattern: '^[a-z0-9][a-z0-9-]{0,62}$',
+      placeholder: t('machineNamePlaceholder'),
+      autocorrect: 'off',
+      autocapitalize: 'none',
+      spellcheck: 'false',
+      'aria-invalid': 'false',
+      'aria-describedby': 'addm-name-hint',
+      dataset: { error: 'addm-name-err' }
+    });
+    const nameErr = el('div', { id: 'addm-name-err', className: 'error-msg', textContent: t('errMachineName') });
+    const nameField = el('div', { className: 'field', style: 'margin-block-end:0;', dataset: { invalid: 'false' } }, [
+      el('label', { for: 'addm-name', textContent: t('machineNameLabel') }),
+      nameHint,
+      nameInput,
+      nameErr
+    ]);
+
+    const syncNameValidity = (announce = false) => {
+      const raw = nameInput.value.trim();
+      if (raw !== nameInput.value) nameInput.value = raw;
+      const valid = raw === '' || /^[a-z0-9][a-z0-9-]{0,62}$/.test(raw);
+      nameInput.setCustomValidity(valid ? '' : t('errMachineName'));
+      nameInput.setAttribute('aria-invalid', valid ? 'false' : 'true');
+      nameField.dataset.invalid = valid ? 'false' : 'true';
+      nameInput.setAttribute('aria-describedby', valid ? 'addm-name-hint' : 'addm-name-hint addm-name-err');
+      if (!valid && announce) liveAnnouncer.textContent = `${t('machineNameLabel')}: ${t('errMachineName')}`;
+      return valid;
+    };
+    nameInput.addEventListener('blur', () => syncNameValidity(true));
+    nameInput.addEventListener('input', () => {
+      nameInput.setCustomValidity('');
+      if (nameField.dataset.invalid === 'true') syncNameValidity(false);
+    });
+
+    const tplSelect = el('select', {
+      id: 'addm-template',
+      name: 'templateId',
+      className: 'input'
+    });
+    const tplField = el('div', { className: 'field', style: 'margin-block-end:0;' }, [
+      el('label', { for: 'addm-template', textContent: t('templateLabel') }),
+      tplSelect
+    ]);
+
+    const tplPreview = el('div', { className: 'template-preview' });
+    const tplPreviewHead = el('div', { className: 'template-preview-head' });
+    const tplPreviewDesc = el('div', { className: 'template-preview-desc' });
+    tplPreview.append(tplPreviewHead, tplPreviewDesc);
+
+    const specSelect = el('select', {
+      id: 'addm-spec',
+      name: 'spec',
+      className: 'input'
+    });
+    const specField = el('div', { className: 'field', style: 'margin-block-end:0;' }, [
+      el('label', { for: 'addm-spec', textContent: t('specLabel') }),
+      specSelect
+    ]);
+
+    let currentOptions = null;
+    const renderTemplatePreview = () => {
+      const templates = currentOptions?.templates || [];
+      const chosen = templates.find((x) => x.id === tplSelect.value) || templates[0];
+      if (!chosen) {
+        tplPreview.hidden = true;
+        return;
+      }
+      tplPreview.hidden = false;
+      const spec = chosen.defaultSpec || {};
+      const ramGiB = spec.memMiB ? (spec.memMiB / 1024).toFixed(spec.memMiB % 1024 === 0 ? 0 : 1) : '?';
+      const diskTxt = spec.rootDiskGiB
+        ? `/ ${spec.rootDiskGiB} + /data ${spec.persistentDiskGiB || 20} GB`
+        : `/data ${spec.persistentDiskGiB || 20} GB`;
+      const badges = [
+        el('span', { className: 'mono', textContent: `${chosen.id}@${chosen.version}` }),
+        el('span', { className: 'badge', textContent: `${spec.vcpus || 4} vCPU · ${ramGiB} GiB · ${diskTxt}` })
+      ];
+      if (chosen.default) badges.push(el('span', { className: 'badge', dataset: { tone: 'running' }, textContent: t('defaultTag') }));
+      if (!chosen.planAllowed) badges.push(el('span', { className: 'badge', dataset: { tone: 'idle' }, textContent: t('paidPlanTag') }));
+      tplPreviewHead.replaceChildren(...badges);
+      tplPreviewDesc.textContent = chosen.description || '';
+    };
+
+    tplSelect.addEventListener('change', renderTemplatePreview);
+
+    let optionsSeq = 0;
+    const loadOptionsForAccount = async (accountId) => {
+      const seq = ++optionsSeq;
+      const cached = state.machineOptionsCache.get(accountId);
+      if (!cached) {
+        currentOptions = null;
+        tplSelect.replaceChildren(el('option', { value: 'agent-browser', textContent: t('loadingOptions') }));
+        specSelect.replaceChildren(el('option', { value: '', textContent: '4 vCPU · 8 GiB RAM · 20 GB /data' }));
+        renderTemplatePreview();
+      }
+      try {
+        const opts = cached || (await apiFetch(`/api/accounts/${encodeURIComponent(accountId)}/machine-options`));
+        state.machineOptionsCache.set(accountId, opts);
+        if (seq !== optionsSeq) return;
+        currentOptions = opts;
+
+        const tplOpts = (opts.templates || []).map((tpl) => {
+          const suffix = tpl.default ? ` (${t('defaultTag')})` : (!tpl.planAllowed ? ` (${t('paidPlanTag')})` : '');
+          return el('option', { value: tpl.id, textContent: `${tpl.id}${suffix}` });
+        });
+        if (tplOpts.length === 0) {
+          tplOpts.push(el('option', { value: 'agent-browser', textContent: 'agent-browser' }));
+        }
+        tplSelect.replaceChildren(...tplOpts);
+        const defTpl = (opts.templates || []).find((x) => x.default && x.planAllowed) || (opts.templates || [])[0];
+        if (defTpl) tplSelect.value = defTpl.id;
+        renderTemplatePreview();
+
+        const specs = opts.allowedSpecs || [];
+        const specOpts = specs.map((sp) => {
+          const ramGiB = (sp.memMiB / 1024).toFixed(sp.memMiB % 1024 === 0 ? 0 : 1);
+          return el('option', {
+            value: `${sp.vcpus}:${sp.memMiB}`,
+            textContent: `${sp.vcpus} vCPU · ${ramGiB} GiB RAM · ${sp.persistentDiskGiB || 20} GB /data`
+          });
+        });
+        if (specOpts.length === 0) {
+          specOpts.push(el('option', { value: '', textContent: '4 vCPU · 8 GiB RAM · 20 GB /data' }));
+        }
+        specSelect.replaceChildren(...specOpts);
+      } catch (err) {
+        if (seq !== optionsSeq) return;
+        currentOptions = null;
+        renderTemplatePreview();
+        tplSelect.replaceChildren(
+          el('option', { value: 'agent-browser', textContent: 'agent-browser' }),
+          el('option', { value: 'android', textContent: 'android' }),
+          el('option', { value: 'omarchy', textContent: 'omarchy' }),
+          el('option', { value: 'ci', textContent: 'ci' })
+        );
+        createErrBanner.textContent = err.message;
+        createErrBanner.hidden = false;
+      }
+    };
+
+    accSelect.addEventListener('change', () => {
+      createErrBanner.hidden = true;
+      loadOptionsForAccount(accSelect.value);
+    });
+    loadOptionsForAccount(accSelect.value);
+
+    const createBtn = el('button', {
+      type: 'submit',
+      className: 'btn btn-primary',
+      style: 'min-block-size:44px;',
+      textContent: t('createVmSubmit')
+    });
+
+    createForm.append(
+      createErrBanner,
+      el('div', { className: 'form-stack' }, [
+        accField,
+        nameField,
+        el('div', { className: 'form-row-2' }, [tplField, specField]),
+        tplPreview,
+        createBtn
+      ])
+    );
+    createForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      createErrBanner.hidden = true;
+      if (!syncNameValidity(false)) {
+        nameInput.focus();
+        return;
+      }
+      if (createBtn.getAttribute('aria-disabled') === 'true') return;
+      createBtn.setAttribute('aria-disabled', 'true');
+      try {
+        const [vcpusStr, memStr] = (specSelect.value || '').split(':');
+        const payload = {
+          accountId: accSelect.value,
+          name: nameInput.value.trim(),
+          templateId: tplSelect.value || 'agent-browser',
+          vcpus: Number(vcpusStr) || 0,
+          memMiB: Number(memStr) || 0
+        };
+        const res = await apiFetch('/api/machines', {
+          method: 'POST',
+          body: JSON.stringify(payload)
+        });
+        applyMachinesPayload(res);
+        if (!updateDashboardInPlace()) render();
+        renderDrawerContent();
+        addMachineDialog.close();
+        showToast(`${t('machineCreated')}${payload.name ? `: ${payload.name}` : ''}`);
+        setTimeout(() => refreshMachinesSilently(), 2000);
+        setTimeout(() => refreshMachinesSilently(), 5500);
+        setTimeout(() => refreshMachinesSilently(), 11000);
+      } catch (err) {
+        createErrBanner.textContent = err.message;
+        createErrBanner.hidden = false;
+      } finally {
+        createBtn.removeAttribute('aria-disabled');
+      }
+    });
+
+    createInner.append(createForm);
+  }
+  panelCreate.append(createInner);
+
+  // --- Panel 2: Attach New API Key ---
+  const connectInner = el('div', { className: 'tabpanel-inner' });
+  const connectErrBanner = el('div', { className: 'form-error-banner', role: 'alert', hidden: true });
+  const connectForm = el('form', { novalidate: true, 'aria-labelledby': 'tab-connect-key' });
+
+  const aliasInput = el('input', {
+    className: 'input',
+    id: 'addm-alias',
+    name: 'alias',
+    type: 'text',
+    required: true,
+    maxlength: '64',
+    placeholder: t('aliasPlaceholder'),
+    'aria-invalid': 'false',
+    dataset: { error: 'addm-alias-err' }
+  });
+  if (activeTab === 'connect') aliasInput.setAttribute('autofocus', '');
+  const aliasErr = el('div', { id: 'addm-alias-err', className: 'error-msg', textContent: t('errGeneric') });
+  const aliasField = el('div', { className: 'field', style: 'margin-block-end:0;', dataset: { invalid: 'false' } }, [
+    el('label', { for: 'addm-alias', textContent: t('aliasLabel') }),
+    aliasInput,
+    aliasErr
+  ]);
+  const syncAlias = () => {
+    const valid = aliasInput.value.trim().length > 0;
+    aliasInput.setCustomValidity(valid ? '' : t('errGeneric'));
+    aliasInput.setAttribute('aria-invalid', valid ? 'false' : 'true');
+    aliasField.dataset.invalid = valid ? 'false' : 'true';
+    if (!valid) aliasInput.setAttribute('aria-describedby', 'addm-alias-err');
+    else aliasInput.removeAttribute('aria-describedby');
+    return valid;
+  };
+  aliasInput.addEventListener('blur', syncAlias);
+  aliasInput.addEventListener('input', () => {
+    aliasInput.setCustomValidity('');
+    if (aliasField.dataset.invalid === 'true') syncAlias();
+  });
+
+  const keyPw = createPasswordField({
+    id: 'addm-apikey',
+    name: 'apiKey',
+    label: t('apiKeyLabel'),
+    autocomplete: 'off',
+    errorText: t('errApiKey'),
+    required: true,
+    minlength: 8
+  });
+  keyPw.input.placeholder = t('apiKeyPlaceholder');
+  keyPw.input.autocorrect = 'off';
+  keyPw.input.autocapitalize = 'none';
+  keyPw.input.spellcheck = false;
+
+  const saveKeyBtn = el('button', {
+    type: 'submit',
+    className: 'btn btn-primary',
+    style: 'min-block-size:44px;',
+    textContent: t('saveAccount')
+  });
+
+  keyPw.field.style.marginBlockEnd = '0';
+  connectForm.append(
+    connectErrBanner,
+    el('div', { className: 'form-stack' }, [aliasField, keyPw.field, saveKeyBtn])
+  );
+  connectForm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    connectErrBanner.hidden = true;
+    const okAlias = syncAlias();
+    const apiKey = keyPw.input.value.trim();
+    if (apiKey.length < 8) {
+      keyPw.field.dataset.customInvalid = 'true';
+      keyPw.input.setCustomValidity(t('errApiKey'));
+    } else {
+      delete keyPw.field.dataset.customInvalid;
+      keyPw.input.setCustomValidity('');
+    }
+    const okKey = keyPw.sync(true);
+    if (!okAlias) {
+      aliasInput.focus();
+      return;
+    }
+    if (!okKey || apiKey.length < 8) {
+      keyPw.input.focus();
+      return;
+    }
+    if (saveKeyBtn.getAttribute('aria-disabled') === 'true') return;
+    saveKeyBtn.setAttribute('aria-disabled', 'true');
+    try {
+      const hadZeroAccounts = state.accounts.length === 0;
+      await apiFetch('/api/accounts', {
+        method: 'POST',
+        body: JSON.stringify({ alias: aliasInput.value.trim(), apiKey })
+      });
+      keyPw.input.value = '';
+      state.machineOptionsCache.clear();
+      await loadDashboardData();
+      if (hadZeroAccounts || !updateDashboardInPlace()) render();
+      renderDrawerContent();
+      addMachineDialog.close();
+      showToast(`${t('saveAccount')}: ${aliasInput.value.trim()}`);
+    } catch (err) {
+      connectErrBanner.textContent = err.message;
+      connectErrBanner.hidden = false;
+    } finally {
+      saveKeyBtn.removeAttribute('aria-disabled');
+    }
+  });
+
+  connectInner.append(connectForm);
+  if (state.accounts.length > 0) {
+    connectInner.append(el('div', { className: 'dialog-subfooter' }, [
+      el('button', {
+        type: 'button',
+        className: 'btn-ghost-link',
+        textContent: t('manageSavedKeys', { count: state.accounts.length }),
+        onClick: () => {
+          addMachineDialog.close();
+          openAccountsDialog();
+        }
+      })
+    ]));
+  }
+  panelConnect.append(connectInner);
+
+  tabsWrap.append(tablist, panelCreate, panelConnect);
+  body.append(tabsWrap);
+  addMachineDialog.replaceChildren(el('div', { className: 'dialog-inner' }, [header, body]));
 }
 
 // ============================================================
@@ -1523,7 +2080,11 @@ function updateDashboardInPlace() {
 let accountsDialog = null;
 function openAccountsDialog() {
   if (!accountsDialog) {
-    accountsDialog = el('dialog', { className: 'app-dialog' });
+    accountsDialog = el('dialog', {
+      className: 'app-dialog app-dialog-narrow',
+      'aria-labelledby': 'accounts-dialog-title'
+    });
+    enableDialogLightDismiss(accountsDialog);
     document.body.append(accountsDialog);
   }
   renderAccountsDialogContent();
@@ -1535,7 +2096,7 @@ function renderAccountsDialogContent() {
 
   const inner = el('div', { className: 'dialog-inner' });
   const header = el('div', { className: 'dialog-header' }, [
-    el('h2', { textContent: t('accountsTitle') }),
+    el('h2', { id: 'accounts-dialog-title', textContent: t('accountsTitle') }),
     el('button', {
       type: 'button',
       className: 'btn btn-icon-only',
@@ -1568,6 +2129,7 @@ function renderAccountsDialogContent() {
         title: t('syncNow'),
         onClick: async () => {
           try {
+            state.machineOptionsCache.delete(acc.id);
             const data = await apiFetch(`/api/accounts/${encodeURIComponent(acc.id)}/sync`, { method: 'POST' });
             applyMachinesPayload(data);
             renderAccountsDialogContent();
@@ -1596,6 +2158,7 @@ function renderAccountsDialogContent() {
           if (!window.confirm(t('confirmDeleteAcc', { alias: acc.alias }))) return;
           try {
             await apiFetch(`/api/accounts/${encodeURIComponent(acc.id)}`, { method: 'DELETE' });
+            state.machineOptionsCache.delete(acc.id);
             await loadDashboardData();
             renderAccountsDialogContent();
             render();
@@ -1695,6 +2258,7 @@ function renderAccountsDialogContent() {
           body: JSON.stringify({ alias, apiKey })
         });
       }
+      state.machineOptionsCache.clear();
       await loadDashboardData();
       renderAccountsDialogContent();
       if (hadZeroAccounts || !updateDashboardInPlace()) render();
@@ -1720,7 +2284,11 @@ let telemetrySeq = 0;
 
 function ensureTelemetryDialogShell() {
   if (!telemetryDialog) {
-    telemetryDialog = el('dialog', { className: 'app-dialog' });
+    telemetryDialog = el('dialog', {
+      className: 'app-dialog',
+      'aria-labelledby': 'telemetry-dialog-title'
+    });
+    enableDialogLightDismiss(telemetryDialog);
     telemetryDialog.addEventListener('close', () => {
       state.telemetryTarget = null;
     });
@@ -1728,7 +2296,7 @@ function ensureTelemetryDialogShell() {
   }
   if (telemetryDialog._shell) return telemetryDialog._shell;
 
-  const titleEl = el('h2');
+  const titleEl = el('h2', { id: 'telemetry-dialog-title' });
   const subtitleEl = el('div', { className: 'hint mono' });
   const header = el('div', { className: 'dialog-header' }, [
     el('div', {}, [titleEl, subtitleEl]),
@@ -1922,8 +2490,12 @@ function applyMachinesPayload(data) {
   if (typeof data.clockOffsetMs === 'number') {
     state.clockOffsetMs = data.clockOffsetMs;
   }
-  state.accounts = data.accounts || [];
-  state.machines = data.machines || [];
+  if (Array.isArray(data.accounts)) {
+    state.accounts = data.accounts;
+  }
+  if (Array.isArray(data.machines)) {
+    state.machines = data.machines;
+  }
 }
 
 async function loadDashboardData() {
@@ -1933,6 +2505,7 @@ async function loadDashboardData() {
 
 function closeOpenDialogs() {
   try { if (navDrawer?.open) navDrawer.close(); } catch {}
+  try { if (addMachineDialog?.open) addMachineDialog.close(); } catch {}
   try { if (accountsDialog?.open) accountsDialog.close(); } catch {}
   try { if (telemetryDialog?.open) telemetryDialog.close(); } catch {}
   state.telemetryTarget = null;
@@ -1952,6 +2525,7 @@ async function refreshMachinesSilently() {
   } catch (err) {
     if (err.status === 401) {
       state.authenticated = false;
+      state.machineOptionsCache.clear();
       closeOpenDialogs();
       vmCardRegistry.clear();
       render();
