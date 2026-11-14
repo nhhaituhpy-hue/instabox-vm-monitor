@@ -19,6 +19,7 @@ var (
 	ErrSessionNotFound    = errors.New("session not found or expired")
 	ErrAccountNotFound    = errors.New("account not found")
 	ErrMachineNotFound    = errors.New("machine not found")
+	ErrAPIKeyNotFound     = errors.New("api key not found")
 )
 
 type Store struct {
@@ -39,6 +40,14 @@ type Session struct {
 	CSRFToken string `json:"csrfToken"`
 	ExpiresAt int64  `json:"expiresAt"`
 	CreatedAt int64  `json:"createdAt"`
+}
+
+type APIKeyRecord struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	KeyMask    string `json:"keyMask"`
+	LastUsedAt int64  `json:"lastUsedAt"`
+	CreatedAt  int64  `json:"createdAt"`
 }
 
 type Account struct {
@@ -245,6 +254,15 @@ func (s *Store) migrate(ctx context.Context) error {
 		FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
 	);
 	CREATE INDEX IF NOT EXISTS idx_machine_metrics_ts ON machine_metrics(account_id, machine_id, ts);
+
+	CREATE TABLE IF NOT EXISTS api_keys (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		key_hash TEXT NOT NULL UNIQUE,
+		key_mask TEXT NOT NULL,
+		last_used_at INTEGER NOT NULL DEFAULT 0,
+		created_at INTEGER NOT NULL
+	);
 	`
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return err
@@ -409,6 +427,95 @@ func (s *Store) DeleteSession(ctx context.Context, rawToken string) error {
 	}
 	_, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE token_hash = ?`, crypto.HashToken(rawToken))
 	return err
+}
+
+func (s *Store) CreateAPIKey(ctx context.Context, name string) (string, *APIKeyRecord, error) {
+	name = strings.TrimSpace(name)
+	if name == "" || len(name) > 64 {
+		return "", nil, errors.New("api key name must be 1-64 characters")
+	}
+	suffix, _, err := crypto.RandomToken(24)
+	if err != nil {
+		return "", nil, err
+	}
+	rawToken := "ibmon_" + suffix
+	hash := crypto.HashToken(rawToken)
+	mask := crypto.MaskAPIKey(rawToken)
+	id := crypto.NewUUID()
+	now := time.Now().Unix()
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO api_keys(id, name, key_hash, key_mask, last_used_at, created_at)
+		VALUES (?, ?, ?, ?, 0, ?)
+	`, id, name, hash, mask, now)
+	if err != nil {
+		return "", nil, err
+	}
+	return rawToken, &APIKeyRecord{
+		ID:        id,
+		Name:      name,
+		KeyMask:   mask,
+		CreatedAt: now,
+	}, nil
+}
+
+func (s *Store) ListAPIKeys(ctx context.Context) ([]APIKeyRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, key_mask, last_used_at, created_at
+		FROM api_keys
+		ORDER BY created_at DESC, name ASC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]APIKeyRecord, 0)
+	for rows.Next() {
+		var r APIKeyRecord
+		if err := rows.Scan(&r.ID, &r.Name, &r.KeyMask, &r.LastUsedAt, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) AuthenticateAPIKey(ctx context.Context, rawToken string) (*APIKeyRecord, error) {
+	trimmed := strings.TrimSpace(rawToken)
+	if !strings.HasPrefix(trimmed, "ibmon_") || len(trimmed) < 20 {
+		return nil, ErrAPIKeyNotFound
+	}
+	hash := crypto.HashToken(trimmed)
+	var r APIKeyRecord
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, name, key_mask, last_used_at, created_at
+		FROM api_keys WHERE key_hash = ?
+	`, hash).Scan(&r.ID, &r.Name, &r.KeyMask, &r.LastUsedAt, &r.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrAPIKeyNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().Unix()
+	if now != r.LastUsedAt {
+		_, _ = s.db.ExecContext(ctx, `UPDATE api_keys SET last_used_at = ? WHERE id = ?`, now, r.ID)
+		r.LastUsedAt = now
+	}
+	return &r, nil
+}
+
+func (s *Store) DeleteAPIKey(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM api_keys WHERE id = ?`, id)
+	if err != nil {
+		return err
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return ErrAPIKeyNotFound
+	}
+	return nil
 }
 
 func (s *Store) CreateAccount(ctx context.Context, in AccountInput) (*Account, error) {

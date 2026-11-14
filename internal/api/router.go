@@ -13,12 +13,14 @@ import (
 	"net/http"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/crypto"
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/instabox"
+	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/mcp"
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/monitor"
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/store"
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/web"
@@ -33,6 +35,7 @@ type Server struct {
 	store      *store.Store
 	client     *instabox.Client
 	poller     *monitor.Poller
+	mcpHandler http.Handler
 	sessionTTL time.Duration
 	staticFS   fs.FS
 	indexTmpl  string
@@ -54,6 +57,7 @@ func NewRouter(st *store.Store, client *instabox.Client, poller *monitor.Poller,
 		store:        st,
 		client:       client,
 		poller:       poller,
+		mcpHandler:   mcp.NewHandler(st, poller),
 		sessionTTL:   sessionTTL,
 		staticFS:     sfs,
 		indexTmpl:    string(indexBytes),
@@ -71,23 +75,45 @@ func NewRouter(st *store.Store, client *instabox.Client, poller *monitor.Poller,
 	mux.HandleFunc("GET /api/auth/status", s.handleAuthStatus)
 	mux.HandleFunc("POST /api/auth/setup", s.withFetchMetadata(s.handleAuthSetup))
 	mux.HandleFunc("POST /api/auth/login", s.withFetchMetadata(s.handleAuthLogin))
-	mux.HandleFunc("POST /api/auth/logout", s.withAuth(true, s.handleAuthLogout))
+	mux.HandleFunc("POST /api/auth/logout", s.withSessionAuth(true, s.handleAuthLogout))
+
+	mux.HandleFunc("GET /api/api-keys", s.withSessionAuth(false, s.handleListAPIKeys))
+	mux.HandleFunc("POST /api/api-keys", s.withSessionAuth(true, s.handleCreateAPIKey))
+	mux.HandleFunc("DELETE /api/api-keys/{id}", s.withSessionAuth(true, s.handleDeleteAPIKey))
 
 	mux.HandleFunc("GET /api/accounts", s.withAuth(false, s.handleListAccounts))
-	mux.HandleFunc("POST /api/accounts", s.withAuth(true, s.handleCreateAccount))
-	mux.HandleFunc("PATCH /api/accounts/{id}", s.withAuth(true, s.handleUpdateAccount))
-	mux.HandleFunc("DELETE /api/accounts/{id}", s.withAuth(true, s.handleDeleteAccount))
+	mux.HandleFunc("POST /api/accounts", s.withSessionAuth(true, s.handleCreateAccount))
+	mux.HandleFunc("PATCH /api/accounts/{id}", s.withSessionAuth(true, s.handleUpdateAccount))
+	mux.HandleFunc("DELETE /api/accounts/{id}", s.withSessionAuth(true, s.handleDeleteAccount))
 	mux.HandleFunc("POST /api/accounts/{id}/sync", s.withAuth(true, s.handleSyncAccount))
 	mux.HandleFunc("GET /api/accounts/{id}/machine-options", s.withAuth(false, s.handleAccountMachineOptions))
+	mux.HandleFunc("GET /api/accounts/{id}/snapshots", s.withAuth(false, s.handleListSnapshots))
+	mux.HandleFunc("DELETE /api/accounts/{id}/snapshots/{snapshotId}", s.withAuth(true, s.handleDeleteSnapshot))
+	mux.HandleFunc("GET /api/accounts/{id}/operations/{operationId}", s.withAuth(false, s.handleGetOperation))
 
 	mux.HandleFunc("GET /api/machines", s.withAuth(false, s.handleListMachines))
 	mux.HandleFunc("POST /api/machines", s.withAuth(true, s.handleCreateMachine))
-	mux.HandleFunc("PATCH /api/machines/{accountId}/{machineId}", s.withAuth(true, s.handleRenameMachine))
+	mux.HandleFunc("PATCH /api/machines/{accountId}/{machineId}", s.withAuth(true, s.handleUpdateMachine))
 	mux.HandleFunc("PATCH /api/machines/{accountId}/{machineId}/keepalive", s.withAuth(true, s.handleSetMachineKeepalive))
 	mux.HandleFunc("DELETE /api/machines/{accountId}/{machineId}", s.withAuth(true, s.handleDeleteMachine))
 	mux.HandleFunc("POST /api/sync", s.withAuth(true, s.handleSyncAll))
 	mux.HandleFunc("GET /api/machines/{accountId}/{machineId}/telemetry", s.withAuth(false, s.handleMachineTelemetry))
 	mux.HandleFunc("POST /api/machines/{accountId}/{machineId}/actions/{action}", s.withAuth(true, s.handleMachineAction))
+	mux.HandleFunc("POST /api/machines/{accountId}/{machineId}/exec", s.withAuth(true, s.handleExecMachine))
+	mux.HandleFunc("GET /api/machines/{accountId}/{machineId}/files", s.withAuth(false, s.handleReadFiles))
+	mux.HandleFunc("PUT /api/machines/{accountId}/{machineId}/files", s.withAuth(true, s.handleWriteFile))
+	mux.HandleFunc("GET /api/machines/{accountId}/{machineId}/ports", s.withAuth(false, s.handleListPorts))
+	mux.HandleFunc("POST /api/machines/{accountId}/{machineId}/ports", s.withAuth(true, s.handlePublishPort))
+	mux.HandleFunc("DELETE /api/machines/{accountId}/{machineId}/ports/{port}", s.withAuth(true, s.handleUnpublishPort))
+	mux.HandleFunc("GET /api/machines/{accountId}/{machineId}/processes", s.withAuth(false, s.handleListProcesses))
+	mux.HandleFunc("GET /api/machines/{accountId}/{machineId}/logs", s.withAuth(false, s.handleMachineLogs))
+	mux.HandleFunc("GET /api/machines/{accountId}/{machineId}/connection-info", s.withAuth(false, s.handleConnectionInfo))
+	mux.HandleFunc("POST /api/machines/{accountId}/{machineId}/snapshots", s.withAuth(true, s.handleCreateSnapshot))
+	mux.HandleFunc("POST /api/machines/{accountId}/{machineId}/restore", s.withAuth(true, s.handleRestoreMachine))
+
+	mux.HandleFunc("POST /mcp", s.withAuth(false, s.mcpHandler.ServeHTTP))
+	mux.HandleFunc("GET /mcp", s.withAuth(false, s.mcpHandler.ServeHTTP))
+	mux.HandleFunc("DELETE /mcp", s.withAuth(false, s.mcpHandler.ServeHTTP))
 
 	mux.HandleFunc("GET /", s.handleIndex)
 
@@ -206,9 +232,56 @@ func (s *Server) withFetchMetadata(next http.HandlerFunc) http.HandlerFunc {
 }
 
 type sessKey struct{}
+type apiKeyCtxKey struct{}
+
+func extractAPIToken(r *http.Request) string {
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if len(auth) > 7 && strings.EqualFold(auth[:7], "Bearer ") {
+		if tok := strings.TrimSpace(auth[7:]); tok != "" {
+			return tok
+		}
+	}
+	if xk := strings.TrimSpace(r.Header.Get("X-API-Key")); xk != "" {
+		return xk
+	}
+	return ""
+}
+
+func (s *Server) withSessionAuth(requireCSRF bool, next http.HandlerFunc) http.HandlerFunc {
+	return s.withFetchMetadata(func(w http.ResponseWriter, r *http.Request) {
+		if extractAPIToken(r) != "" {
+			writeError(w, http.StatusForbidden, "session_required", "this admin endpoint requires a browser session")
+			return
+		}
+		sess, ok := s.currentSession(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		if requireCSRF {
+			got := r.Header.Get("X-CSRF-Token")
+			if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(sess.CSRFToken)) != 1 {
+				writeError(w, http.StatusForbidden, "csrf_invalid", "invalid or missing CSRF token")
+				return
+			}
+		}
+		ctx := context.WithValue(r.Context(), sessKey{}, sess)
+		next(w, r.WithContext(ctx))
+	})
+}
 
 func (s *Server) withAuth(requireCSRF bool, next http.HandlerFunc) http.HandlerFunc {
 	return s.withFetchMetadata(func(w http.ResponseWriter, r *http.Request) {
+		if tok := extractAPIToken(r); tok != "" {
+			rec, err := s.store.AuthenticateAPIKey(r.Context(), tok)
+			if err != nil {
+				writeError(w, http.StatusUnauthorized, "unauthorized", "invalid API key")
+				return
+			}
+			ctx := context.WithValue(r.Context(), apiKeyCtxKey{}, rec)
+			next(w, r.WithContext(ctx))
+			return
+		}
 		sess, ok := s.currentSession(r)
 		if !ok {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
@@ -229,6 +302,21 @@ func (s *Server) withAuth(requireCSRF bool, next http.HandlerFunc) http.HandlerF
 func sessionFromContext(ctx context.Context) *store.Session {
 	v, _ := ctx.Value(sessKey{}).(*store.Session)
 	return v
+}
+
+func apiKeyFromContext(ctx context.Context) *store.APIKeyRecord {
+	v, _ := ctx.Value(apiKeyCtxKey{}).(*store.APIKeyRecord)
+	return v
+}
+
+func actorLabelFromContext(ctx context.Context) string {
+	if sess := sessionFromContext(ctx); sess != nil {
+		return sess.Username
+	}
+	if ak := apiKeyFromContext(ctx); ak != nil {
+		return "api-key:" + ak.Name
+	}
+	return "unknown"
 }
 
 func (s *Server) currentSession(r *http.Request) (*store.Session, bool) {
@@ -698,43 +786,40 @@ func (s *Server) handleCreateMachine(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, resp)
 }
 
-func (s *Server) handleRenameMachine(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleUpdateMachine(w http.ResponseWriter, r *http.Request) {
 	accountID := r.PathValue("accountId")
 	machineID := r.PathValue("machineId")
 	var req struct {
-		Name string `json:"name"`
+		Name                    *string           `json:"name"`
+		AutoSuspendAfterSeconds *int              `json:"autoSuspendAfterSeconds"`
+		MaxRunMinutes           *int              `json:"maxRunMinutes"`
+		Metadata                map[string]string `json:"metadata"`
+		Apply                   string            `json:"apply"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
 	}
-	req.Name = strings.TrimSpace(req.Name)
-	if !isValidMachineName(req.Name) {
-		writeError(w, http.StatusBadRequest, "invalid_name", "machine name must be 1-63 lowercase letters, digits or hyphens, starting with a letter or digit")
+	if req.Name != nil {
+		trimmed := strings.TrimSpace(*req.Name)
+		if !isValidMachineName(trimmed) {
+			writeError(w, http.StatusBadRequest, "invalid_name", "machine name must be 1-63 lowercase letters, digits or hyphens, starting with a letter or digit")
+			return
+		}
+		req.Name = &trimmed
+	}
+	if req.Name == nil && req.AutoSuspendAfterSeconds == nil && req.MaxRunMinutes == nil && req.Metadata == nil && req.Apply == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "no update fields provided")
 		return
 	}
-	updated, err := s.poller.RenameMachine(r.Context(), accountID, machineID, req.Name)
+	updated, err := s.poller.UpdateMachine(r.Context(), accountID, machineID, instabox.UpdateMachineInput{
+		Name:                    req.Name,
+		AutoSuspendAfterSeconds: req.AutoSuspendAfterSeconds,
+		MaxRunMinutes:           req.MaxRunMinutes,
+		Metadata:                req.Metadata,
+		Apply:                   strings.TrimSpace(req.Apply),
+	})
 	if err != nil {
-		if errors.Is(err, store.ErrAccountNotFound) || errors.Is(err, store.ErrMachineNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", err.Error())
-			return
-		}
-		var apiErr *instabox.APIError
-		if errors.As(err, &apiErr) {
-			writeJSON(w, clampUpstreamStatus(apiErr.Status), map[string]any{
-				"error": map[string]any{
-					"code":              apiErr.Code,
-					"message":           apiErr.Message,
-					"retryable":         apiErr.Retryable,
-					"operationId":       apiErr.OperationID,
-					"retryAfterSeconds": apiErr.RetryAfterSeconds,
-					"reason":            apiErr.Reason,
-					"hint":              apiErr.Hint,
-				},
-			})
-			return
-		}
-		log.Printf("rename machine %s/%s error: %v", accountID, machineID, err)
-		writeError(w, http.StatusBadGateway, "upstream_error", "failed to rename machine on instabox.sh")
+		s.writePollerOrUpstreamError(w, "update machine", accountID, machineID, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -775,29 +860,29 @@ func (s *Server) handleSetMachineKeepalive(w http.ResponseWriter, r *http.Reques
 func (s *Server) handleDeleteMachine(w http.ResponseWriter, r *http.Request) {
 	accountID := r.PathValue("accountId")
 	machineID := r.PathValue("machineId")
+	if apiKeyFromContext(r.Context()) != nil {
+		confirmToken := strings.TrimSpace(r.Header.Get("X-Confirm-Delete-Token"))
+		if confirmToken == "" {
+			confirmToken = strings.TrimSpace(r.URL.Query().Get("confirmToken"))
+		}
+		if confirmToken == "" {
+			ch, err := s.poller.CreateDeleteChallenge(r.Context(), accountID, machineID)
+			if err != nil {
+				s.writePollerOrUpstreamError(w, "delete challenge", accountID, machineID, err)
+				return
+			}
+			writeJSON(w, http.StatusConflict, ch)
+			return
+		}
+		if err := s.poller.ConsumeDeleteChallenge(accountID, machineID, confirmToken); err != nil {
+			writeError(w, http.StatusForbidden, "confirmation_invalid", err.Error())
+			return
+		}
+	}
+
 	res, err := s.poller.DeleteMachine(r.Context(), accountID, machineID)
 	if err != nil {
-		if errors.Is(err, store.ErrAccountNotFound) || errors.Is(err, store.ErrMachineNotFound) {
-			writeError(w, http.StatusNotFound, "not_found", err.Error())
-			return
-		}
-		var apiErr *instabox.APIError
-		if errors.As(err, &apiErr) {
-			writeJSON(w, clampUpstreamStatus(apiErr.Status), map[string]any{
-				"error": map[string]any{
-					"code":              apiErr.Code,
-					"message":           apiErr.Message,
-					"retryable":         apiErr.Retryable,
-					"operationId":       apiErr.OperationID,
-					"retryAfterSeconds": apiErr.RetryAfterSeconds,
-					"reason":            apiErr.Reason,
-					"hint":              apiErr.Hint,
-				},
-			})
-			return
-		}
-		log.Printf("delete machine %s/%s error: %v", accountID, machineID, err)
-		writeError(w, http.StatusBadGateway, "upstream_error", "failed to delete machine on instabox.sh")
+		s.writePollerOrUpstreamError(w, "delete machine", accountID, machineID, err)
 		return
 	}
 	accounts, accErr := s.store.ListAccounts(r.Context())
@@ -815,6 +900,284 @@ func (s *Server) handleDeleteMachine(w http.ResponseWriter, r *http.Request) {
 		resp["machines"] = machines
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) writePollerOrUpstreamError(w http.ResponseWriter, op, accountID, machineID string, err error) {
+	if errors.Is(err, store.ErrAccountNotFound) || errors.Is(err, store.ErrMachineNotFound) {
+		writeError(w, http.StatusNotFound, "not_found", err.Error())
+		return
+	}
+	var apiErr *instabox.APIError
+	if errors.As(err, &apiErr) {
+		writeJSON(w, clampUpstreamStatus(apiErr.Status), map[string]any{
+			"error": map[string]any{
+				"code":              apiErr.Code,
+				"message":           apiErr.Message,
+				"retryable":         apiErr.Retryable,
+				"operationId":       apiErr.OperationID,
+				"retryAfterSeconds": apiErr.RetryAfterSeconds,
+				"reason":            apiErr.Reason,
+				"hint":              apiErr.Hint,
+			},
+		})
+		return
+	}
+	log.Printf("%s %s/%s error: %v", op, accountID, machineID, err)
+	writeError(w, http.StatusBadGateway, "upstream_error", op+" failed on instabox.sh")
+}
+
+func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
+	keys, err := s.store.ListAPIKeys(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "db_error", "failed to list api keys")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"apiKeys": keys})
+}
+
+func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name string `json:"name"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" || len(req.Name) > 64 {
+		writeError(w, http.StatusBadRequest, "invalid_name", "name must be 1-64 characters")
+		return
+	}
+	raw, rec, err := s.store.CreateAPIKey(r.Context(), req.Name)
+	if err != nil {
+		log.Printf("create api key error: %v", err)
+		writeError(w, http.StatusInternalServerError, "create_failed", "failed to create API key")
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"ok":     true,
+		"token":  raw,
+		"apiKey": rec,
+	})
+}
+
+func (s *Server) handleDeleteAPIKey(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.store.DeleteAPIKey(r.Context(), id); err != nil {
+		if errors.Is(err, store.ErrAPIKeyNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "API key not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "delete_failed", "failed to delete API key")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleExecMachine(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	var req instabox.ExecInput
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Cmd == "" && len(req.Argv) == 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "either cmd or argv is required")
+		return
+	}
+	res, err := s.poller.ExecMachine(r.Context(), accountID, machineID, req)
+	if err != nil {
+		s.writePollerOrUpstreamError(w, "exec machine", accountID, machineID, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleReadFiles(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	filePath := r.URL.Query().Get("path")
+	res, err := s.poller.ReadMachineFiles(r.Context(), accountID, machineID, filePath)
+	if err != nil {
+		s.writePollerOrUpstreamError(w, "read files", accountID, machineID, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleWriteFile(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	filePath := strings.TrimSpace(r.URL.Query().Get("path"))
+	if filePath == "" {
+		writeError(w, http.StatusBadRequest, "invalid_path", "path query parameter is required")
+		return
+	}
+	mode := strings.TrimSpace(r.URL.Query().Get("mode"))
+	parents := r.URL.Query().Get("parents") == "true" || r.URL.Query().Get("parents") == "1"
+	r.Body = http.MaxBytesReader(w, r.Body, 16<<20)
+	data, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_body", "failed to read file body (max 16 MiB)")
+		return
+	}
+	res, err := s.poller.WriteMachineFile(r.Context(), accountID, machineID, filePath, mode, parents, data)
+	if err != nil {
+		s.writePollerOrUpstreamError(w, "write file", accountID, machineID, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleListPorts(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	res, err := s.poller.ListMachinePorts(r.Context(), accountID, machineID)
+	if err != nil {
+		s.writePollerOrUpstreamError(w, "list ports", accountID, machineID, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handlePublishPort(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	var req instabox.PublishPortInput
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Port < 1024 || req.Port > 65535 {
+		writeError(w, http.StatusBadRequest, "invalid_port", "port must be between 1024 and 65535")
+		return
+	}
+	res, err := s.poller.PublishMachinePort(r.Context(), accountID, machineID, req)
+	if err != nil {
+		s.writePollerOrUpstreamError(w, "publish port", accountID, machineID, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleUnpublishPort(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	port, err := strconv.Atoi(r.PathValue("port"))
+	if err != nil || port < 1024 || port > 65535 {
+		writeError(w, http.StatusBadRequest, "invalid_port", "port must be between 1024 and 65535")
+		return
+	}
+	if err := s.poller.UnpublishMachinePort(r.Context(), accountID, machineID, port); err != nil {
+		s.writePollerOrUpstreamError(w, "unpublish port", accountID, machineID, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleListProcesses(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	all := r.URL.Query().Get("all") == "true" || r.URL.Query().Get("all") == "1"
+	res, err := s.poller.ListMachineProcesses(r.Context(), accountID, machineID, all)
+	if err != nil {
+		s.writePollerOrUpstreamError(w, "list processes", accountID, machineID, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleMachineLogs(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	tail, _ := strconv.Atoi(r.URL.Query().Get("tail"))
+	after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+	res, err := s.poller.GetMachineLogs(r.Context(), accountID, machineID, tail, after)
+	if err != nil {
+		s.writePollerOrUpstreamError(w, "machine logs", accountID, machineID, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleConnectionInfo(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	res, err := s.poller.GetMachineConnectionInfo(r.Context(), accountID, machineID)
+	if err != nil {
+		s.writePollerOrUpstreamError(w, "connection info", accountID, machineID, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleListSnapshots(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("id")
+	snaps, err := s.poller.ListSnapshots(r.Context(), accountID)
+	if err != nil {
+		s.writePollerOrUpstreamError(w, "list snapshots", accountID, "", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"snapshots": snaps})
+}
+
+func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	var req instabox.CreateSnapshotInput
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if !isValidMachineName(req.Name) {
+		writeError(w, http.StatusBadRequest, "invalid_name", "snapshot name must match ^[a-z0-9][a-z0-9-]{0,62}$")
+		return
+	}
+	sn, err := s.poller.CreateSnapshot(r.Context(), accountID, machineID, req)
+	if err != nil {
+		s.writePollerOrUpstreamError(w, "create snapshot", accountID, machineID, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, sn)
+}
+
+func (s *Server) handleRestoreMachine(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	var req instabox.RestoreMachineInput
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	res, err := s.poller.RestoreMachine(r.Context(), accountID, machineID, req)
+	if err != nil {
+		s.writePollerOrUpstreamError(w, "restore machine", accountID, machineID, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, res)
+}
+
+func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("id")
+	snapshotID := r.PathValue("snapshotId")
+	confirm := strings.TrimSpace(r.Header.Get("X-Confirm-Delete"))
+	if confirm == "" {
+		confirm = snapshotID
+	}
+	if err := s.poller.DeleteSnapshot(r.Context(), accountID, snapshotID, confirm); err != nil {
+		s.writePollerOrUpstreamError(w, "delete snapshot", accountID, snapshotID, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleGetOperation(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("id")
+	opID := r.PathValue("operationId")
+	wait := strings.TrimSpace(r.URL.Query().Get("wait"))
+	op, err := s.poller.GetOperation(r.Context(), accountID, opID, wait)
+	if err != nil {
+		s.writePollerOrUpstreamError(w, "get operation", accountID, opID, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, op)
 }
 
 func (s *Server) handleListMachines(w http.ResponseWriter, r *http.Request) {
@@ -885,10 +1248,10 @@ func (s *Server) handleMachineAction(w http.ResponseWriter, r *http.Request) {
 
 	var action instabox.Action
 	switch instabox.Action(actionRaw) {
-	case instabox.ActionWake, instabox.ActionSuspend, instabox.ActionStart, instabox.ActionStop:
+	case instabox.ActionWake, instabox.ActionSuspend, instabox.ActionStart, instabox.ActionStop, instabox.ActionResume:
 		action = instabox.Action(actionRaw)
 	default:
-		writeError(w, http.StatusBadRequest, "invalid_action", "allowed actions: wake, suspend, start, stop")
+		writeError(w, http.StatusBadRequest, "invalid_action", "allowed actions: wake, suspend, start, stop, resume")
 		return
 	}
 
@@ -924,7 +1287,7 @@ func (s *Server) handleMachineAction(w http.ResponseWriter, r *http.Request) {
 		"action":    actionRaw,
 		"result":    res,
 		"machine":   fresh,
-		"sessionId": sessionFromContext(r.Context()).Username,
+		"sessionId": actorLabelFromContext(r.Context()),
 	})
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"sort"
 	"strings"
@@ -11,9 +12,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/crypto"
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/instabox"
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/store"
 )
+
+var ErrDeleteConfirmationInvalid = errors.New("invalid or expired delete confirmation token")
 
 const (
 	keepaliveLeaseID          = "ibmon-keepalive"
@@ -50,6 +54,27 @@ type Poller struct {
 	keepaliveCtrls         sync.Map // key: accountID+":"+machineID -> *keepaliveCtrl
 	keepaliveLeaseRunStart sync.Map // key: accountID+":"+machineID -> string
 	keepaliveDelayOverride atomic.Int64
+
+	deleteChallengeMu sync.Mutex
+	deleteChallenges  map[string]deleteChallengeEntry
+}
+
+type deleteChallengeEntry struct {
+	accountID   string
+	machineID   string
+	machineName string
+	expiresAt   time.Time
+}
+
+type DeleteConfirmationChallenge struct {
+	RequiresUserConfirmation bool   `json:"requiresUserConfirmation"`
+	ConfirmationToken        string `json:"confirmationToken"`
+	AccountID                string `json:"accountId"`
+	AccountAlias             string `json:"accountAlias,omitempty"`
+	MachineID                string `json:"machineId"`
+	MachineName              string `json:"machineName"`
+	ExpiresInSeconds         int    `json:"expiresInSeconds"`
+	Instruction              string `json:"instruction"`
 }
 
 func (p *Poller) accountLockChan(accountID string) chan struct{} {
@@ -577,6 +602,10 @@ func (p *Poller) CreateMachine(ctx context.Context, accountID string, in instabo
 }
 
 func (p *Poller) RenameMachine(ctx context.Context, accountID, machineID, name string) (*store.MachineRecord, error) {
+	return p.UpdateMachine(ctx, accountID, machineID, instabox.UpdateMachineInput{Name: &name})
+}
+
+func (p *Poller) UpdateMachine(ctx context.Context, accountID, machineID string, in instabox.UpdateMachineInput) (*store.MachineRecord, error) {
 	apiKey, err := p.store.GetAccountAPIKey(ctx, accountID)
 	if err != nil {
 		return nil, err
@@ -584,7 +613,7 @@ func (p *Poller) RenameMachine(ctx context.Context, accountID, machineID, name s
 	if _, err := p.store.GetMachine(ctx, accountID, machineID); err != nil {
 		return nil, err
 	}
-	updated, err := p.client.RenameMachine(ctx, apiKey, machineID, name)
+	updated, err := p.client.UpdateMachine(ctx, apiKey, machineID, in)
 	if err != nil {
 		return nil, err
 	}
@@ -603,18 +632,22 @@ func (p *Poller) DeleteMachine(ctx context.Context, accountID, machineID string)
 	if err != nil {
 		return nil, err
 	}
+	usageKey := accountID + ":" + machineID
+	p.cancelKeepaliveCycle(ctx, usageKey, 2*time.Second)
+
 	res, err := p.client.DeleteMachine(ctx, apiKey, machineID, m.MachineID)
 	if err != nil {
 		return nil, err
 	}
 
-	usageKey := accountID + ":" + machineID
 	if res.Operation != nil && res.Operation.State == "succeeded" {
 		unlock := p.lockAccount(accountID)
 		_ = p.store.DeleteMachine(ctx, accountID, machineID)
 		unlock()
 		p.lastUsageCheck.Delete(usageKey)
 		p.inactiveMetricDone.Delete(usageKey)
+		p.keepaliveLeaseRunStart.Delete(usageKey)
+		p.keepaliveCtrls.Delete(usageKey)
 		return res, nil
 	}
 
@@ -625,6 +658,230 @@ func (p *Poller) DeleteMachine(ctx context.Context, accountID, machineID string)
 		p.trackOperation(accountID, apiKey, res.Operation.ID)
 	}
 	return res, nil
+}
+
+func (p *Poller) CreateDeleteChallenge(ctx context.Context, accountID, machineID string) (*DeleteConfirmationChallenge, error) {
+	acc, err := p.store.GetAccount(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	m, err := p.store.GetMachine(ctx, accountID, machineID)
+	if err != nil {
+		return nil, err
+	}
+	raw, _, err := crypto.RandomToken(18)
+	if err != nil {
+		return nil, err
+	}
+	token := "del_" + raw
+	now := time.Now()
+	const ttl = 5 * time.Minute
+
+	p.deleteChallengeMu.Lock()
+	if p.deleteChallenges == nil {
+		p.deleteChallenges = make(map[string]deleteChallengeEntry)
+	}
+	for k, v := range p.deleteChallenges {
+		if now.After(v.expiresAt) {
+			delete(p.deleteChallenges, k)
+		}
+	}
+	if len(p.deleteChallenges) >= 256 {
+		for k := range p.deleteChallenges {
+			delete(p.deleteChallenges, k)
+			if len(p.deleteChallenges) < 128 {
+				break
+			}
+		}
+	}
+	p.deleteChallenges[token] = deleteChallengeEntry{
+		accountID:   accountID,
+		machineID:   machineID,
+		machineName: m.Name,
+		expiresAt:   now.Add(ttl),
+	}
+	p.deleteChallengeMu.Unlock()
+
+	return &DeleteConfirmationChallenge{
+		RequiresUserConfirmation: true,
+		ConfirmationToken:        token,
+		AccountID:                accountID,
+		AccountAlias:             acc.Alias,
+		MachineID:                machineID,
+		MachineName:              m.Name,
+		ExpiresInSeconds:         int(ttl.Seconds()),
+		Instruction: fmt.Sprintf(
+			"STOP and ask the user to confirm permanently deleting machine %q (%s) on account %q (%s). Call again with confirmationToken ONLY after the user explicitly approves.",
+			m.Name, machineID, acc.Alias, accountID,
+		),
+	}, nil
+}
+
+func (p *Poller) ConsumeDeleteChallenge(accountID, machineID, token string) error {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return ErrDeleteConfirmationInvalid
+	}
+	now := time.Now()
+	p.deleteChallengeMu.Lock()
+	defer p.deleteChallengeMu.Unlock()
+	if p.deleteChallenges == nil {
+		return ErrDeleteConfirmationInvalid
+	}
+	entry, ok := p.deleteChallenges[trimmed]
+	if !ok {
+		return ErrDeleteConfirmationInvalid
+	}
+	if now.After(entry.expiresAt) {
+		delete(p.deleteChallenges, trimmed)
+		return ErrDeleteConfirmationInvalid
+	}
+	if entry.accountID != accountID || entry.machineID != machineID {
+		return ErrDeleteConfirmationInvalid
+	}
+	delete(p.deleteChallenges, trimmed)
+	return nil
+}
+
+func (p *Poller) resolveMachineKey(ctx context.Context, accountID, machineID string) (string, error) {
+	apiKey, err := p.store.GetAccountAPIKey(ctx, accountID)
+	if err != nil {
+		return "", err
+	}
+	if _, err := p.store.GetMachine(ctx, accountID, machineID); err != nil {
+		return "", err
+	}
+	return apiKey, nil
+}
+
+func (p *Poller) ExecMachine(ctx context.Context, accountID, machineID string, in instabox.ExecInput) (*instabox.ExecResult, error) {
+	apiKey, err := p.resolveMachineKey(ctx, accountID, machineID)
+	if err != nil {
+		return nil, err
+	}
+	return p.client.ExecMachine(ctx, apiKey, machineID, in)
+}
+
+func (p *Poller) ReadMachineFiles(ctx context.Context, accountID, machineID, filePath string) (*instabox.MachineFiles, error) {
+	apiKey, err := p.resolveMachineKey(ctx, accountID, machineID)
+	if err != nil {
+		return nil, err
+	}
+	return p.client.ReadMachineFiles(ctx, apiKey, machineID, filePath)
+}
+
+func (p *Poller) WriteMachineFile(ctx context.Context, accountID, machineID, filePath, mode string, parents bool, content []byte) (*instabox.FileWritten, error) {
+	apiKey, err := p.resolveMachineKey(ctx, accountID, machineID)
+	if err != nil {
+		return nil, err
+	}
+	return p.client.WriteMachineFile(ctx, apiKey, machineID, filePath, mode, parents, content)
+}
+
+func (p *Poller) ListMachinePorts(ctx context.Context, accountID, machineID string) (*instabox.PublicPortList, error) {
+	apiKey, err := p.resolveMachineKey(ctx, accountID, machineID)
+	if err != nil {
+		return nil, err
+	}
+	return p.client.ListMachinePorts(ctx, apiKey, machineID)
+}
+
+func (p *Poller) PublishMachinePort(ctx context.Context, accountID, machineID string, in instabox.PublishPortInput) (*instabox.PublicPort, error) {
+	apiKey, err := p.resolveMachineKey(ctx, accountID, machineID)
+	if err != nil {
+		return nil, err
+	}
+	return p.client.PublishMachinePort(ctx, apiKey, machineID, in)
+}
+
+func (p *Poller) UnpublishMachinePort(ctx context.Context, accountID, machineID string, port int) error {
+	apiKey, err := p.resolveMachineKey(ctx, accountID, machineID)
+	if err != nil {
+		return err
+	}
+	return p.client.UnpublishMachinePort(ctx, apiKey, machineID, port)
+}
+
+func (p *Poller) ListMachineProcesses(ctx context.Context, accountID, machineID string, all bool) (*instabox.ProcessList, error) {
+	apiKey, err := p.resolveMachineKey(ctx, accountID, machineID)
+	if err != nil {
+		return nil, err
+	}
+	return p.client.ListMachineProcesses(ctx, apiKey, machineID, all)
+}
+
+func (p *Poller) GetMachineLogs(ctx context.Context, accountID, machineID string, tail int, after int64) (*instabox.MachineLogs, error) {
+	apiKey, err := p.resolveMachineKey(ctx, accountID, machineID)
+	if err != nil {
+		return nil, err
+	}
+	return p.client.GetMachineLogs(ctx, apiKey, machineID, tail, after)
+}
+
+func (p *Poller) GetMachineConnectionInfo(ctx context.Context, accountID, machineID string) (*instabox.ConnectionInfo, error) {
+	apiKey, err := p.resolveMachineKey(ctx, accountID, machineID)
+	if err != nil {
+		return nil, err
+	}
+	return p.client.GetMachineConnectionInfo(ctx, apiKey, machineID)
+}
+
+func (p *Poller) ListSnapshots(ctx context.Context, accountID string) ([]instabox.Snapshot, error) {
+	apiKey, err := p.store.GetAccountAPIKey(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	return p.client.ListSnapshots(ctx, apiKey)
+}
+
+func (p *Poller) CreateSnapshot(ctx context.Context, accountID, machineID string, in instabox.CreateSnapshotInput) (*instabox.Snapshot, error) {
+	apiKey, err := p.resolveMachineKey(ctx, accountID, machineID)
+	if err != nil {
+		return nil, err
+	}
+	return p.client.CreateSnapshot(ctx, apiKey, machineID, in)
+}
+
+func (p *Poller) RestoreMachine(ctx context.Context, accountID, machineID string, in instabox.RestoreMachineInput) (*instabox.ActionResult, error) {
+	apiKey, err := p.resolveMachineKey(ctx, accountID, machineID)
+	if err != nil {
+		return nil, err
+	}
+	res, err := p.client.RestoreMachine(ctx, apiKey, machineID, in)
+	if err != nil {
+		return nil, err
+	}
+	if res.Operation != nil && res.Operation.ID != "" && res.Operation.State != "succeeded" && res.Operation.State != "failed" {
+		p.trackOperation(accountID, apiKey, res.Operation.ID)
+	} else {
+		syncCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		defer cancel()
+		_ = p.SyncAccount(syncCtx, accountID)
+	}
+	return res, nil
+}
+
+func (p *Poller) DeleteSnapshot(ctx context.Context, accountID, snapshotID, confirmValue string) error {
+	apiKey, err := p.store.GetAccountAPIKey(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	return p.client.DeleteSnapshot(ctx, apiKey, snapshotID, confirmValue)
+}
+
+func (p *Poller) GetOperation(ctx context.Context, accountID, opID, wait string) (*instabox.Operation, error) {
+	apiKey, err := p.store.GetAccountAPIKey(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	op, err := p.client.GetOperation(ctx, apiKey, opID, wait)
+	if err != nil {
+		return nil, err
+	}
+	if op != nil && op.Machine != nil {
+		_ = p.syncSingleMachine(ctx, accountID, *op.Machine)
+	}
+	return op, nil
 }
 
 func (p *Poller) trackOperation(accountID, apiKey, opID string) {
@@ -738,7 +995,7 @@ func keepaliveRestartThresholdSec(m instabox.Machine) int64 {
 
 func isTransitionalState(state string) bool {
 	switch state {
-	case "starting", "resuming", "stopping", "pausing", "suspending", "creating":
+	case "starting", "resuming", "stopping", "pausing", "suspending", "creating", "deleting":
 		return true
 	default:
 		return false

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -335,7 +336,55 @@ func TestMachineKeepalivePersistenceAndLegacyMigration(t *testing.T) {
 		t.Fatalf("SetMachineKeepalive(false): %v", err)
 	}
 	m, err = st.GetMachine(ctx, "acc_old", "m_old")
-	if err != nil || m.KeepalivePendingRestart {
-		t.Fatalf("expected disable to clear pending restart, got err=%v m=%+v", err, m)
+	if err != nil || m.KeepaliveEnabled || m.KeepalivePendingRestart || m.KeepaliveLeaseExpiresAt != 0 || m.KeepaliveLastAction != "" {
+		t.Fatalf("expected keepalive cleared after disable, got err=%v m=%+v", err, m)
+	}
+}
+
+func TestAPIKeyLifecycleAndVerification(t *testing.T) {
+	st, _ := newTestStore(t)
+	ctx := context.Background()
+
+	if _, _, err := st.CreateAPIKey(ctx, ""); err == nil {
+		t.Fatalf("expected error on empty api key name")
+	}
+
+	raw, rec, err := st.CreateAPIKey(ctx, "Hermes Agent")
+	if err != nil {
+		t.Fatalf("CreateAPIKey: %v", err)
+	}
+	if !strings.HasPrefix(raw, "ibmon_") || len(raw) < 24 {
+		t.Fatalf("unexpected raw key format: %q", raw)
+	}
+	if rec.ID == "" || rec.Name != "Hermes Agent" || rec.KeyMask == "" || strings.Contains(rec.KeyMask, raw[10:]) {
+		t.Fatalf("unexpected api key record or key leak in mask: %+v", rec)
+	}
+
+	list, err := st.ListAPIKeys(ctx)
+	if err != nil || len(list) != 1 || list[0].ID != rec.ID {
+		t.Fatalf("ListAPIKeys unexpected: err=%v list=%+v", err, list)
+	}
+
+	authRec, err := st.AuthenticateAPIKey(ctx, raw)
+	if err != nil || authRec.ID != rec.ID || authRec.Name != "Hermes Agent" {
+		t.Fatalf("AuthenticateAPIKey failed: err=%v rec=%+v", err, authRec)
+	}
+	if _, err := st.AuthenticateAPIKey(ctx, "ibmon_wrong_token"); !errors.Is(err, store.ErrAPIKeyNotFound) {
+		t.Fatalf("expected ErrAPIKeyNotFound on wrong token, got %v", err)
+	}
+
+	list, _ = st.ListAPIKeys(ctx)
+	if list[0].LastUsedAt == 0 {
+		t.Fatalf("expected LastUsedAt updated after authentication")
+	}
+
+	if err := st.DeleteAPIKey(ctx, rec.ID); err != nil {
+		t.Fatalf("DeleteAPIKey: %v", err)
+	}
+	if !errors.Is(st.DeleteAPIKey(ctx, rec.ID), store.ErrAPIKeyNotFound) {
+		t.Fatalf("expected ErrAPIKeyNotFound on repeat delete")
+	}
+	if _, err := st.AuthenticateAPIKey(ctx, raw); !errors.Is(err, store.ErrAPIKeyNotFound) {
+		t.Fatalf("expected revoked key to fail auth, got %v", err)
 	}
 }

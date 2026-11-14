@@ -1588,3 +1588,127 @@ func TestKeepaliveLeaseRenewalUsesUpstreamClockUnderHostClockSkew(t *testing.T) 
 		runCase(t, -2*time.Hour, 55*time.Minute, false)
 	})
 }
+
+func TestPollerOrchestrationAndDeleteConfirmationGate(t *testing.T) {
+	dir := t.TempDir()
+	key, _ := crypto.LoadOrCreateMasterKey(dir, "")
+	st, _ := store.Open(filepath.Join(dir, "mon.db"), key)
+	t.Cleanup(func() { _ = st.Close() })
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_1/exec":
+			_, _ = w.Write([]byte(`{"stdout":"hello\n","stderr":"","exitCode":0,"timedOut":false,"truncated":false}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_1/files":
+			_, _ = w.Write([]byte(`{"path":"/data","type":"dir","size":0,"mode":"drwxr-xr-x","modTime":"2026-11-14T00:00:00Z","entries":[]}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/machines/m_1/files":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"path":"/data/a.txt","size":2,"sha256":"ab","mode":"0644","created":true}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_1/ports":
+			_, _ = w.Write([]byte(`{"enabled":true,"ports":[]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_1/ports":
+			_, _ = w.Write([]byte(`{"id":"p1","machineId":"m_1","port":8080,"name":"web","url":"https://8080.instabox.sh","access":"public","createdAt":"2026-11-14T00:00:00Z"}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/machines/m_1/ports/8080":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_1/processes":
+			_, _ = w.Write([]byte(`{"machineId":"m_1","state":"running","live":true,"capturedAt":"2026-11-14T00:00:00Z","trigger":"request","truncated":false,"processes":[]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_1/logs":
+			_, _ = w.Write([]byte(`{"machineId":"m_1","state":"running","console":"ok","cursor":2,"operations":[]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_1/connection-info":
+			_, _ = w.Write([]byte(`{"machineId":"m_1","transport":"ssh","host":"ssh.instabox.sh","port":22,"username":"m_1","capabilities":["exec"]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/snapshots":
+			_, _ = w.Write([]byte(`{"snapshots":[]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_1/snapshots":
+			_, _ = w.Write([]byte(`{"id":"sn_1","name":"s1","orgId":"org_1","sourceMachineId":"m_1","status":"ready","rootSizeBytes":1,"createdAt":"2026-11-14T00:00:00Z"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_1/restore":
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"id":"op_r","machineId":"m_1","state":"succeeded"}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/snapshots/sn_1":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1/machines/m_1":
+			_, _ = w.Write([]byte(`{"id":"m_1","name":"box-new","state":"running","desiredState":"running","autoSuspendAfterSeconds":0,"maxRunMinutes":-1}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	hc := srv.Client()
+	hc.Transport = &rt{u: u, t: srv.Client().Transport}
+	client, _ := instabox.NewClient("https://api.instabox.sh", hc)
+
+	acc, _ := st.CreateAccount(context.Background(), store.AccountInput{Alias: "Box 1", APIKey: "ibk_a...9", OrgTier: "free"})
+	_ = st.SyncAccountMachines(context.Background(), acc.ID, []store.MachineRecord{
+		{AccountID: acc.ID, MachineID: "m_1", Name: "box-1", State: "running", DesiredState: "running"},
+	})
+
+	p := monitor.NewPoller(st, client, 30*time.Second, 7)
+	defer p.Stop()
+
+	ctx := context.Background()
+	ex, err := p.ExecMachine(ctx, acc.ID, "m_1", instabox.ExecInput{Cmd: "echo hello"})
+	if err != nil || ex.Stdout != "hello\n" {
+		t.Fatalf("ExecMachine: err=%v ex=%+v", err, ex)
+	}
+	if _, err := p.ReadMachineFiles(ctx, acc.ID, "m_1", "/data"); err != nil {
+		t.Fatalf("ReadMachineFiles: %v", err)
+	}
+	if _, err := p.WriteMachineFile(ctx, acc.ID, "m_1", "/data/a.txt", "0644", true, []byte("hi")); err != nil {
+		t.Fatalf("WriteMachineFile: %v", err)
+	}
+	if _, err := p.ListMachinePorts(ctx, acc.ID, "m_1"); err != nil {
+		t.Fatalf("ListMachinePorts: %v", err)
+	}
+	if _, err := p.PublishMachinePort(ctx, acc.ID, "m_1", instabox.PublishPortInput{Port: 8080}); err != nil {
+		t.Fatalf("PublishMachinePort: %v", err)
+	}
+	if err := p.UnpublishMachinePort(ctx, acc.ID, "m_1", 8080); err != nil {
+		t.Fatalf("UnpublishMachinePort: %v", err)
+	}
+	if _, err := p.ListMachineProcesses(ctx, acc.ID, "m_1", false); err != nil {
+		t.Fatalf("ListMachineProcesses: %v", err)
+	}
+	if _, err := p.GetMachineLogs(ctx, acc.ID, "m_1", 50, 0); err != nil {
+		t.Fatalf("GetMachineLogs: %v", err)
+	}
+	if _, err := p.GetMachineConnectionInfo(ctx, acc.ID, "m_1"); err != nil {
+		t.Fatalf("GetMachineConnectionInfo: %v", err)
+	}
+	if _, err := p.ListSnapshots(ctx, acc.ID); err != nil {
+		t.Fatalf("ListSnapshots: %v", err)
+	}
+	if _, err := p.CreateSnapshot(ctx, acc.ID, "m_1", instabox.CreateSnapshotInput{Name: "s1"}); err != nil {
+		t.Fatalf("CreateSnapshot: %v", err)
+	}
+	if _, err := p.RestoreMachine(ctx, acc.ID, "m_1", instabox.RestoreMachineInput{SnapshotID: "sn_1"}); err != nil {
+		t.Fatalf("RestoreMachine: %v", err)
+	}
+	if err := p.DeleteSnapshot(ctx, acc.ID, "sn_1", "sn_1"); err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+	nm := "box-new"
+	upd, err := p.UpdateMachine(ctx, acc.ID, "m_1", instabox.UpdateMachineInput{Name: &nm})
+	if err != nil || upd.Name != "box-new" {
+		t.Fatalf("UpdateMachine: err=%v upd=%+v", err, upd)
+	}
+
+	// Two-step delete confirmation gate
+	ch, err := p.CreateDeleteChallenge(ctx, acc.ID, "m_1")
+	if err != nil || ch.ConfirmationToken == "" || ch.MachineName != "box-new" {
+		t.Fatalf("CreateDeleteChallenge: err=%v ch=%+v", err, ch)
+	}
+	if err := p.ConsumeDeleteChallenge(acc.ID, "m_1", "del_wrong"); err == nil {
+		t.Fatalf("expected invalid delete confirmation token to fail")
+	}
+	if err := p.ConsumeDeleteChallenge(acc.ID, "m_other", ch.ConfirmationToken); err == nil {
+		t.Fatalf("expected mismatched machineId to fail")
+	}
+	if err := p.ConsumeDeleteChallenge(acc.ID, "m_1", ch.ConfirmationToken); err != nil {
+		t.Fatalf("expected valid confirmation token to succeed: %v", err)
+	}
+	if err := p.ConsumeDeleteChallenge(acc.ID, "m_1", ch.ConfirmationToken); err == nil {
+		t.Fatalf("expected confirmation token to be single-use")
+	}
+}

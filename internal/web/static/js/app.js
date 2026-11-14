@@ -99,7 +99,17 @@ const ICONS = {
     { d: 'M12 5v14' },
     { d: 'M5 12h14' }
   ]),
-  check: () => svgIcon([{ tag: 'polyline', points: '20 6 9 17 4 12' }])
+  check: () => svgIcon([{ tag: 'polyline', points: '20 6 9 17 4 12' }]),
+  key: () => svgIcon([
+    { tag: 'circle', cx: '7.5', cy: '15.5', r: '4.5' },
+    { d: 'M10.7 12.3 19 4' },
+    { d: 'M16 7l3 3' },
+    { d: 'M18 5l2 2' }
+  ]),
+  copy: () => svgIcon([
+    { tag: 'rect', x: '9', y: '9', width: '13', height: '13', rx: '2' },
+    { d: 'M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1' }
+  ])
 };
 
 const state = {
@@ -591,6 +601,17 @@ function renderDrawerContent() {
         ICONS.accounts(),
         el('span', { textContent: t('accountsBtn') }),
         el('span', { className: 'drawer-item-badge', textContent: String(state.accounts.length) })
+      ]),
+      el('button', {
+        type: 'button',
+        className: 'drawer-item',
+        onClick: () => {
+          closeDrawer();
+          setTimeout(() => openAPIKeysDialog(), 160);
+        }
+      }, [
+        ICONS.key(),
+        el('span', { textContent: t('apiKeysBtn') })
       ]),
       el('button', {
         type: 'button',
@@ -2636,6 +2657,264 @@ function renderAccountsDialogContent() {
 }
 
 // ============================================================
+// Copy Button (Invoker Commands + Fallback) & API Keys / MCP Dialog
+// ============================================================
+const copyTimers = new WeakMap();
+let lastCopyMessage = '';
+
+function legacyCopyText(text) {
+  const field = Object.assign(document.createElement('textarea'), { value: text });
+  field.setAttribute('readonly', '');
+  field.style.cssText = 'position:fixed;inset-block-start:0;opacity:0';
+  document.body.append(field);
+  field.select();
+  try {
+    return document.execCommand('copy');
+  } finally {
+    field.remove();
+  }
+}
+
+function reportCopyStatus(button, ok) {
+  const tip = button.nextElementSibling;
+  const iconWrap = button.querySelector('.icon');
+  clearTimeout(copyTimers.get(button));
+  button.removeAttribute('data-copied');
+  button.removeAttribute('data-failed');
+  let message = ok ? t('copiedTip') : t('copyFailedTip');
+  if (message === lastCopyMessage) message += '\u00A0';
+  lastCopyMessage = message;
+  if (tip) tip.textContent = '';
+  void button.offsetWidth;
+  button.setAttribute(ok ? 'data-copied' : 'data-failed', '');
+  if (iconWrap) iconWrap.replaceChildren(ok ? ICONS.check() : ICONS.close());
+  if (tip) requestAnimationFrame(() => (tip.textContent = message));
+  copyTimers.set(button, setTimeout(() => {
+    button.removeAttribute('data-copied');
+    button.removeAttribute('data-failed');
+    if (iconWrap) iconWrap.replaceChildren(ICONS.copy());
+    if (tip) tip.textContent = '';
+  }, 2000));
+}
+
+async function performCopy(button, target) {
+  if (!button || !target) return;
+  const text = target.matches('input, textarea') ? target.value : target.innerText.trim();
+  if (!text) return;
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      await navigator.clipboard.writeText(text);
+    } else if (!legacyCopyText(text)) {
+      throw new Error('clipboard unavailable');
+    }
+    reportCopyStatus(button, true);
+  } catch {
+    try {
+      if (legacyCopyText(text)) {
+        reportCopyStatus(button, true);
+        return;
+      }
+    } catch {}
+    reportCopyStatus(button, false);
+  }
+}
+
+if ('CommandEvent' in window) {
+  document.addEventListener('command', (event) => {
+    if (event.command === '--copy') performCopy(event.source, event.target);
+  }, true);
+} else {
+  document.addEventListener('click', (event) => {
+    const button = event.target.closest('button[command="--copy"]');
+    if (!button) return;
+    const target = document.getElementById(button.getAttribute('commandfor'));
+    if (target) performCopy(button, target);
+  });
+}
+
+function makeCopyableCodeBlock(codeId, codeText, copyAriaLabel) {
+  const codeEl = el('code', { id: codeId, textContent: codeText });
+  const preEl = el('pre', { tabindex: '0', className: 'mcp-pre mono' }, [codeEl]);
+  const copyBtn = el('button', {
+    type: 'button',
+    className: 'copy-button',
+    command: '--copy',
+    commandfor: codeId,
+    'aria-label': copyAriaLabel
+  }, [el('span', { className: 'icon', 'aria-hidden': 'true' }, [ICONS.copy()])]);
+  const tipEl = el('span', { className: 'tip', role: 'status' });
+  const copyWrap = el('span', { className: 'copy' }, [copyBtn, tipEl]);
+  return el('div', { className: 'copyable' }, [copyWrap, preEl]);
+}
+
+let apiKeysDialog = null;
+let apiKeysListState = [];
+let newlyCreatedApiToken = '';
+
+async function openAPIKeysDialog() {
+  if (!apiKeysDialog) {
+    apiKeysDialog = el('dialog', {
+      className: 'app-dialog app-dialog-narrow',
+      'aria-labelledby': 'apikeys-dialog-title'
+    });
+    enableDialogLightDismiss(apiKeysDialog);
+    apiKeysDialog.addEventListener('close', () => {
+      newlyCreatedApiToken = '';
+      renderAPIKeysDialogContent();
+    });
+    document.body.append(apiKeysDialog);
+  }
+  newlyCreatedApiToken = '';
+  renderAPIKeysDialogContent();
+  if (!apiKeysDialog.open) apiKeysDialog.showModal();
+  try {
+    const res = await apiFetch('/api/api-keys');
+    apiKeysListState = res.apiKeys || [];
+    renderAPIKeysDialogContent();
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+}
+
+function renderAPIKeysDialogContent() {
+  if (!apiKeysDialog) return;
+
+  const inner = el('div', { className: 'dialog-inner' });
+  const header = el('div', { className: 'dialog-header' }, [
+    el('h2', { id: 'apikeys-dialog-title', textContent: t('apiKeysTitle') }),
+    el('button', {
+      type: 'button',
+      className: 'btn btn-icon-only',
+      'aria-label': t('close'),
+      onClick: () => apiKeysDialog.close()
+    }, [ICONS.close()])
+  ]);
+
+  const body = el('div', { className: 'dialog-body' });
+  body.append(el('p', { className: 'hint', style: 'margin-block-end:0.9rem;', textContent: t('apiKeysDesc') }));
+
+  const mcpUrl = `${window.location.origin}/mcp`;
+  body.append(
+    el('div', { className: 'field', style: 'margin-block-end:0.85rem;' }, [
+      el('label', { textContent: t('mcpEndpointLabel') }),
+      makeCopyableCodeBlock('mcp-url-snippet', mcpUrl, `${t('copyLabel')}: ${t('mcpEndpointLabel')}`)
+    ])
+  );
+
+  const tokenPlaceholder = newlyCreatedApiToken || 'ibmon_YOUR_API_KEY';
+  const yamlSnippet = `mcp_servers:\n  instabox:\n    url: "${mcpUrl}"\n    headers:\n      Authorization: "Bearer ${tokenPlaceholder}"\n    timeout: 620`;
+  body.append(
+    el('div', { className: 'field', style: 'margin-block-end:1rem;' }, [
+      el('label', { textContent: t('mcpConfigLabel') }),
+      makeCopyableCodeBlock('mcp-yaml-snippet', yamlSnippet, `${t('copyLabel')}: ${t('mcpConfigLabel')}`)
+    ])
+  );
+
+  if (newlyCreatedApiToken) {
+    body.append(
+      el('div', { className: 'secret-once-banner', role: 'status' }, [
+        el('div', { className: 'secret-once-head', textContent: t('apiKeyCreatedWarn') }),
+        makeCopyableCodeBlock('new-apikey-token', newlyCreatedApiToken, `${t('copyLabel')}: API Key`)
+      ])
+    );
+  }
+
+  const list = el('div', { className: 'account-list' });
+  if (apiKeysListState.length === 0) {
+    list.append(el('p', { className: 'hint', textContent: t('noApiKeys') }));
+  } else {
+    for (const k of apiKeysListState) {
+      const lastUsedStr = k.lastUsedAt
+        ? `${t('lastUsed')}: ${new Date(k.lastUsedAt * 1000).toLocaleString(state.lang)}`
+        : t('neverUsed');
+      const row = el('div', { className: 'account-row' }, [
+        el('div', { className: 'account-info' }, [
+          el('div', { className: 'account-alias' }, [
+            el('span', { textContent: k.name }),
+            el('span', { className: 'badge mono', textContent: k.keyMask })
+          ]),
+          el('div', { className: 'account-meta', textContent: lastUsedStr })
+        ]),
+        el('div', { className: 'account-controls' }, [
+          el('button', {
+            type: 'button',
+            className: 'btn btn-icon-only btn-danger',
+            'aria-label': `${t('revokeApiKey')}: ${k.name}`,
+            title: t('revokeApiKey'),
+            onClick: async () => {
+              if (!window.confirm(t('confirmRevokeApiKey', { name: k.name }))) return;
+              try {
+                await apiFetch(`/api/api-keys/${encodeURIComponent(k.id)}`, { method: 'DELETE' });
+                apiKeysListState = apiKeysListState.filter((item) => item.id !== k.id);
+                renderAPIKeysDialogContent();
+              } catch (err) {
+                showToast(err.message, 'error');
+              }
+            }
+          }, [ICONS.trash()])
+        ])
+      ]);
+      list.append(row);
+    }
+  }
+  body.append(list);
+
+  const errBanner = el('div', { className: 'form-error-banner', role: 'alert', hidden: true });
+  const nameInput = el('input', {
+    className: 'input',
+    id: 'new-apikey-name',
+    name: 'name',
+    type: 'text',
+    required: true,
+    maxlength: '64',
+    placeholder: t('apiKeyNamePlaceholder')
+  });
+  const createBtn = el('button', {
+    type: 'submit',
+    className: 'btn btn-primary',
+    textContent: t('createApiKeyBtn')
+  });
+  const form = el('form', { novalidate: true, className: 'form-stack' }, [
+    errBanner,
+    el('div', { className: 'field', style: 'margin-block-end:0;' }, [
+      el('label', { for: 'new-apikey-name', textContent: t('apiKeyNameLabel') }),
+      nameInput
+    ]),
+    el('div', { className: 'dialog-actions-row' }, [createBtn])
+  ]);
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    errBanner.hidden = true;
+    const keyName = nameInput.value.trim();
+    if (!keyName) {
+      nameInput.focus();
+      return;
+    }
+    if (createBtn.getAttribute('aria-disabled') === 'true') return;
+    createBtn.setAttribute('aria-disabled', 'true');
+    try {
+      const res = await apiFetch('/api/api-keys', {
+        method: 'POST',
+        body: JSON.stringify({ name: keyName })
+      });
+      newlyCreatedApiToken = res.token || '';
+      if (res.apiKey) apiKeysListState = [res.apiKey, ...apiKeysListState];
+      renderAPIKeysDialogContent();
+    } catch (err) {
+      errBanner.textContent = err.message;
+      errBanner.hidden = false;
+    } finally {
+      createBtn.removeAttribute('aria-disabled');
+    }
+  });
+
+  body.append(form);
+  inner.append(header, body);
+  apiKeysDialog.replaceChildren(inner);
+}
+
+// ============================================================
 // Beszel-style Telemetry Detail Modal (persistent scroll container!)
 // ============================================================
 let telemetryDialog = null;
@@ -2868,6 +3147,7 @@ function closeOpenDialogs() {
   try { if (renameMachineDialog?.open) renameMachineDialog.close(); } catch {}
   try { if (deleteMachineDialog?.open) deleteMachineDialog.close(); } catch {}
   try { if (accountsDialog?.open) accountsDialog.close(); } catch {}
+  try { if (apiKeysDialog?.open) apiKeysDialog.close(); } catch {}
   try { if (telemetryDialog?.open) telemetryDialog.close(); } catch {}
   state.telemetryTarget = null;
   state.editingAccountId = null;

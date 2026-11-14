@@ -2311,6 +2311,134 @@ select.input {
   color: #ffffff;
 }
 
+/* Copyable Code Blocks & API Key One-Time Banner */
+.copyable {
+  display: flex;
+  align-items: start;
+  gap: 0.5rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 0.72rem;
+  padding: 0.6rem 0.75rem;
+}
+
+.mcp-pre {
+  margin: 0;
+  flex: 1 1 auto;
+  min-inline-size: 0;
+  overflow-x: auto;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+.copy {
+  position: relative;
+  flex: none;
+  order: 1;
+  display: inline-flex;
+  align-items: center;
+}
+
+.copy-button {
+  min-inline-size: 32px;
+  min-block-size: 32px;
+  padding: 0.3rem;
+  border-radius: 0.5rem;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  color: var(--text);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.copy-button:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  color: var(--accent);
+}
+
+.copy-button[data-copied] {
+  border-color: var(--ok-border);
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+.copy-button[data-failed] {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.copy .tip {
+  position: absolute;
+  inset-block-end: calc(100% + 6px);
+  inset-inline-end: 0;
+  padding: 0.2rem 0.5rem;
+  border-radius: 0.45rem;
+  background: var(--text);
+  color: var(--surface);
+  font-size: 0.72rem;
+  font-weight: 600;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.14s ease;
+}
+
+.copy-button[data-copied] + .tip,
+.copy-button[data-failed] + .tip {
+  opacity: 1;
+}
+
+@media (hover: hover) {
+  .copyable {
+    display: block;
+    position: relative;
+  }
+  .mcp-pre {
+    padding-inline-end: 2.5rem;
+  }
+  .copy {
+    position: absolute;
+    inset-block-start: 0.45rem;
+    inset-inline-end: 0.45rem;
+  }
+  .copy-button {
+    opacity: 0;
+    transition: opacity 0.15s ease;
+  }
+  .copyable:hover .copy-button,
+  .copyable:focus-within .copy-button,
+  .copy-button:focus-visible,
+  .copy-button[data-copied],
+  .copy-button[data-failed] {
+    opacity: 1;
+  }
+}
+
+.secret-once-banner {
+  padding: 0.78rem 0.9rem;
+  border-radius: 0.85rem;
+  background: var(--ok-soft);
+  border: 1px solid var(--ok-border);
+  margin-block-end: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.secret-once-head {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--ok);
+}
+
+.secret-once-banner .mcp-pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 @media (max-width: 640px) {
   .auth-card {
     padding: 1.35rem;

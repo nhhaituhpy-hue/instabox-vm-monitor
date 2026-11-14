@@ -277,3 +277,107 @@ func TestPutAndDeleteActivityLease(t *testing.T) {
 		t.Fatalf("expected DELETE activity-lease request to reach server")
 	}
 }
+
+func TestExecFilesPortsProcessesLogsSnapshotsAndUpdate(t *testing.T) {
+	var wroteBytes string
+	var snapConfirm string
+	client, _ := newMockClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_1/exec":
+			_, _ = w.Write([]byte(`{"stdout":"ok\n","stderr":"","exitCode":0,"timedOut":false,"truncated":false}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_1/files":
+			_, _ = w.Write([]byte(`{"path":"/data/app","type":"dir","size":0,"mode":"drwxr-xr-x","modTime":"2026-11-14T00:00:00Z","entries":[{"name":"main.py","type":"file","size":12,"mode":"-rw-r--r--"}]}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/machines/m_1/files":
+			b := make([]byte, 1024)
+			n, _ := r.Body.Read(b)
+			wroteBytes = string(b[:n])
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"path":"/data/app/main.py","size":12,"sha256":"abc","mode":"0644","created":true}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_1/ports":
+			_, _ = w.Write([]byte(`{"enabled":true,"ports":[{"id":"p_1","machineId":"m_1","port":8080,"name":"web","url":"https://8080-box.instabox.sh","access":"public","protocol":"http","createdAt":"2026-11-14T00:00:00Z"}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_1/ports":
+			_, _ = w.Write([]byte(`{"id":"p_2","machineId":"m_1","port":3000,"name":"api","url":"https://3000-box.instabox.sh","access":"private","token":"ibp_tok","tokenUrl":"https://3000-box.instabox.sh?_token=ibp_tok","protocol":"http","createdAt":"2026-11-14T00:00:00Z"}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/machines/m_1/ports/3000":
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_1/processes":
+			_, _ = w.Write([]byte(`{"machineId":"m_1","state":"running","live":true,"capturedAt":"2026-11-14T00:00:00Z","trigger":"request","truncated":false,"processes":[{"pid":1,"user":"root","command":"init"}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_1/logs":
+			_, _ = w.Write([]byte(`{"machineId":"m_1","state":"running","console":"boot ok\n","cursor":8,"operations":[]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_1/connection-info":
+			_, _ = w.Write([]byte(`{"machineId":"m_1","transport":"ssh","host":"ssh.instabox.sh","port":22,"username":"m_1","capabilities":["pty","exec"]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/snapshots":
+			_, _ = w.Write([]byte(`{"snapshots":[{"id":"sn_1","name":"pre-upgrade","orgId":"org_1","sourceMachineId":"m_1","sourceSnapshotSeq":1,"rootSizeBytes":100,"createdAt":"2026-11-14T00:00:00Z","status":"ready"}]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_1/snapshots":
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"id":"sn_2","name":"snap-2","orgId":"org_1","sourceMachineId":"m_1","sourceSnapshotSeq":2,"rootSizeBytes":100,"createdAt":"2026-11-14T00:00:00Z","status":"pending"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_1/restore":
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"id":"op_rest","machineId":"m_1","state":"queued"}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/snapshots/sn_2":
+			snapConfirm = r.Header.Get("X-Confirm-Delete")
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1/machines/m_1":
+			_, _ = w.Write([]byte(`{"id":"m_1","name":"box-updated","state":"running","desiredState":"running","autoSuspendAfterSeconds":0,"maxRunMinutes":-1}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	ctx := context.Background()
+	ex, err := client.ExecMachine(ctx, "ibk_test", "m_1", instabox.ExecInput{Cmd: "echo ok", TimeoutSeconds: 30})
+	if err != nil || ex.ExitCode != 0 || ex.Stdout != "ok\n" {
+		t.Fatalf("ExecMachine failed: err=%v ex=%+v", err, ex)
+	}
+	files, err := client.ReadMachineFiles(ctx, "ibk_test", "m_1", "/data/app")
+	if err != nil || files.Type != "dir" || len(files.Entries) != 1 {
+		t.Fatalf("ReadMachineFiles failed: err=%v files=%+v", err, files)
+	}
+	fw, err := client.WriteMachineFile(ctx, "ibk_test", "m_1", "/data/app/main.py", "0644", true, []byte("print('hi')\n"))
+	if err != nil || !fw.Created || wroteBytes != "print('hi')\n" {
+		t.Fatalf("WriteMachineFile failed: err=%v fw=%+v wrote=%q", err, fw, wroteBytes)
+	}
+	ports, err := client.ListMachinePorts(ctx, "ibk_test", "m_1")
+	if err != nil || !ports.Enabled || len(ports.Ports) != 1 {
+		t.Fatalf("ListMachinePorts failed: err=%v ports=%+v", err, ports)
+	}
+	pub, err := client.PublishMachinePort(ctx, "ibk_test", "m_1", instabox.PublishPortInput{Port: 3000, Name: "api", Access: "private"})
+	if err != nil || pub.Token != "ibp_tok" {
+		t.Fatalf("PublishMachinePort failed: err=%v pub=%+v", err, pub)
+	}
+	if err := client.UnpublishMachinePort(ctx, "ibk_test", "m_1", 3000); err != nil {
+		t.Fatalf("UnpublishMachinePort failed: %v", err)
+	}
+	procs, err := client.ListMachineProcesses(ctx, "ibk_test", "m_1", false)
+	if err != nil || !procs.Live || len(procs.Processes) != 1 {
+		t.Fatalf("ListMachineProcesses failed: err=%v procs=%+v", err, procs)
+	}
+	logs, err := client.GetMachineLogs(ctx, "ibk_test", "m_1", 100, 0)
+	if err != nil || logs.Console != "boot ok\n" {
+		t.Fatalf("GetMachineLogs failed: err=%v logs=%+v", err, logs)
+	}
+	conn, err := client.GetMachineConnectionInfo(ctx, "ibk_test", "m_1")
+	if err != nil || conn.Host != "ssh.instabox.sh" {
+		t.Fatalf("GetMachineConnectionInfo failed: err=%v conn=%+v", err, conn)
+	}
+	snaps, err := client.ListSnapshots(ctx, "ibk_test")
+	if err != nil || len(snaps) != 1 || snaps[0].ID != "sn_1" {
+		t.Fatalf("ListSnapshots failed: err=%v snaps=%+v", err, snaps)
+	}
+	sn, err := client.CreateSnapshot(ctx, "ibk_test", "m_1", instabox.CreateSnapshotInput{Name: "snap-2"})
+	if err != nil || sn.ID != "sn_2" {
+		t.Fatalf("CreateSnapshot failed: err=%v sn=%+v", err, sn)
+	}
+	rest, err := client.RestoreMachine(ctx, "ibk_test", "m_1", instabox.RestoreMachineInput{SnapshotID: "sn_1"})
+	if err != nil || rest.Operation == nil || rest.Operation.ID != "op_rest" {
+		t.Fatalf("RestoreMachine failed: err=%v rest=%+v", err, rest)
+	}
+	if err := client.DeleteSnapshot(ctx, "ibk_test", "sn_2", "sn_2"); err != nil || snapConfirm != "sn_2" {
+		t.Fatalf("DeleteSnapshot failed: err=%v confirm=%q", err, snapConfirm)
+	}
+	nm := "box-updated"
+	upd, err := client.UpdateMachine(ctx, "ibk_test", "m_1", instabox.UpdateMachineInput{Name: &nm})
+	if err != nil || upd.Name != "box-updated" {
+		t.Fatalf("UpdateMachine failed: err=%v upd=%+v", err, upd)
+	}
+}

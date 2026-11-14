@@ -608,3 +608,132 @@ func TestMachineKeepaliveEndpoint(t *testing.T) {
 		t.Fatalf("expected 404 on unknown machine, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestAPIKeysMCPAuthAndGatedDeleteOverHTTP(t *testing.T) {
+	h, _ := setupTestServer(t)
+
+	// Setup admin
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/setup", bytes.NewBufferString(`{"username":"admin","password":"SuperSecret!123"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	cookies := rec.Result().Cookies()
+	var setupResp struct {
+		CSRFToken string `json:"csrfToken"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &setupResp)
+
+	// Add account (populates m_1)
+	req = httptest.NewRequest(http.MethodPost, "/api/accounts", bytes.NewBufferString(`{"alias":"Box 1","apiKey":"ibk_valid_secret_key_9999"}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var accResp struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &accResp)
+
+	// 1. Unauthenticated /mcp and /api/api-keys -> 401
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauthenticated /mcp, got %d", rec.Code)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/api-keys", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauthenticated /api/api-keys, got %d", rec.Code)
+	}
+
+	// 2. Create Service API Key via session + CSRF
+	req = httptest.NewRequest(http.MethodPost, "/api/api-keys", bytes.NewBufferString(`{"name":"Hermes"}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create api key HTTP %d: %s", rec.Code, rec.Body.String())
+	}
+	var keyResp struct {
+		Token  string `json:"token"`
+		APIKey struct {
+			ID string `json:"id"`
+		} `json:"apiKey"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &keyResp)
+	if !strings.HasPrefix(keyResp.Token, "ibmon_") || keyResp.APIKey.ID == "" {
+		t.Fatalf("unexpected api key create response: %s", rec.Body.String())
+	}
+
+	// 3. Bearer token works on /mcp initialize + tools/list
+	req = httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`))
+	req.Header.Set("Authorization", "Bearer "+keyResp.Token)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"instabox-vm-monitor"`) {
+		t.Fatalf("MCP with Bearer token failed: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// 4. Bearer token CANNOT manage /api/api-keys (session-only admin)
+	req = httptest.NewRequest(http.MethodGet, "/api/api-keys", nil)
+	req.Header.Set("Authorization", "Bearer "+keyResp.Token)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden && rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected API key blocked from /api/api-keys, got %d", rec.Code)
+	}
+
+	// 5. Bearer token CAN execute actions without CSRF (and does NOT panic on nil session!)
+	req = httptest.NewRequest(http.MethodPost, "/api/machines/"+accResp.ID+"/m_1/actions/stop", nil)
+	req.Header.Set("Authorization", "Bearer "+keyResp.Token)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected Bearer action stop 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 6. Bearer DELETE /api/machines without confirmation token returns 409 challenge instead of deleting!
+	req = httptest.NewRequest(http.MethodDelete, "/api/machines/"+accResp.ID+"/m_1", nil)
+	req.Header.Set("Authorization", "Bearer "+keyResp.Token)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"requiresUserConfirmation":true`) {
+		t.Fatalf("expected 409 confirmation challenge for Bearer delete, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var ch struct {
+		ConfirmationToken string `json:"confirmationToken"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &ch)
+
+	// 7. Bearer DELETE WITH confirmation token succeeds
+	req = httptest.NewRequest(http.MethodDelete, "/api/machines/"+accResp.ID+"/m_1", nil)
+	req.Header.Set("Authorization", "Bearer "+keyResp.Token)
+	req.Header.Set("X-Confirm-Delete-Token", ch.ConfirmationToken)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on confirmed Bearer delete, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// 8. Revoking API key via session immediately rejects subsequent /mcp calls
+	req = httptest.NewRequest(http.MethodDelete, "/api/api-keys/"+keyResp.APIKey.ID, nil)
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 revoking api key, got %d", rec.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/mcp", bytes.NewBufferString(`{"jsonrpc":"2.0","id":2,"method":"ping"}`))
+	req.Header.Set("Authorization", "Bearer "+keyResp.Token)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after key revocation, got %d", rec.Code)
+	}
+}

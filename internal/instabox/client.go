@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,8 +27,9 @@ const (
 )
 
 type Client struct {
-	baseURL string
-	http    *http.Client
+	baseURL  string
+	http     *http.Client
+	longHTTP *http.Client
 }
 
 func NewClient(baseURL string, hc *http.Client) (*Client, error) {
@@ -59,9 +61,14 @@ func NewClient(baseURL string, hc *http.Client) (*Client, error) {
 		}
 		return http.ErrUseLastResponse
 	}
+	longClone := clone
+	if longClone.Timeout < 630*time.Second {
+		longClone.Timeout = 630 * time.Second
+	}
 	return &Client{
-		baseURL: strings.TrimRight(u.String(), "/"),
-		http:    &clone,
+		baseURL:  strings.TrimRight(u.String(), "/"),
+		http:     &clone,
+		longHTTP: &longClone,
 	}, nil
 }
 
@@ -111,13 +118,160 @@ type TemplateList struct {
 }
 
 type CreateMachineInput struct {
-	Name                    string `json:"name,omitempty"`
-	TemplateID              string `json:"templateId,omitempty"`
-	VCPUs                   int    `json:"vcpus,omitempty"`
-	MemMiB                  int    `json:"memMiB,omitempty"`
-	DesiredState            string `json:"desiredState,omitempty"`
-	AutoSuspendAfterSeconds *int   `json:"autoSuspendAfterSeconds,omitempty"`
-	MaxRunMinutes           *int   `json:"maxRunMinutes,omitempty"`
+	Name                    string            `json:"name,omitempty"`
+	TemplateID              string            `json:"templateId,omitempty"`
+	SnapshotID              string            `json:"snapshotId,omitempty"`
+	VCPUs                   int               `json:"vcpus,omitempty"`
+	MemMiB                  int               `json:"memMiB,omitempty"`
+	DesiredState            string            `json:"desiredState,omitempty"`
+	AutoSuspendAfterSeconds *int              `json:"autoSuspendAfterSeconds,omitempty"`
+	MaxRunMinutes           *int              `json:"maxRunMinutes,omitempty"`
+	Env                     map[string]string `json:"env,omitempty"`
+}
+
+type UpdateMachineInput struct {
+	Name                    *string           `json:"name,omitempty"`
+	AutoSuspendAfterSeconds *int              `json:"autoSuspendAfterSeconds,omitempty"`
+	MaxRunMinutes           *int              `json:"maxRunMinutes,omitempty"`
+	Metadata                map[string]string `json:"metadata,omitempty"`
+	Apply                   string            `json:"apply,omitempty"`
+}
+
+type ExecInput struct {
+	Cmd            string            `json:"cmd,omitempty"`
+	Argv           []string          `json:"argv,omitempty"`
+	Cwd            string            `json:"cwd,omitempty"`
+	Envs           map[string]string `json:"envs,omitempty"`
+	Stdin          string            `json:"stdin,omitempty"`
+	TimeoutSeconds int               `json:"timeoutSeconds,omitempty"`
+}
+
+type ExecResult struct {
+	Stdout      string       `json:"stdout"`
+	Stderr      string       `json:"stderr"`
+	ExitCode    int          `json:"exitCode"`
+	TimedOut    bool         `json:"timedOut"`
+	Truncated   bool         `json:"truncated"`
+	InvalidUTF8 bool         `json:"invalidUtf8,omitempty"`
+	OOMKilled   bool         `json:"oomKilled,omitempty"`
+	Signal      string       `json:"signal,omitempty"`
+	DiskWarning *DiskWarning `json:"diskWarning,omitempty"`
+}
+
+type FileEntry struct {
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Size    int64  `json:"size"`
+	Mode    string `json:"mode"`
+	ModTime string `json:"modTime"`
+}
+
+type MachineFiles struct {
+	Path      string      `json:"path"`
+	Type      string      `json:"type"`
+	Size      int64       `json:"size"`
+	Mode      string      `json:"mode"`
+	ModTime   string      `json:"modTime"`
+	Content   string      `json:"content,omitempty"`
+	Binary    bool        `json:"binary,omitempty"`
+	Truncated bool        `json:"truncated,omitempty"`
+	Entries   []FileEntry `json:"entries,omitempty"`
+}
+
+type FileWritten struct {
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	SHA256  string `json:"sha256"`
+	Mode    string `json:"mode"`
+	Created bool   `json:"created"`
+}
+
+type PublishPortInput struct {
+	Port        int    `json:"port"`
+	Name        string `json:"name,omitempty"`
+	Access      string `json:"access,omitempty"`
+	Protocol    string `json:"protocol,omitempty"`
+	RotateToken bool   `json:"rotateToken,omitempty"`
+}
+
+type PublicPort struct {
+	ID        string `json:"id"`
+	MachineID string `json:"machineId"`
+	Port      int    `json:"port"`
+	Name      string `json:"name"`
+	URL       string `json:"url"`
+	Address   string `json:"address,omitempty"`
+	Access    string `json:"access"`
+	Protocol  string `json:"protocol,omitempty"`
+	Token     string `json:"token,omitempty"`
+	TokenURL  string `json:"tokenUrl,omitempty"`
+	CreatedAt string `json:"createdAt"`
+}
+
+type PublicPortList struct {
+	Enabled bool         `json:"enabled"`
+	Ports   []PublicPort `json:"ports"`
+}
+
+type ProcessList struct {
+	MachineID  string            `json:"machineId"`
+	State      string            `json:"state"`
+	Live       bool              `json:"live"`
+	CapturedAt string            `json:"capturedAt"`
+	Trigger    string            `json:"trigger"`
+	Truncated  bool              `json:"truncated"`
+	Processes  []json.RawMessage `json:"processes"`
+}
+
+type MachineLogs struct {
+	MachineID          string      `json:"machineId"`
+	State              string      `json:"state"`
+	Console            string      `json:"console"`
+	ConsoleTruncated   bool        `json:"consoleTruncated,omitempty"`
+	ConsoleReset       bool        `json:"consoleReset,omitempty"`
+	ConsoleUnavailable string      `json:"consoleUnavailable,omitempty"`
+	Cursor             int64       `json:"cursor"`
+	Operations         []Operation `json:"operations"`
+}
+
+type ConnectionInfo struct {
+	MachineID    string   `json:"machineId"`
+	Transport    string   `json:"transport"`
+	Host         string   `json:"host"`
+	Port         int      `json:"port"`
+	MoshHost     string   `json:"moshHost,omitempty"`
+	MoshPort     int      `json:"moshPort,omitempty"`
+	Username     string   `json:"username"`
+	Capabilities []string `json:"capabilities"`
+}
+
+type CreateSnapshotInput struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	RootOnly    bool   `json:"rootOnly,omitempty"`
+}
+
+type RestoreMachineInput struct {
+	SnapshotID   string `json:"snapshotId,omitempty"`
+	DesiredState string `json:"desiredState,omitempty"`
+}
+
+type Snapshot struct {
+	ID              string       `json:"id"`
+	Name            string       `json:"name"`
+	Description     string       `json:"description,omitempty"`
+	OrgID           string       `json:"orgId"`
+	SourceMachineID string       `json:"sourceMachineId"`
+	Status          string       `json:"status"`
+	RootSizeBytes   int64        `json:"rootSizeBytes"`
+	DataSizeBytes   int64        `json:"dataSizeBytes,omitempty"`
+	DefaultSpec     *MachineSpec `json:"defaultSpec,omitempty"`
+	Error           string       `json:"error,omitempty"`
+	CreatedAt       string       `json:"createdAt"`
+}
+
+type SnapshotList struct {
+	Snapshots []Snapshot `json:"snapshots"`
 }
 
 type TemplateRef struct {
@@ -392,15 +546,180 @@ func (c *Client) CreateMachine(ctx context.Context, apiKey string, in CreateMach
 }
 
 func (c *Client) RenameMachine(ctx context.Context, apiKey, machineID, name string) (*Machine, error) {
+	return c.UpdateMachine(ctx, apiKey, machineID, UpdateMachineInput{Name: &name})
+}
+
+func (c *Client) UpdateMachine(ctx context.Context, apiKey, machineID string, in UpdateMachineInput) (*Machine, error) {
 	var out Machine
-	payload := struct {
-		Name string `json:"name"`
-	}{Name: name}
-	_, err := c.doJSON(ctx, http.MethodPatch, "/v1/machines/"+url.PathEscape(machineID), apiKey, payload, true, &out)
+	_, err := c.doJSON(ctx, http.MethodPatch, "/v1/machines/"+url.PathEscape(machineID), apiKey, in, true, &out)
 	if err != nil {
 		return nil, err
 	}
 	return &out, nil
+}
+
+func (c *Client) ExecMachine(ctx context.Context, apiKey, machineID string, in ExecInput) (*ExecResult, error) {
+	var out ExecResult
+	_, err := c.doWithHTTP(ctx, c.longHTTP, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/exec", apiKey, in, false, nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) ReadMachineFiles(ctx context.Context, apiKey, machineID, filePath string) (*MachineFiles, error) {
+	p := "/v1/machines/" + url.PathEscape(machineID) + "/files"
+	if filePath != "" {
+		p += "?path=" + url.QueryEscape(filePath)
+	}
+	var out MachineFiles
+	_, err := c.doWithHTTP(ctx, c.longHTTP, http.MethodGet, p, apiKey, nil, false, nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) WriteMachineFile(ctx context.Context, apiKey, machineID, filePath, mode string, parents bool, content []byte) (*FileWritten, error) {
+	q := url.Values{}
+	q.Set("path", filePath)
+	if mode != "" {
+		q.Set("mode", mode)
+	}
+	if parents {
+		q.Set("parents", "true")
+	}
+	reqPath := "/v1/machines/" + url.PathEscape(machineID) + "/files?" + q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.baseURL+reqPath, bytes.NewReader(content))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-API-Key", apiKey)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("User-Agent", "instabox-vm-monitor/1.0")
+
+	resp, err := c.longHTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	rawBody, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, decodeUpstreamError(resp.StatusCode, rawBody)
+	}
+	var out FileWritten
+	if len(rawBody) > 0 {
+		if err := json.Unmarshal(rawBody, &out); err != nil {
+			return nil, fmt.Errorf("decode response: %w", err)
+		}
+	}
+	return &out, nil
+}
+
+func (c *Client) ListMachinePorts(ctx context.Context, apiKey, machineID string) (*PublicPortList, error) {
+	var out PublicPortList
+	_, err := c.doJSON(ctx, http.MethodGet, "/v1/machines/"+url.PathEscape(machineID)+"/ports", apiKey, nil, false, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) PublishMachinePort(ctx context.Context, apiKey, machineID string, in PublishPortInput) (*PublicPort, error) {
+	var out PublicPort
+	_, err := c.doJSON(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/ports", apiKey, in, false, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) UnpublishMachinePort(ctx context.Context, apiKey, machineID string, port int) error {
+	_, err := c.doJSON(ctx, http.MethodDelete, "/v1/machines/"+url.PathEscape(machineID)+"/ports/"+strconv.Itoa(port), apiKey, nil, false, nil)
+	return err
+}
+
+func (c *Client) ListMachineProcesses(ctx context.Context, apiKey, machineID string, all bool) (*ProcessList, error) {
+	p := "/v1/machines/" + url.PathEscape(machineID) + "/processes"
+	if all {
+		p += "?all=true"
+	}
+	var out ProcessList
+	_, err := c.doWithHTTP(ctx, c.longHTTP, http.MethodGet, p, apiKey, nil, false, nil, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) GetMachineLogs(ctx context.Context, apiKey, machineID string, tail int, after int64) (*MachineLogs, error) {
+	q := url.Values{}
+	if tail > 0 {
+		q.Set("tail", strconv.Itoa(tail))
+	}
+	if after > 0 {
+		q.Set("after", strconv.FormatInt(after, 10))
+	}
+	p := "/v1/machines/" + url.PathEscape(machineID) + "/logs"
+	if enc := q.Encode(); enc != "" {
+		p += "?" + enc
+	}
+	var out MachineLogs
+	_, err := c.doJSON(ctx, http.MethodGet, p, apiKey, nil, false, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) GetMachineConnectionInfo(ctx context.Context, apiKey, machineID string) (*ConnectionInfo, error) {
+	var out ConnectionInfo
+	_, err := c.doJSON(ctx, http.MethodGet, "/v1/machines/"+url.PathEscape(machineID)+"/connection-info", apiKey, nil, false, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) ListSnapshots(ctx context.Context, apiKey string) ([]Snapshot, error) {
+	var out SnapshotList
+	_, err := c.doJSON(ctx, http.MethodGet, "/v1/snapshots", apiKey, nil, false, &out)
+	if err != nil {
+		return nil, err
+	}
+	return out.Snapshots, nil
+}
+
+func (c *Client) CreateSnapshot(ctx context.Context, apiKey, machineID string, in CreateSnapshotInput) (*Snapshot, error) {
+	var out Snapshot
+	_, err := c.doJSON(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/snapshots", apiKey, in, true, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) RestoreMachine(ctx context.Context, apiKey, machineID string, in RestoreMachineInput) (*ActionResult, error) {
+	var op Operation
+	_, err := c.doJSON(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/restore", apiKey, in, true, &op)
+	if err != nil {
+		return nil, err
+	}
+	return &ActionResult{Operation: &op}, nil
+}
+
+func (c *Client) DeleteSnapshot(ctx context.Context, apiKey, snapshotID, confirmValue string) error {
+	if confirmValue == "" {
+		confirmValue = snapshotID
+	}
+	extra := map[string]string{"X-Confirm-Delete": confirmValue}
+	_, err := c.doJSONWithHeaders(ctx, http.MethodDelete, "/v1/snapshots/"+url.PathEscape(snapshotID), apiKey, nil, true, extra, nil)
+	return err
 }
 
 func (c *Client) DeleteMachine(ctx context.Context, apiKey, machineID, confirmValue string) (*ActionResult, error) {
@@ -487,6 +806,39 @@ func (c *Client) doJSON(ctx context.Context, method, path, apiKey string, body a
 }
 
 func (c *Client) doJSONWithHeaders(ctx context.Context, method, path, apiKey string, body any, needIdem bool, extraHeaders map[string]string, out any) (time.Time, error) {
+	return c.doWithHTTP(ctx, c.http, method, path, apiKey, body, needIdem, extraHeaders, out)
+}
+
+func decodeUpstreamError(status int, rawBody []byte) *APIError {
+	if status >= 300 && status < 400 {
+		return &APIError{
+			Status:  http.StatusBadGateway,
+			Code:    "unexpected_redirect",
+			Message: fmt.Sprintf("unexpected redirect (%d) from upstream API", status),
+		}
+	}
+	var env struct {
+		Error APIErrorBody `json:"error"`
+	}
+	_ = json.Unmarshal(rawBody, &env)
+	apiErr := &APIError{
+		Status:            status,
+		Code:              env.Error.Code,
+		Message:           env.Error.Message,
+		RequestID:         env.Error.RequestID,
+		Retryable:         env.Error.Retryable,
+		OperationID:       env.Error.OperationID,
+		RetryAfterSeconds: env.Error.RetryAfterSeconds,
+		Reason:            env.Error.Reason,
+		Hint:              env.Error.Hint,
+	}
+	if apiErr.Message == "" {
+		apiErr.Message = http.StatusText(status)
+	}
+	return apiErr
+}
+
+func (c *Client) doWithHTTP(ctx context.Context, hc *http.Client, method, path, apiKey string, body any, needIdem bool, extraHeaders map[string]string, out any) (time.Time, error) {
 	var bodyReader io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -512,7 +864,7 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, method, path, apiKey str
 		req.Header.Set(k, v)
 	}
 
-	resp, err := c.http.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -531,32 +883,7 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, method, path, apiKey str
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-			return serverTime, &APIError{
-				Status:  http.StatusBadGateway,
-				Code:    "unexpected_redirect",
-				Message: fmt.Sprintf("unexpected redirect (%d) from upstream API", resp.StatusCode),
-			}
-		}
-		var env struct {
-			Error APIErrorBody `json:"error"`
-		}
-		_ = json.Unmarshal(rawBody, &env)
-		apiErr := &APIError{
-			Status:            resp.StatusCode,
-			Code:              env.Error.Code,
-			Message:           env.Error.Message,
-			RequestID:         env.Error.RequestID,
-			Retryable:         env.Error.Retryable,
-			OperationID:       env.Error.OperationID,
-			RetryAfterSeconds: env.Error.RetryAfterSeconds,
-			Reason:            env.Error.Reason,
-			Hint:              env.Error.Hint,
-		}
-		if apiErr.Message == "" {
-			apiErr.Message = http.StatusText(resp.StatusCode)
-		}
-		return serverTime, apiErr
+		return serverTime, decodeUpstreamError(resp.StatusCode, rawBody)
 	}
 
 	if out != nil && len(rawBody) > 0 {
