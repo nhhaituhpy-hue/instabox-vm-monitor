@@ -1,5 +1,5 @@
 import { LANGUAGES, detectInitialLang, tr } from './i18n.js';
-import { buildMiniAreaChart, fmtRate, renderDetailChart } from './charts.js';
+import { buildMiniAreaChart, fmtBytes, fmtRate, renderDetailChart } from './charts.js';
 
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
@@ -910,22 +910,40 @@ function createActionButton(initialVm, actionKey, iconNode) {
   };
 }
 
-function getVmDiskPct(vm) {
+function getVmMountStats(vm, mount) {
   if (vm.disk?.filesystems?.length) {
-    const dataFs = vm.disk.filesystems.find((f) => f.mount === '/data') || vm.disk.filesystems[0];
-    if (dataFs && Number.isFinite(dataFs.usedPct)) return dataFs.usedPct;
+    const fs = vm.disk.filesystems.find((f) => f.mount === mount);
+    if (fs) {
+      const pct = Number.isFinite(fs.usedPct)
+        ? fs.usedPct
+        : (fs.sizeBytes > 0 && fs.usedBytes > 0 ? (fs.usedBytes / fs.sizeBytes) * 100 : 0);
+      return { pct, usedBytes: fs.usedBytes || 0, sizeBytes: fs.sizeBytes || 0 };
+    }
   }
   const latest = vm.latestMetric;
-  if (latest && latest.diskTotal > 0 && latest.diskUsed > 0) {
-    return (latest.diskUsed / latest.diskTotal) * 100;
+  if (latest) {
+    if (mount === '/' && latest.rootTotal > 0 && latest.rootUsed > 0) {
+      return {
+        pct: (latest.rootUsed / latest.rootTotal) * 100,
+        usedBytes: latest.rootUsed,
+        sizeBytes: latest.rootTotal
+      };
+    }
+    if (mount === '/data' && latest.diskTotal > 0 && latest.diskUsed > 0) {
+      return {
+        pct: (latest.diskUsed / latest.diskTotal) * 100,
+        usedBytes: latest.diskUsed,
+        sizeBytes: latest.diskTotal
+      };
+    }
   }
-  return 0;
+  return { pct: 0, usedBytes: 0, sizeBytes: 0 };
 }
 
-function metricsSignature(vm, diskPct) {
+function metricsSignature(vm, rootPct, dataPct) {
   const samples = vm.recentMetrics || [];
   const last = samples.length ? samples[samples.length - 1] : null;
-  return `${samples.length}|${last ? `${last.ts}:${last.cpuPct}:${last.memUsed}:${last.diskUsed}` : 'none'}|${diskPct.toFixed(1)}`;
+  return `${samples.length}|${last ? `${last.ts}:${last.cpuPct}:${last.memUsed}:${last.diskUsed}:${last.rootUsed}` : 'none'}|${rootPct.toFixed(1)}|${dataPct.toFixed(1)}`;
 }
 
 // ============================================================
@@ -981,7 +999,7 @@ function createVmCardController(initialVm) {
   const metaBottom = el('div', { className: 'vm-meta-bottom' }, [specEl, clockRow, errEl]);
   col1.append(metaBottom);
 
-  // Column 2: Mini Beszel Charts
+  // Column 2: Mini Beszel Charts (CPU, RAM, System (/), Data (/data))
   const cpuLbl = el('span', { className: 'mini-chart-lbl' });
   const cpuVal = el('span', { className: 'mini-chart-val mono' });
   const cpuSvgHost = el('div');
@@ -990,9 +1008,21 @@ function createVmCardController(initialVm) {
   const ramVal = el('span', { className: 'mini-chart-val mono' });
   const ramSvgHost = el('div');
 
-  const diskLbl = el('span', { className: 'mini-chart-lbl' });
-  const diskVal = el('span', { className: 'mini-chart-val mono' });
-  const diskSvgHost = el('div');
+  const rootLbl = el('span', { className: 'mini-chart-lbl' });
+  const rootVal = el('span', { className: 'mini-chart-val mono' });
+  const rootSvgHost = el('div');
+  const rootBox = el('button', { type: 'button', className: 'mini-chart-box', onClick: () => openTelemetryDialog(vm) }, [
+    el('div', { className: 'mini-chart-top' }, [rootLbl, rootVal]),
+    rootSvgHost
+  ]);
+
+  const dataLbl = el('span', { className: 'mini-chart-lbl' });
+  const dataVal = el('span', { className: 'mini-chart-val mono' });
+  const dataSvgHost = el('div');
+  const dataBox = el('button', { type: 'button', className: 'mini-chart-box', onClick: () => openTelemetryDialog(vm) }, [
+    el('div', { className: 'mini-chart-top' }, [dataLbl, dataVal]),
+    dataSvgHost
+  ]);
 
   const miniGrid = el('div', { className: 'mini-charts-grid' }, [
     el('button', { type: 'button', className: 'mini-chart-box', onClick: () => openTelemetryDialog(vm) }, [
@@ -1003,10 +1033,8 @@ function createVmCardController(initialVm) {
       el('div', { className: 'mini-chart-top' }, [ramLbl, ramVal]),
       ramSvgHost
     ]),
-    el('button', { type: 'button', className: 'mini-chart-box', onClick: () => openTelemetryDialog(vm) }, [
-      el('div', { className: 'mini-chart-top' }, [diskLbl, diskVal]),
-      diskSvgHost
-    ])
+    rootBox,
+    dataBox
   ]);
 
   // Column 3: 4 Icon-Only SVG Action Buttons
@@ -1049,10 +1077,13 @@ function createVmCardController(initialVm) {
       freeBadge.hidden = true;
     }
 
+    const diskSummary = vm.rootDiskGiB > 0
+      ? `/ ${vm.rootDiskGiB} + /data ${vm.persistentDiskGiB}`
+      : `${vm.persistentDiskGiB}`;
     const specTxt = t('specFmt', {
       vcpu: vm.vcpus,
       ram: `${(vm.memMiB / 1024).toFixed(vm.memMiB % 1024 === 0 ? 0 : 1)} GiB`,
-      disk: vm.persistentDiskGiB
+      disk: diskSummary
     });
     const policyTxt = vm.autoSuspendAfterSeconds
       ? `${t('idlePolicy')}: ${Math.round(vm.autoSuspendAfterSeconds / 60)}m`
@@ -1081,25 +1112,41 @@ function createVmCardController(initialVm) {
 
     setTextIfChanged(cpuLbl, t('cpuLabel'));
     setTextIfChanged(ramLbl, t('ramLabel'));
-    setTextIfChanged(diskLbl, t('diskLabel'));
+    setTextIfChanged(rootLbl, t('diskRootLabel'));
+    setTextIfChanged(dataLbl, t('diskDataLabel'));
 
     const samples = vm.recentMetrics || [];
     const latest = vm.latestMetric || null;
-    const diskPct = getVmDiskPct(vm);
-    const sig = metricsSignature(vm, diskPct);
+    const rootStat = getVmMountStats(vm, '/');
+    const dataStat = getVmMountStats(vm, '/data');
+    const sig = metricsSignature(vm, rootStat.pct, dataStat.pct);
 
     setTextIfChanged(cpuVal, latest ? `${latest.cpuPct.toFixed(1)}%` : '--');
-    setTextIfChanged(ramVal, latest && latest.memTotal > 0 ? `${((latest.memUsed / latest.memTotal) * 100).toFixed(0)}%` : '--');
-    setTextIfChanged(diskVal, diskPct > 0 ? `${diskPct.toFixed(0)}%` : '--');
+    setTextIfChanged(ramVal, latest && latest.memTotal > 0 ? `${((latest.memUsed / latest.memTotal) * 100).toFixed(1)}%` : '--');
+    setTextIfChanged(rootVal, rootStat.pct > 0 ? `${rootStat.pct.toFixed(1)}%` : '--');
+    setTextIfChanged(dataVal, dataStat.pct > 0 ? `${dataStat.pct.toFixed(1)}%` : '--');
+    rootBox.title = rootStat.sizeBytes > 0 ? `${t('diskRootLabel')}: ${fmtBytes(rootStat.usedBytes)} / ${fmtBytes(rootStat.sizeBytes)}` : t('diskRootLabel');
+    dataBox.title = dataStat.sizeBytes > 0 ? `${t('diskDataLabel')}: ${fmtBytes(dataStat.usedBytes)} / ${fmtBytes(dataStat.sizeBytes)}` : t('diskDataLabel');
 
     if (sig !== lastChartSig) {
       lastChartSig = sig;
       const cpuVals = samples.map((s) => s.cpuPct || 0);
       const ramVals = samples.map((s) => (s.memTotal > 0 ? (s.memUsed / s.memTotal) * 100 : 0));
-      const diskVals = samples.map((s) => (s.diskTotal > 0 && s.diskUsed > 0 ? (s.diskUsed / s.diskTotal) * 100 : diskPct));
+
+      const rootSeries = samples
+        .filter((s) => s.rootTotal > 0 && s.rootUsed > 0)
+        .map((s) => (s.rootUsed / s.rootTotal) * 100);
+      const rootVals = rootSeries.length ? rootSeries : (rootStat.pct > 0 ? [rootStat.pct] : []);
+
+      const dataSeries = samples
+        .filter((s) => s.diskTotal > 0 && s.diskUsed > 0)
+        .map((s) => (s.diskUsed / s.diskTotal) * 100);
+      const dataVals = dataSeries.length ? dataSeries : (dataStat.pct > 0 ? [dataStat.pct] : []);
+
       cpuSvgHost.replaceChildren(buildMiniAreaChart(cpuVals, '#2563eb', 100));
       ramSvgHost.replaceChildren(buildMiniAreaChart(ramVals, '#10b981', 100));
-      diskSvgHost.replaceChildren(buildMiniAreaChart(diskVals, '#f59e0b', 100));
+      rootSvgHost.replaceChildren(buildMiniAreaChart(rootVals, '#ec4899', 100));
+      dataSvgHost.replaceChildren(buildMiniAreaChart(dataVals, '#f59e0b', 100));
     }
 
     const cooldownActive = vm.cooldownUntil && Date.parse(vm.cooldownUntil) > upstreamNowMs();
@@ -1810,23 +1857,39 @@ function renderTelemetryDialogContent(vm) {
     locale: state.lang
   });
 
+  const rootStat = getVmMountStats(vm, '/');
+  const dataStat = getVmMountStats(vm, '/data');
   renderDetailChart(shell.diskBox, {
-    title: `${t('diskLabel')} (/data & /)`,
+    title: `${t('diskLabel')} (/ & /data)`,
     unit: '%',
     samples: state.telemetrySamples,
     fixedMax: 100,
+    statPills: [
+      [
+        t('diskRootLabel'),
+        rootStat.pct > 0
+          ? `${rootStat.pct.toFixed(1)}%${rootStat.sizeBytes > 0 ? ` (${fmtBytes(rootStat.usedBytes)} / ${fmtBytes(rootStat.sizeBytes)})` : ''}`
+          : '--'
+      ],
+      [
+        t('diskDataLabel'),
+        dataStat.pct > 0
+          ? `${dataStat.pct.toFixed(1)}%${dataStat.sizeBytes > 0 ? ` (${fmtBytes(dataStat.usedBytes)} / ${fmtBytes(dataStat.sizeBytes)})` : ''}`
+          : '--'
+      ]
+    ],
     series: [
       {
-        label: '/data',
-        shortLabel: '/data',
-        color: '#f59e0b',
-        getValue: (s) => (s.diskTotal > 0 && s.diskUsed > 0 ? (s.diskUsed / s.diskTotal) * 100 : null)
-      },
-      {
-        label: '/',
+        label: t('diskRootLabel'),
         shortLabel: '/',
         color: '#ec4899',
         getValue: (s) => (s.rootTotal > 0 && s.rootUsed > 0 ? (s.rootUsed / s.rootTotal) * 100 : null)
+      },
+      {
+        label: t('diskDataLabel'),
+        shortLabel: '/data',
+        color: '#f59e0b',
+        getValue: (s) => (s.diskTotal > 0 && s.diskUsed > 0 ? (s.diskUsed / s.diskTotal) * 100 : null)
       }
     ],
     labels: chartLabels,

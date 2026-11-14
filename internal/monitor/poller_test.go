@@ -238,3 +238,65 @@ func TestStoppedVMCapturesFinalMetricsOnceThenSkipsRedundantPolling(t *testing.T
 		t.Fatalf("expected stopped VM to skip redundant metrics polls, got %d calls", metricsCalls.Load())
 	}
 }
+
+func TestBackfillMetricsSinceNeverExceeds24Hours(t *testing.T) {
+	dir := t.TempDir()
+	key, _ := crypto.LoadOrCreateMasterKey(dir, "")
+	st, _ := store.Open(filepath.Join(dir, "mon.db"), key)
+	t.Cleanup(func() { _ = st.Close() })
+
+	var capturedSince string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
+		switch r.URL.Path {
+		case "/v1/me":
+			_, _ = w.Write([]byte(`{"userId":1,"login":"u","org":{"id":"org_1","name":"P","tier":"free","kind":"personal"}}`))
+		case "/v1/usage":
+			_, _ = w.Write([]byte(`{"machines":1}`))
+		case "/v1/machines":
+			_, _ = w.Write([]byte(`{"machines":[{"id":"m_1","name":"vm1","state":"running","desiredState":"running","spec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20,"rootDiskGiB":16},"storage":{"sizeGiB":20,"mountPath":"/data","persistent":true,"synced":true},"runtime":{"ready":true},"updatedAt":"2026-11-13T12:00:00Z"}],"nextCursor":null}`))
+		case "/v1/machines/m_1/usage":
+			_, _ = w.Write([]byte(`{"runningSeconds":100}`))
+		case "/v1/machines/m_1/metrics":
+			capturedSince = r.URL.Query().Get("since")
+			parsed, err := time.Parse(time.RFC3339, capturedSince)
+			if err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			// Enforce strict upstream < 24h check
+			if time.Since(parsed) >= 24*time.Hour {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":{"code":"bad_request","message":"since must be within the last 24 hours"}}`))
+				return
+			}
+			ts := time.Now().UTC().Add(-20 * time.Second).Format(time.RFC3339)
+			_, _ = w.Write([]byte(`{"metrics":[{"timestamp":"` + ts + `","cpuCount":4,"cpuUsedPct":12.5,"memUsed":720000000,"memTotal":8589934592,"diskTotal":21474836480}]}`))
+		case "/v1/machines/m_1/disk":
+			_, _ = w.Write([]byte(`{"measuredAt":"2026-11-13T12:00:00Z","filesystems":[{"mount":"/data","sizeBytes":20957446144,"usedBytes":3373514752,"availableBytes":17567154176,"usedPct":16.2},{"mount":"/","sizeBytes":16729894912,"usedBytes":5021024256,"availableBytes":10833100800,"usedPct":31.7}]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	hc := srv.Client()
+	hc.Transport = &rt{u: u, t: srv.Client().Transport}
+	client, _ := instabox.NewClient("https://api.instabox.sh", hc)
+
+	acc, _ := st.CreateAccount(context.Background(), store.AccountInput{Alias: "A", APIKey: "ibk_abc123456789"})
+	p := monitor.NewPoller(st, client, 30*time.Second, 7)
+
+	if err := p.SyncAccount(context.Background(), acc.ID); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	if capturedSince == "" {
+		t.Fatalf("expected since query param to be captured")
+	}
+	samples, err := st.GetMachineMetrics(context.Background(), acc.ID, "m_1", 0)
+	if err != nil || len(samples) != 1 || samples[0].CPUPct != 12.5 || samples[0].RootTotal == 0 {
+		t.Fatalf("expected 1 metric sample with CPU & Root disk persisted, got err=%v samples=%+v", err, samples)
+	}
+}

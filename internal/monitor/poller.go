@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -199,14 +200,20 @@ func (p *Poller) syncMachineTelemetry(ctx context.Context, accountID, apiKey str
 		}
 	}
 
-	// Determine metric query window: backfill 24h if empty/old, else incremental since last sample - 90s.
-	since := now.Add(-24 * time.Hour)
+	// Determine metric query window: backfill ~23h45m if empty/old (strict <24h upstream limit),
+	// else incremental since last sample - 90s.
+	upstreamNow := now.Add(time.Duration(p.clockOffsetMs.Load()) * time.Millisecond)
+	minSince := upstreamNow.Add(-23*time.Hour - 45*time.Minute)
+	since := minSince
 	existingMetrics, err := p.store.GetMachineMetrics(ctx, accountID, m.ID, now.Add(-48*time.Hour).Unix())
 	hasAnyMetrics := err == nil && len(existingMetrics) > 0
 	if hasAnyMetrics {
 		lastTS := existingMetrics[len(existingMetrics)-1].TS
 		if now.Unix()-lastTS < 23*3600 {
-			since = time.Unix(lastTS-90, 0).UTC()
+			cand := time.Unix(lastTS-90, 0).UTC()
+			if cand.After(minSince) {
+				since = cand
+			}
 		}
 	}
 
@@ -223,7 +230,18 @@ func (p *Poller) syncMachineTelemetry(ctx context.Context, accountID, apiKey str
 	var samples []store.MetricSample
 
 	if shouldPollMetrics {
-		if mm, err := p.client.GetMachineMetrics(ctx, apiKey, m.ID, since); err == nil && mm != nil {
+		mm, mErr := p.client.GetMachineMetrics(ctx, apiKey, m.ID, since)
+		if mErr != nil {
+			// Retry once with upstream default window (last 5m) if `since` was rejected due to clock drift.
+			var apiErr *instabox.APIError
+			if errors.As(mErr, &apiErr) && apiErr.Status == 400 {
+				mm, mErr = p.client.GetMachineMetrics(ctx, apiKey, m.ID, time.Time{})
+			}
+		}
+		if mErr != nil && ctx.Err() == nil {
+			log.Printf("metrics %s/%s: %v", accountID, m.ID, mErr)
+		}
+		if mErr == nil && mm != nil {
 			diskPtr = mm.Disk
 			if diskPtr == nil && m.State == "running" {
 				if d, dErr := p.client.GetMachineDisk(ctx, apiKey, m.ID); dErr == nil && d != nil {

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'instabox-monitor-shell-v2';
+const CACHE_NAME = 'instabox-monitor-shell-v3';
 const SHELL_ASSETS = [
   '/css/app.css',
   '/js/app.js',

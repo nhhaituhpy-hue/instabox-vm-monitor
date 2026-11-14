@@ -100,6 +100,7 @@ export function renderDetailChart(container, config) {
     fixedMax = null,
     valueFormatter = (v) => `${v.toFixed(1)}%`,
     axisFormatter = null,
+    statPills = null,
     labels = { now: 'Now', avg: 'Avg', peak: 'Peak', empty: 'No data' },
     locale = 'en'
   } = config;
@@ -118,19 +119,23 @@ export function renderDetailChart(container, config) {
   const statsRow = document.createElement('div');
   statsRow.className = 'telemetry-stats';
 
-  const primary = series[0];
-  const primaryVals = samples
-    .map((s) => primary.getValue(s))
-    .filter((v) => v !== null && v !== undefined && Number.isFinite(v));
-  const latestVal = primaryVals.length ? primaryVals[primaryVals.length - 1] : 0;
-  const avgVal = primaryVals.length ? primaryVals.reduce((a, b) => a + b, 0) / primaryVals.length : 0;
-  const peakVal = primaryVals.length ? Math.max(...primaryVals) : 0;
+  let pillsData = statPills;
+  if (!pillsData) {
+    const primary = series[0];
+    const primaryVals = samples
+      .map((s) => primary.getValue(s))
+      .filter((v) => v !== null && v !== undefined && Number.isFinite(v));
+    const latestVal = primaryVals.length ? primaryVals[primaryVals.length - 1] : 0;
+    const avgVal = primaryVals.length ? primaryVals.reduce((a, b) => a + b, 0) / primaryVals.length : 0;
+    const peakVal = primaryVals.length ? Math.max(...primaryVals) : 0;
+    pillsData = [
+      [labels.now, valueFormatter(latestVal)],
+      [labels.avg, valueFormatter(avgVal)],
+      [labels.peak, valueFormatter(peakVal)]
+    ];
+  }
 
-  for (const [lbl, val] of [
-    [labels.now, valueFormatter(latestVal)],
-    [labels.avg, valueFormatter(avgVal)],
-    [labels.peak, valueFormatter(peakVal)]
-  ]) {
+  for (const [lbl, val] of pillsData) {
     const pill = document.createElement('span');
     pill.className = 'telemetry-stat-pill';
     const k = document.createElement('span');

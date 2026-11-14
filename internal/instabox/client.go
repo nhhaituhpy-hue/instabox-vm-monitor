@@ -299,6 +299,12 @@ func (c *Client) GetMachine(ctx context.Context, apiKey, machineID string) (*Mac
 func (c *Client) GetMachineMetrics(ctx context.Context, apiKey, machineID string, since time.Time) (*MachineMetrics, error) {
 	path := "/v1/machines/" + url.PathEscape(machineID) + "/metrics"
 	if !since.IsZero() {
+		// instabox.sh strictly rejects `since` older than 24h (and RFC3339 truncates subseconds).
+		// Clamp conservatively to 23h45m ago so clock skew / rounding never triggers 400 bad_request.
+		floor := time.Now().UTC().Add(-23*time.Hour - 45*time.Minute)
+		if since.UTC().Before(floor) {
+			since = floor
+		}
 		path += "?since=" + url.QueryEscape(since.UTC().Format(time.RFC3339))
 	}
 	var out MachineMetrics

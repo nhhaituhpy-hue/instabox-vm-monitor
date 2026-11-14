@@ -1368,11 +1368,17 @@ select:focus-visible,
   white-space: nowrap;
 }
 
-/* Mini Beszel Charts inside VM cards */
+/* Mini Beszel Charts inside VM cards (2x2 on cards, 4-across on wide list) */
 .mini-charts-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.48rem;
+}
+
+@container vmcard (inline-size > 760px) {
+  .vm-container-cards .mini-charts-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
 }
 
 .mini-chart-box {
@@ -1396,14 +1402,18 @@ select:focus-visible,
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 0.2rem;
-  font-size: 0.72rem;
+  gap: 0.25rem;
+  font-size: 0.71rem;
+  min-inline-size: 0;
 }
 
 .mini-chart-lbl {
   color: var(--muted);
   font-weight: 600;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-inline-size: 0;
 }
 
 .mini-chart-val {
@@ -1792,7 +1802,7 @@ dialog.app-dialog::backdrop {
   .auth-card {
     padding: 1.35rem;
   }
-  .mini-charts-grid {
-    grid-template-columns: 1fr;
+  .mini-chart-top {
+    font-size: 0.67rem;
   }
 }
