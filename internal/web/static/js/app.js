@@ -271,30 +271,42 @@ function getVmToneAndLabel(vm) {
   if (vm.cooldownUntil) {
     const cd = Date.parse(vm.cooldownUntil);
     if (Number.isFinite(cd) && cd > now) {
-      return { tone: 'error', label: t('statusCooldown') };
+      return { tone: 'error', label: t('statusCooldown'), title: '' };
     }
   }
   switch (vm.state) {
-    case 'running':
-      return vm.ready
-        ? { tone: 'running', label: t('statusRunning') }
-        : { tone: 'booting', label: t('statusBooting') };
+    case 'running': {
+      // instabox.sh may leave runtime.ready=false on snapshot-resumed or headless VMs
+      // even after wake/start completes and exec/SSH work. Show booting only while an
+      // operation is still active or within a short 30s cold-boot grace window.
+      if (!vm.ready) {
+        if (vm.operationId) {
+          return { tone: 'booting', label: t('statusBooting'), title: '' };
+        }
+        const started = vm.runStartedAt ? Date.parse(vm.runStartedAt) : NaN;
+        if (!vm.processesPreserved && Number.isFinite(started) && now - started < 30000) {
+          return { tone: 'booting', label: t('statusBooting'), title: '' };
+        }
+        return { tone: 'running', label: t('statusRunning'), title: t('statusUnreadyNote') };
+      }
+      return { tone: 'running', label: t('statusRunning'), title: '' };
+    }
     case 'starting':
     case 'resuming':
     case 'creating':
-      return { tone: 'booting', label: t('statusBooting') };
+      return { tone: 'booting', label: t('statusBooting'), title: '' };
     case 'suspended':
       return vm.autoSuspendedAt
-        ? { tone: 'idle', label: t('statusIdleSuspended') }
-        : { tone: 'suspended', label: t('statusSuspended') };
+        ? { tone: 'idle', label: t('statusIdleSuspended'), title: '' }
+        : { tone: 'suspended', label: t('statusSuspended'), title: '' };
     case 'stopping':
     case 'suspending':
     case 'deleting':
-      return { tone: 'stopping', label: t('statusStopping') };
+      return { tone: 'stopping', label: t('statusStopping'), title: '' };
     case 'error':
-      return { tone: 'error', label: t('statusError') };
+      return { tone: 'error', label: t('statusError'), title: '' };
     default:
-      return { tone: 'stopped', label: t('statusStopped') };
+      return { tone: 'stopped', label: t('statusStopped'), title: '' };
   }
 }
 
@@ -1199,10 +1211,12 @@ function createVmCardController(initialVm) {
 
   const update = (nextVm) => {
     vm = nextVm;
-    const { tone, label } = getVmToneAndLabel(vm);
+    const { tone, label, title } = getVmToneAndLabel(vm);
 
     if (statusPoint.dataset.tone !== tone) statusPoint.dataset.tone = tone;
     if (statusBadge.dataset.tone !== tone) statusBadge.dataset.tone = tone;
+    statusBadge.title = title || '';
+    statusPoint.title = title || '';
     setTextIfChanged(statusBadge, label);
 
     setTextIfChanged(nameBtn, vm.name);
