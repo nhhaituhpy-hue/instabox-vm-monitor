@@ -99,6 +99,12 @@ type MachineRecord struct {
 	RawJSON                 json.RawMessage `json:"-"`
 	LatestMetric            *MetricSample   `json:"latestMetric,omitempty"`
 	RecentMetrics           []MetricSample  `json:"recentMetrics,omitempty"`
+	KeepaliveEnabled        bool            `json:"keepaliveEnabled"`
+	KeepaliveLeaseExpiresAt int64           `json:"keepaliveLeaseExpiresAt,omitempty"`
+	KeepaliveLastAt         int64           `json:"keepaliveLastAt,omitempty"`
+	KeepaliveLastAction     string          `json:"keepaliveLastAction,omitempty"`
+	KeepaliveLastError      string          `json:"keepaliveLastError,omitempty"`
+	KeepalivePendingRestart bool            `json:"keepalivePendingRestart,omitempty"`
 	UpdatedAt               int64           `json:"updatedAt"`
 }
 
@@ -209,6 +215,12 @@ func (s *Store) migrate(ctx context.Context) error {
 		last_error_msg TEXT NOT NULL DEFAULT '',
 		disk_json TEXT NOT NULL DEFAULT '',
 		raw_json TEXT NOT NULL DEFAULT '',
+		keepalive_enabled INTEGER NOT NULL DEFAULT 0,
+		keepalive_lease_expires_at INTEGER NOT NULL DEFAULT 0,
+		keepalive_last_at INTEGER NOT NULL DEFAULT 0,
+		keepalive_last_action TEXT NOT NULL DEFAULT '',
+		keepalive_last_error TEXT NOT NULL DEFAULT '',
+		keepalive_pending_restart INTEGER NOT NULL DEFAULT 0,
 		updated_at INTEGER NOT NULL DEFAULT 0,
 		PRIMARY KEY (account_id, machine_id)
 	);
@@ -234,8 +246,55 @@ func (s *Store) migrate(ctx context.Context) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_machine_metrics_ts ON machine_metrics(account_id, machine_id, ts);
 	`
-	_, err := s.db.ExecContext(ctx, schema)
-	return err
+	if _, err := s.db.ExecContext(ctx, schema); err != nil {
+		return err
+	}
+	return s.ensureMachineColumns(ctx)
+}
+
+func (s *Store) ensureMachineColumns(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(machines)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	existing := make(map[string]bool)
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull int
+		var dflt sql.NullString
+		var pk int
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dflt, &pk); err != nil {
+			return err
+		}
+		existing[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	migrations := []struct {
+		name string
+		ddl  string
+	}{
+		{"keepalive_enabled", `ALTER TABLE machines ADD COLUMN keepalive_enabled INTEGER NOT NULL DEFAULT 0`},
+		{"keepalive_lease_expires_at", `ALTER TABLE machines ADD COLUMN keepalive_lease_expires_at INTEGER NOT NULL DEFAULT 0`},
+		{"keepalive_last_at", `ALTER TABLE machines ADD COLUMN keepalive_last_at INTEGER NOT NULL DEFAULT 0`},
+		{"keepalive_last_action", `ALTER TABLE machines ADD COLUMN keepalive_last_action TEXT NOT NULL DEFAULT ''`},
+		{"keepalive_last_error", `ALTER TABLE machines ADD COLUMN keepalive_last_error TEXT NOT NULL DEFAULT ''`},
+		{"keepalive_pending_restart", `ALTER TABLE machines ADD COLUMN keepalive_pending_restart INTEGER NOT NULL DEFAULT 0`},
+	}
+	for _, m := range migrations {
+		if existing[m.name] {
+			continue
+		}
+		if _, err := s.db.ExecContext(ctx, m.ddl); err != nil {
+			return fmt.Errorf("migrate machines.%s: %w", m.name, err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) HasAdmin(ctx context.Context) (bool, error) {
@@ -636,6 +695,67 @@ func (s *Store) UpdateMachineDiskAndUsage(ctx context.Context, accountID, machin
 	return err
 }
 
+func (s *Store) SetMachineKeepalive(ctx context.Context, accountID, machineID string, enabled bool) error {
+	enabledInt := boolInt(enabled)
+	var res sql.Result
+	var err error
+	if enabled {
+		res, err = s.db.ExecContext(ctx, `
+			UPDATE machines
+			SET keepalive_enabled = ?, keepalive_last_error = ''
+			WHERE account_id = ? AND machine_id = ?
+		`, enabledInt, accountID, machineID)
+	} else {
+		res, err = s.db.ExecContext(ctx, `
+			UPDATE machines
+			SET keepalive_enabled = 0,
+			    keepalive_lease_expires_at = 0,
+			    keepalive_last_at = 0,
+			    keepalive_last_action = '',
+			    keepalive_last_error = '',
+			    keepalive_pending_restart = 0
+			WHERE account_id = ? AND machine_id = ?
+		`, accountID, machineID)
+	}
+	if err != nil {
+		return err
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return ErrMachineNotFound
+	}
+	return nil
+}
+
+func (s *Store) UpdateMachineKeepaliveState(ctx context.Context, accountID, machineID string, leaseExpiresAt, lastAt int64, lastAction, lastErr string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE machines
+		SET keepalive_lease_expires_at = CASE WHEN ? >= 0 THEN ? ELSE keepalive_lease_expires_at END,
+		    keepalive_last_at = ?,
+		    keepalive_last_action = ?,
+		    keepalive_last_error = ?
+		WHERE account_id = ? AND machine_id = ? AND keepalive_enabled = 1
+	`, leaseExpiresAt, leaseExpiresAt, lastAt, lastAction, lastErr, accountID, machineID)
+	return err
+}
+
+func (s *Store) SetMachineKeepalivePendingRestart(ctx context.Context, accountID, machineID string, pending bool) error {
+	if pending {
+		_, err := s.db.ExecContext(ctx, `
+			UPDATE machines
+			SET keepalive_pending_restart = 1
+			WHERE account_id = ? AND machine_id = ? AND keepalive_enabled = 1
+		`, accountID, machineID)
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE machines
+		SET keepalive_pending_restart = 0
+		WHERE account_id = ? AND machine_id = ?
+	`, accountID, machineID)
+	return err
+}
+
 func (s *Store) GetMachine(ctx context.Context, accountID, machineID string) (*MachineRecord, error) {
 	list, err := s.queryMachines(ctx, `WHERE m.account_id = ? AND m.machine_id = ?`, accountID, machineID)
 	if err != nil {
@@ -657,7 +777,9 @@ func (s *Store) queryMachines(ctx context.Context, clause string, args ...any) (
 		       m.vcpus, m.mem_mib, m.persistent_disk_gib, m.root_disk_gib, m.template_id,
 		       m.free, m.ready, m.processes_preserved, m.auto_suspend_after_seconds, m.max_run_minutes,
 		       m.run_started_at, m.auto_suspended_at, m.cooldown_until, m.cooldown_reason, m.operation_id,
-		       m.monthly_running_seconds, m.last_error_code, m.last_error_msg, m.disk_json, m.updated_at
+		       m.monthly_running_seconds, m.last_error_code, m.last_error_msg, m.disk_json,
+		       m.keepalive_enabled, m.keepalive_lease_expires_at, m.keepalive_last_at, m.keepalive_last_action, m.keepalive_last_error, m.keepalive_pending_restart,
+		       m.updated_at
 		FROM machines m
 		JOIN accounts a ON a.id = m.account_id
 	`+" "+clause, args...)
@@ -669,7 +791,7 @@ func (s *Store) queryMachines(ctx context.Context, clause string, args ...any) (
 	out := make([]MachineRecord, 0)
 	for rows.Next() {
 		var r MachineRecord
-		var freeInt, readyInt, procInt int
+		var freeInt, readyInt, procInt, keepaliveInt, pendingRestartInt int
 		var autoSusp sql.NullInt64
 		var diskStr string
 		if err := rows.Scan(
@@ -677,13 +799,17 @@ func (s *Store) queryMachines(ctx context.Context, clause string, args ...any) (
 			&r.VCPUs, &r.MemMiB, &r.PersistentDiskGiB, &r.RootDiskGiB, &r.TemplateID,
 			&freeInt, &readyInt, &procInt, &autoSusp, &r.MaxRunMinutes,
 			&r.RunStartedAt, &r.AutoSuspendedAt, &r.CooldownUntil, &r.CooldownReason, &r.OperationID,
-			&r.MonthlyRunningSeconds, &r.LastErrorCode, &r.LastErrorMsg, &diskStr, &r.UpdatedAt,
+			&r.MonthlyRunningSeconds, &r.LastErrorCode, &r.LastErrorMsg, &diskStr,
+			&keepaliveInt, &r.KeepaliveLeaseExpiresAt, &r.KeepaliveLastAt, &r.KeepaliveLastAction, &r.KeepaliveLastError, &pendingRestartInt,
+			&r.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
 		r.Free = freeInt != 0
 		r.Ready = readyInt != 0
 		r.ProcessesPreserved = procInt != 0
+		r.KeepaliveEnabled = keepaliveInt != 0
+		r.KeepalivePendingRestart = pendingRestartInt != 0
 		if autoSusp.Valid {
 			v := int(autoSusp.Int64)
 			r.AutoSuspendAfterSeconds = &v

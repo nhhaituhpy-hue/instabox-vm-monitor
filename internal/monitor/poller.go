@@ -15,6 +15,23 @@ import (
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/store"
 )
 
+const (
+	keepaliveLeaseID          = "ibmon-keepalive"
+	keepaliveLeaseTTLSeconds  = 3600
+	keepaliveRenewLeadSeconds = 2400 // renew when <=40m left on 60m TTL (~every 20m)
+	keepaliveRestartCapMaxSec = 25200
+)
+
+type keepaliveCtrl struct {
+	toggleMu  sync.Mutex
+	mu        sync.Mutex
+	gen       uint64
+	inFlight  bool
+	cancelled bool
+	cancel    context.CancelFunc
+	done      chan struct{}
+}
+
 type Poller struct {
 	store         *store.Store
 	client        *instabox.Client
@@ -25,18 +42,38 @@ type Poller struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	accountLocks       sync.Map // key: accountID -> *sync.Mutex
-	clockOffsetMs      atomic.Int64
-	lastPruneUnix      atomic.Int64
-	lastUsageCheck     sync.Map // key: accountID+":"+machineID -> int64 unix
-	inactiveMetricDone sync.Map // key: accountID+":"+machineID -> bool
+	accountLocks           sync.Map // key: accountID -> chan struct{} (cap 1)
+	clockOffsetMs          atomic.Int64
+	lastPruneUnix          atomic.Int64
+	lastUsageCheck         sync.Map // key: accountID+":"+machineID -> int64 unix
+	inactiveMetricDone     sync.Map // key: accountID+":"+machineID -> bool
+	keepaliveCtrls         sync.Map // key: accountID+":"+machineID -> *keepaliveCtrl
+	keepaliveLeaseRunStart sync.Map // key: accountID+":"+machineID -> string
+	keepaliveDelayOverride atomic.Int64
+}
+
+func (p *Poller) accountLockChan(accountID string) chan struct{} {
+	chIface, _ := p.accountLocks.LoadOrStore(accountID, make(chan struct{}, 1))
+	return chIface.(chan struct{})
 }
 
 func (p *Poller) lockAccount(accountID string) func() {
-	muIface, _ := p.accountLocks.LoadOrStore(accountID, &sync.Mutex{})
-	mu := muIface.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	ch := p.accountLockChan(accountID)
+	ch <- struct{}{}
+	return func() { <-ch }
+}
+
+func (p *Poller) lockAccountContext(ctx context.Context, accountID string) (func(), bool) {
+	if ctx.Err() != nil {
+		return nil, false
+	}
+	ch := p.accountLockChan(accountID)
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, true
+	case <-ctx.Done():
+		return nil, false
+	}
 }
 
 func NewPoller(st *store.Store, client *instabox.Client, interval time.Duration, retentionDays int) *Poller {
@@ -180,6 +217,13 @@ func (p *Poller) SyncAccount(ctx context.Context, accountID string) error {
 			prevState = prev.State
 		}
 		p.syncMachineTelemetry(ctx, accountID, apiKey, m, prevState)
+		if hadPrev && prev.KeepaliveEnabled {
+			if p.needsKeepaliveAction(m, prev) {
+				p.triggerKeepalive(accountID, m.ID, false)
+			} else {
+				p.reconcileSkippedKeepalive(ctx, accountID, m, prev)
+			}
+		}
 	}
 	return nil
 }
@@ -334,9 +378,20 @@ func (p *Poller) ExecuteAction(ctx context.Context, accountID, machineID string,
 		effective = instabox.ActionResume
 	}
 
+	if requested == instabox.ActionStop {
+		key := accountID + ":" + machineID
+		p.cancelKeepaliveCycle(ctx, key, 2*time.Second)
+		_ = p.store.SetMachineKeepalivePendingRestart(ctx, accountID, machineID, false)
+		p.deleteKeepaliveLeaseRunStart(key)
+	}
+
 	res, err := p.client.PerformAction(ctx, apiKey, machineID, effective)
 	if err != nil {
 		return nil, err
+	}
+
+	if requested == instabox.ActionStop && m.KeepaliveEnabled {
+		_ = p.store.UpdateMachineKeepaliveState(ctx, accountID, machineID, 0, time.Now().Unix(), "manual_paused", "")
 	}
 
 	if res.Machine != nil {
@@ -353,8 +408,14 @@ func (p *Poller) ExecuteAction(ctx context.Context, accountID, machineID string,
 }
 
 func (p *Poller) syncSingleMachine(ctx context.Context, accountID string, m instabox.Machine) error {
-	unlock := p.lockAccount(accountID)
+	unlock, ok := p.lockAccountContext(ctx, accountID)
+	if !ok {
+		return ctx.Err()
+	}
 	defer unlock()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 
 	existing, err := p.store.ListMachines(ctx)
 	if err != nil {
@@ -619,4 +680,705 @@ func toMachineRecord(accountID string, m instabox.Machine) store.MachineRecord {
 		rec.LastErrorMsg = m.LastError.Message
 	}
 	return rec
+}
+
+func (p *Poller) SetKeepalivePollDelay(d time.Duration) {
+	if d <= 0 {
+		p.keepaliveDelayOverride.Store(0)
+		return
+	}
+	p.keepaliveDelayOverride.Store(d.Nanoseconds())
+}
+
+func (p *Poller) keepalivePollDelay(defaultDelay time.Duration) time.Duration {
+	if ov := p.keepaliveDelayOverride.Load(); ov > 0 {
+		return time.Duration(ov)
+	}
+	return defaultDelay
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func parseInstaboxTime(raw string) (time.Time, bool) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return time.Time{}, false
+	}
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t.UTC(), true
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.UTC(), true
+	}
+	return time.Time{}, false
+}
+
+func keepaliveRestartThresholdSec(m instabox.Machine) int64 {
+	if m.MaxRunMinutes <= 5 {
+		return 0
+	}
+	// Free runs start at 120m and extend at T-5m while active; checking at T-3m
+	// avoids interrupting an active extension while preventing cooldown lockouts,
+	// and caps at 25200s (7h) ahead of the 8h (480m) limit as in render_watch.py.
+	threshold := int64(m.MaxRunMinutes)*60 - 180
+	if threshold > keepaliveRestartCapMaxSec {
+		threshold = keepaliveRestartCapMaxSec
+	}
+	return threshold
+}
+
+func isTransitionalState(state string) bool {
+	switch state {
+	case "starting", "resuming", "stopping", "pausing", "suspending", "creating":
+		return true
+	default:
+		return false
+	}
+}
+
+func (p *Poller) upstreamNow() time.Time {
+	return time.Now().UTC().Add(time.Duration(p.clockOffsetMs.Load()) * time.Millisecond)
+}
+
+func isCooldownActive(m instabox.Machine, upNow time.Time) bool {
+	cd, ok := parseInstaboxTime(m.CooldownUntil)
+	return ok && cd.After(upNow)
+}
+
+func (p *Poller) needsKeepaliveAction(m instabox.Machine, rec store.MachineRecord) bool {
+	if !rec.KeepaliveEnabled || isTransitionalState(m.State) {
+		return false
+	}
+	upNow := p.upstreamNow()
+	upUnix := upNow.Unix()
+	if m.State == "running" {
+		threshold := keepaliveRestartThresholdSec(m)
+		if threshold > 0 {
+			if rs, ok := parseInstaboxTime(m.RunStartedAt); ok && int64(upNow.Sub(rs).Seconds()) >= threshold {
+				return true
+			}
+		}
+		key := rec.AccountID + ":" + m.ID
+		prevRS, hasRS := p.keepaliveLeaseRunStart.Load(key)
+		if m.RunStartedAt != "" && (!hasRS || prevRS.(string) != m.RunStartedAt) {
+			return true
+		}
+		return rec.KeepaliveLeaseExpiresAt <= upUnix+keepaliveRenewLeadSeconds
+	}
+	if m.State == "suspended" && m.AutoSuspendedAt != "" {
+		if isCooldownActive(m, upNow) {
+			return false
+		}
+		return true
+	}
+	if m.State == "stopped" && rec.KeepalivePendingRestart {
+		if isCooldownActive(m, upNow) {
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+func (p *Poller) reconcileSkippedKeepalive(ctx context.Context, accountID string, m instabox.Machine, prev store.MachineRecord) {
+	key := accountID + ":" + m.ID
+	if p.isKeepaliveInFlight(key) || isTransitionalState(m.State) {
+		return
+	}
+	if m.State == "running" {
+		if prev.KeepalivePendingRestart {
+			_ = p.store.SetMachineKeepalivePendingRestart(ctx, accountID, m.ID, false)
+		}
+		return
+	}
+	upNow := p.upstreamNow()
+	var targetAction string
+	targetErr := ""
+	switch {
+	case isCooldownActive(m, upNow) && ((m.State == "suspended" && m.AutoSuspendedAt != "") || (m.State == "stopped" && prev.KeepalivePendingRestart)):
+		targetAction = "cooldown_wait"
+	case (m.State == "stopped" && !prev.KeepalivePendingRestart) || (m.State == "suspended" && m.AutoSuspendedAt == ""):
+		targetAction = "manual_paused"
+	case m.State == "error":
+		if prev.KeepaliveLeaseExpiresAt == 0 {
+			return
+		}
+		targetAction = "error"
+		targetErr = prev.KeepaliveLastError
+		if m.LastError != nil && m.LastError.Message != "" {
+			targetErr = m.LastError.Message
+		}
+	default:
+		return
+	}
+	ctrl := p.getKeepaliveCtrl(key)
+	ctrl.mu.Lock()
+	if ctrl.inFlight {
+		ctrl.mu.Unlock()
+		return
+	}
+	p.keepaliveLeaseRunStart.Delete(key)
+	ctrl.mu.Unlock()
+
+	if prev.KeepaliveLeaseExpiresAt != 0 || prev.KeepaliveLastAction != targetAction || prev.KeepaliveLastError != targetErr {
+		_ = p.store.UpdateMachineKeepaliveState(ctx, accountID, m.ID, 0, time.Now().Unix(), targetAction, targetErr)
+	}
+}
+
+func (p *Poller) getKeepaliveCtrl(key string) *keepaliveCtrl {
+	if v, ok := p.keepaliveCtrls.Load(key); ok {
+		return v.(*keepaliveCtrl)
+	}
+	c := &keepaliveCtrl{}
+	actual, _ := p.keepaliveCtrls.LoadOrStore(key, c)
+	return actual.(*keepaliveCtrl)
+}
+
+func (p *Poller) isKeepaliveInFlight(key string) bool {
+	ctrl := p.getKeepaliveCtrl(key)
+	ctrl.mu.Lock()
+	inFlight := ctrl.inFlight
+	ctrl.mu.Unlock()
+	return inFlight
+}
+
+func (p *Poller) keepaliveValid(ctx context.Context, key string, gen uint64) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	ctrl := p.getKeepaliveCtrl(key)
+	ctrl.mu.Lock()
+	ok := ctrl.gen == gen && !ctrl.cancelled
+	ctrl.mu.Unlock()
+	return ok
+}
+
+func (p *Poller) storeKeepaliveLeaseRunStart(ctx context.Context, key string, gen uint64, runStart string) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	ctrl := p.getKeepaliveCtrl(key)
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if ctrl.gen != gen || ctrl.cancelled {
+		return false
+	}
+	p.keepaliveLeaseRunStart.Store(key, runStart)
+	return true
+}
+
+func (p *Poller) deleteKeepaliveLeaseRunStart(key string) {
+	ctrl := p.getKeepaliveCtrl(key)
+	ctrl.mu.Lock()
+	p.keepaliveLeaseRunStart.Delete(key)
+	ctrl.mu.Unlock()
+}
+
+func (p *Poller) updateKeepaliveState(ctx context.Context, accountID, machineID string, gen uint64, leaseExpiresAt, lastAt int64, lastAction, lastErr string) {
+	key := accountID + ":" + machineID
+	if !p.keepaliveValid(ctx, key, gen) {
+		return
+	}
+	_ = p.store.UpdateMachineKeepaliveState(ctx, accountID, machineID, leaseExpiresAt, lastAt, lastAction, lastErr)
+}
+
+func (p *Poller) cancelKeepaliveCycle(ctx context.Context, key string, waitTimeout time.Duration) {
+	ctrl := p.getKeepaliveCtrl(key)
+	ctrl.mu.Lock()
+	ctrl.gen++
+	var cancel context.CancelFunc
+	var done chan struct{}
+	if ctrl.inFlight {
+		ctrl.cancelled = true
+		cancel = ctrl.cancel
+		done = ctrl.done
+	}
+	ctrl.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		if waitTimeout > 0 {
+			timer := time.NewTimer(waitTimeout)
+			defer timer.Stop()
+			select {
+			case <-done:
+			case <-timer.C:
+			case <-ctx.Done():
+			}
+		} else {
+			select {
+			case <-done:
+			case <-ctx.Done():
+			}
+		}
+	}
+}
+
+func (p *Poller) SetMachineKeepalive(ctx context.Context, accountID, machineID string, enabled bool) (*store.MachineRecord, error) {
+	apiKey, err := p.store.GetAccountAPIKey(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.store.GetMachine(ctx, accountID, machineID); err != nil {
+		return nil, err
+	}
+	key := accountID + ":" + machineID
+	ctrl := p.getKeepaliveCtrl(key)
+	ctrl.toggleMu.Lock()
+	defer ctrl.toggleMu.Unlock()
+
+	if err := p.store.SetMachineKeepalive(ctx, accountID, machineID, enabled); err != nil {
+		return nil, err
+	}
+	if enabled {
+		ctrl.mu.Lock()
+		ctrl.gen++
+		ctrl.cancelled = false
+		ctrl.mu.Unlock()
+		p.triggerKeepalive(accountID, machineID, true)
+	} else {
+		p.cancelKeepaliveCycle(ctx, key, 3*time.Second)
+		p.deleteKeepaliveLeaseRunStart(key)
+		delCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		_ = p.client.DeleteActivityLease(delCtx, apiKey, machineID, keepaliveLeaseID)
+	}
+	return p.store.GetMachine(ctx, accountID, machineID)
+}
+
+func (p *Poller) triggerKeepalive(accountID, machineID string, forceLease bool) {
+	if p.ctx.Err() != nil {
+		return
+	}
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		ctx, cancel := context.WithTimeout(p.ctx, 120*time.Second)
+		defer cancel()
+		if err := p.RunKeepaliveCycle(ctx, accountID, machineID, forceLease); err != nil && p.ctx.Err() == nil && ctx.Err() == nil {
+			log.Printf("keepalive %s/%s: %v", accountID, machineID, err)
+		}
+	}()
+}
+
+func (p *Poller) RunKeepaliveCycle(ctx context.Context, accountID, machineID string, forceLease bool) error {
+	key := accountID + ":" + machineID
+	ctrl := p.getKeepaliveCtrl(key)
+
+	var myGen uint64
+	var cycleCtx context.Context
+	var cancel context.CancelFunc
+	var done chan struct{}
+	for {
+		ctrl.mu.Lock()
+		if ctrl.inFlight {
+			if !forceLease && !ctrl.cancelled {
+				ctrl.mu.Unlock()
+				return nil
+			}
+			oldDone := ctrl.done
+			ctrl.mu.Unlock()
+			select {
+			case <-oldDone:
+				continue
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		myGen = ctrl.gen
+		cycleCtx, cancel = context.WithCancel(ctx)
+		done = make(chan struct{})
+		ctrl.inFlight = true
+		ctrl.cancelled = false
+		ctrl.cancel = cancel
+		ctrl.done = done
+		ctrl.mu.Unlock()
+		break
+	}
+	defer func() {
+		cancel()
+		ctrl.mu.Lock()
+		ctrl.inFlight = false
+		ctrl.cancelled = false
+		ctrl.cancel = nil
+		ctrl.done = nil
+		ctrl.mu.Unlock()
+		close(done)
+	}()
+
+	rec, err := p.store.GetMachine(cycleCtx, accountID, machineID)
+	if err != nil {
+		return err
+	}
+	if !rec.KeepaliveEnabled || !p.keepaliveValid(cycleCtx, key, myGen) {
+		return nil
+	}
+	apiKey, err := p.store.GetAccountAPIKey(cycleCtx, accountID)
+	if err != nil {
+		return err
+	}
+
+	m, err := p.client.GetMachine(cycleCtx, apiKey, machineID)
+	if err != nil {
+		p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, -1, time.Now().Unix(), "error", err.Error())
+		return err
+	}
+	if !p.keepaliveValid(cycleCtx, key, myGen) {
+		return nil
+	}
+	rec, err = p.store.GetMachine(cycleCtx, accountID, machineID)
+	if err != nil || !rec.KeepaliveEnabled || !p.keepaliveValid(cycleCtx, key, myGen) {
+		return nil
+	}
+	if err := p.syncSingleMachine(cycleCtx, accountID, *m); err != nil {
+		if !p.keepaliveValid(cycleCtx, key, myGen) {
+			return nil
+		}
+	}
+	if !p.keepaliveValid(cycleCtx, key, myGen) {
+		return nil
+	}
+
+	if isTransitionalState(m.State) {
+		p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, -1, time.Now().Unix(), "transition", "")
+		return nil
+	}
+
+	nowUnix := time.Now().Unix()
+	upNow := p.upstreamNow()
+	upUnix := upNow.Unix()
+
+	if m.State == "running" {
+		threshold := keepaliveRestartThresholdSec(*m)
+		if threshold > 0 {
+			if rs, ok := parseInstaboxTime(m.RunStartedAt); ok {
+				rt := int64(upNow.Sub(rs).Seconds())
+				if rt >= threshold {
+					return p.powerCycleForKeepalive(cycleCtx, accountID, apiKey, machineID, key, myGen)
+				}
+			}
+		}
+		if rec.KeepalivePendingRestart {
+			_ = p.store.SetMachineKeepalivePendingRestart(cycleCtx, accountID, machineID, false)
+		}
+
+		prevRS, hasRS := p.keepaliveLeaseRunStart.Load(key)
+		runChanged := m.RunStartedAt != "" && (!hasRS || prevRS.(string) != m.RunStartedAt)
+		expiring := rec.KeepaliveLeaseExpiresAt <= upUnix+keepaliveRenewLeadSeconds
+		if !forceLease && !runChanged && !expiring {
+			return nil
+		}
+		if !p.keepaliveValid(cycleCtx, key, myGen) {
+			return nil
+		}
+
+		lease, err := p.client.PutActivityLease(cycleCtx, apiKey, machineID, keepaliveLeaseID, keepaliveLeaseTTLSeconds)
+		if err != nil {
+			p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, -1, time.Now().Unix(), "error", err.Error())
+			return err
+		}
+		if !p.keepaliveValid(cycleCtx, key, myGen) {
+			return nil
+		}
+		expUnix := p.upstreamNow().Unix() + keepaliveLeaseTTLSeconds
+		if lease != nil {
+			if expTime, ok := parseInstaboxTime(lease.ExpiresAt); ok {
+				expUnix = expTime.Unix()
+			}
+		}
+		if !p.storeKeepaliveLeaseRunStart(cycleCtx, key, myGen, m.RunStartedAt) {
+			return nil
+		}
+		p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, expUnix, time.Now().Unix(), "lease_renewed", "")
+		return nil
+	}
+
+	if m.State == "stopped" && rec.KeepalivePendingRestart {
+		if isCooldownActive(*m, upNow) {
+			p.deleteKeepaliveLeaseRunStart(key)
+			p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, 0, nowUnix, "cooldown_wait", "")
+			return nil
+		}
+		return p.startForKeepalive(cycleCtx, accountID, apiKey, machineID, key, myGen, p.keepalivePollDelay(2*time.Second))
+	}
+
+	if m.State == "suspended" && m.AutoSuspendedAt != "" {
+		if isCooldownActive(*m, upNow) {
+			p.deleteKeepaliveLeaseRunStart(key)
+			p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, 0, nowUnix, "cooldown_wait", "")
+			return nil
+		}
+		if !p.keepaliveValid(cycleCtx, key, myGen) {
+			return nil
+		}
+
+		wakeStep := p.keepalivePollDelay(3 * time.Second)
+		if _, err := p.client.PerformAction(cycleCtx, apiKey, machineID, instabox.ActionWake); err != nil {
+			if !p.keepaliveValid(cycleCtx, key, myGen) {
+				return nil
+			}
+			var apiErr *instabox.APIError
+			if errors.As(err, &apiErr) && apiErr.Code == "machine_cooldown" {
+				p.deleteKeepaliveLeaseRunStart(key)
+				p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, 0, nowUnix, "cooldown_wait", "")
+				return nil
+			}
+			p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, 0, nowUnix, "error", err.Error())
+			return err
+		}
+
+		var cur *instabox.Machine
+		for range 8 {
+			if !sleepWithContext(cycleCtx, wakeStep) {
+				if !p.keepaliveValid(cycleCtx, key, myGen) {
+					return nil
+				}
+				return cycleCtx.Err()
+			}
+			if !p.keepaliveValid(cycleCtx, key, myGen) {
+				return nil
+			}
+			got, gErr := p.client.GetMachine(cycleCtx, apiKey, machineID)
+			if gErr == nil && got != nil {
+				cur = got
+				if got.State == "running" ||
+					got.State == "stopped" ||
+					(got.State == "suspended" && got.AutoSuspendedAt == "") ||
+					isCooldownActive(*got, p.upstreamNow()) {
+					break
+				}
+			}
+		}
+		if !p.keepaliveValid(cycleCtx, key, myGen) {
+			return nil
+		}
+
+		if cur != nil {
+			if cur.State == "stopped" || (cur.State == "suspended" && cur.AutoSuspendedAt == "") {
+				_ = p.syncSingleMachine(cycleCtx, accountID, *cur)
+				p.deleteKeepaliveLeaseRunStart(key)
+				p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, 0, time.Now().Unix(), "manual_paused", "")
+				return nil
+			}
+			if isCooldownActive(*cur, p.upstreamNow()) {
+				_ = p.syncSingleMachine(cycleCtx, accountID, *cur)
+				p.deleteKeepaliveLeaseRunStart(key)
+				p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, 0, time.Now().Unix(), "cooldown_wait", "")
+				return nil
+			}
+		}
+
+		usedAction := "wake"
+		if cur == nil || cur.State != "running" {
+			usedAction = "resume"
+			if _, err := p.client.PerformAction(cycleCtx, apiKey, machineID, instabox.ActionResume); err != nil {
+				if !p.keepaliveValid(cycleCtx, key, myGen) {
+					return nil
+				}
+				var apiErr *instabox.APIError
+				if errors.As(err, &apiErr) && apiErr.Code == "machine_cooldown" {
+					p.deleteKeepaliveLeaseRunStart(key)
+					p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, 0, time.Now().Unix(), "cooldown_wait", "")
+					return nil
+				}
+				p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, 0, time.Now().Unix(), "error", err.Error())
+				return err
+			}
+			for range 6 {
+				if !sleepWithContext(cycleCtx, wakeStep) {
+					if !p.keepaliveValid(cycleCtx, key, myGen) {
+						return nil
+					}
+					return cycleCtx.Err()
+				}
+				if !p.keepaliveValid(cycleCtx, key, myGen) {
+					return nil
+				}
+				got, gErr := p.client.GetMachine(cycleCtx, apiKey, machineID)
+				if gErr == nil && got != nil {
+					cur = got
+					if got.State == "running" ||
+						got.State == "stopped" ||
+						(got.State == "suspended" && got.AutoSuspendedAt == "") ||
+						isCooldownActive(*got, p.upstreamNow()) {
+						break
+					}
+				}
+			}
+		}
+		if !p.keepaliveValid(cycleCtx, key, myGen) {
+			return nil
+		}
+
+		if cur != nil {
+			_ = p.syncSingleMachine(cycleCtx, accountID, *cur)
+		}
+		if !p.keepaliveValid(cycleCtx, key, myGen) {
+			return nil
+		}
+		if cur != nil && cur.State == "running" {
+			if rec.KeepalivePendingRestart {
+				_ = p.store.SetMachineKeepalivePendingRestart(cycleCtx, accountID, machineID, false)
+			}
+			var expUnix int64
+			if lease, lErr := p.client.PutActivityLease(cycleCtx, apiKey, machineID, keepaliveLeaseID, keepaliveLeaseTTLSeconds); lErr == nil && lease != nil {
+				if !p.keepaliveValid(cycleCtx, key, myGen) {
+					return nil
+				}
+				expUnix = p.upstreamNow().Unix() + keepaliveLeaseTTLSeconds
+				if expTime, ok := parseInstaboxTime(lease.ExpiresAt); ok {
+					expUnix = expTime.Unix()
+				}
+				if !p.storeKeepaliveLeaseRunStart(cycleCtx, key, myGen, cur.RunStartedAt) {
+					return nil
+				}
+			}
+			p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, expUnix, time.Now().Unix(), usedAction, "")
+		} else if cur != nil && (cur.State == "stopped" || (cur.State == "suspended" && cur.AutoSuspendedAt == "")) {
+			p.deleteKeepaliveLeaseRunStart(key)
+			p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, 0, time.Now().Unix(), "manual_paused", "")
+		} else if cur != nil && isCooldownActive(*cur, p.upstreamNow()) {
+			p.deleteKeepaliveLeaseRunStart(key)
+			p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, 0, time.Now().Unix(), "cooldown_wait", "")
+		} else {
+			p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, 0, time.Now().Unix(), usedAction, "")
+		}
+		return nil
+	}
+
+	p.deleteKeepaliveLeaseRunStart(key)
+	p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, 0, nowUnix, "manual_paused", "")
+	return nil
+}
+
+func (p *Poller) powerCycleForKeepalive(ctx context.Context, accountID, apiKey, machineID, key string, gen uint64) error {
+	step := p.keepalivePollDelay(2 * time.Second)
+	if !p.keepaliveValid(ctx, key, gen) {
+		return nil
+	}
+	if err := p.store.SetMachineKeepalivePendingRestart(ctx, accountID, machineID, true); err != nil {
+		return err
+	}
+	if _, err := p.client.PerformAction(ctx, apiKey, machineID, instabox.ActionStop); err != nil {
+		if !p.keepaliveValid(ctx, key, gen) {
+			return nil
+		}
+		var apiErr *instabox.APIError
+		if errors.As(err, &apiErr) {
+			_ = p.store.SetMachineKeepalivePendingRestart(ctx, accountID, machineID, false)
+		}
+		p.updateKeepaliveState(ctx, accountID, machineID, gen, 0, time.Now().Unix(), "error", err.Error())
+		return err
+	}
+	stopped := false
+	for range 20 {
+		if !sleepWithContext(ctx, step) {
+			if !p.keepaliveValid(ctx, key, gen) {
+				return nil
+			}
+			return ctx.Err()
+		}
+		if !p.keepaliveValid(ctx, key, gen) {
+			return nil
+		}
+		cur, err := p.client.GetMachine(ctx, apiKey, machineID)
+		if err == nil && cur != nil {
+			if !p.keepaliveValid(ctx, key, gen) {
+				return nil
+			}
+			_ = p.syncSingleMachine(ctx, accountID, *cur)
+			if cur.State == "stopped" {
+				stopped = true
+				break
+			}
+		}
+	}
+	if !p.keepaliveValid(ctx, key, gen) {
+		return nil
+	}
+	if !stopped {
+		err := errors.New("machine did not stop before power-cycle timeout")
+		p.updateKeepaliveState(ctx, accountID, machineID, gen, 0, time.Now().Unix(), "error", err.Error())
+		return err
+	}
+
+	return p.startForKeepalive(ctx, accountID, apiKey, machineID, key, gen, step)
+}
+
+func (p *Poller) startForKeepalive(ctx context.Context, accountID, apiKey, machineID, key string, gen uint64, step time.Duration) error {
+	if !p.keepaliveValid(ctx, key, gen) {
+		return nil
+	}
+	if _, err := p.client.PerformAction(ctx, apiKey, machineID, instabox.ActionStart); err != nil {
+		if !p.keepaliveValid(ctx, key, gen) {
+			return nil
+		}
+		var apiErr *instabox.APIError
+		if errors.As(err, &apiErr) && apiErr.Code == "machine_cooldown" {
+			p.updateKeepaliveState(ctx, accountID, machineID, gen, 0, time.Now().Unix(), "cooldown_wait", "")
+			return nil
+		}
+		p.updateKeepaliveState(ctx, accountID, machineID, gen, 0, time.Now().Unix(), "error", err.Error())
+		return err
+	}
+	var runningMachine *instabox.Machine
+	for range 25 {
+		if !sleepWithContext(ctx, step) {
+			if !p.keepaliveValid(ctx, key, gen) {
+				return nil
+			}
+			return ctx.Err()
+		}
+		if !p.keepaliveValid(ctx, key, gen) {
+			return nil
+		}
+		cur, err := p.client.GetMachine(ctx, apiKey, machineID)
+		if err == nil && cur != nil {
+			if !p.keepaliveValid(ctx, key, gen) {
+				return nil
+			}
+			_ = p.syncSingleMachine(ctx, accountID, *cur)
+			if cur.State == "running" {
+				runningMachine = cur
+				break
+			}
+		}
+	}
+	if !p.keepaliveValid(ctx, key, gen) {
+		return nil
+	}
+	if runningMachine == nil {
+		err := errors.New("machine did not reach running state after power-cycle start")
+		p.updateKeepaliveState(ctx, accountID, machineID, gen, 0, time.Now().Unix(), "error", err.Error())
+		return err
+	}
+
+	_ = p.store.SetMachineKeepalivePendingRestart(ctx, accountID, machineID, false)
+
+	var expUnix int64
+	if lease, lErr := p.client.PutActivityLease(ctx, apiKey, machineID, keepaliveLeaseID, keepaliveLeaseTTLSeconds); lErr == nil && lease != nil {
+		if !p.keepaliveValid(ctx, key, gen) {
+			return nil
+		}
+		expUnix = p.upstreamNow().Unix() + keepaliveLeaseTTLSeconds
+		if expTime, ok := parseInstaboxTime(lease.ExpiresAt); ok {
+			expUnix = expTime.Unix()
+		}
+		if !p.storeKeepaliveLeaseRunStart(ctx, key, gen, runningMachine.RunStartedAt) {
+			return nil
+		}
+	}
+	p.updateKeepaliveState(ctx, accountID, machineID, gen, expUnix, time.Now().Unix(), "power_cycle", "")
+	return nil
 }

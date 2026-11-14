@@ -280,6 +280,12 @@ type ActionResult struct {
 	Machine   *Machine   `json:"machine,omitempty"`
 }
 
+type ActivityLease struct {
+	ID        string `json:"id"`
+	MachineID string `json:"machineId"`
+	ExpiresAt string `json:"expiresAt"`
+}
+
 func (c *Client) GetMe(ctx context.Context, apiKey string) (*Me, error) {
 	var out Me
 	_, err := c.doJSON(ctx, http.MethodGet, "/v1/me", apiKey, nil, false, &out)
@@ -408,6 +414,38 @@ func (c *Client) DeleteMachine(ctx context.Context, apiKey, machineID, confirmVa
 		return nil, err
 	}
 	return &ActionResult{Operation: &op}, nil
+}
+
+func (c *Client) PutActivityLease(ctx context.Context, apiKey, machineID, leaseID string, ttlSeconds int) (*ActivityLease, error) {
+	if strings.TrimSpace(leaseID) == "" {
+		leaseID = "ibmon-keepalive"
+	}
+	if ttlSeconds <= 0 {
+		ttlSeconds = 3600
+	} else if ttlSeconds < 30 {
+		ttlSeconds = 30
+	} else if ttlSeconds > 3600 {
+		ttlSeconds = 3600
+	}
+	var out ActivityLease
+	payload := struct {
+		TTLSeconds int `json:"ttlSeconds"`
+	}{TTLSeconds: ttlSeconds}
+	path := "/v1/machines/" + url.PathEscape(machineID) + "/activity-leases/" + url.PathEscape(leaseID)
+	_, err := c.doJSON(ctx, http.MethodPut, path, apiKey, payload, false, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) DeleteActivityLease(ctx context.Context, apiKey, machineID, leaseID string) error {
+	if strings.TrimSpace(leaseID) == "" {
+		leaseID = "ibmon-keepalive"
+	}
+	path := "/v1/machines/" + url.PathEscape(machineID) + "/activity-leases/" + url.PathEscape(leaseID)
+	_, err := c.doJSON(ctx, http.MethodDelete, path, apiKey, nil, false, nil)
+	return err
 }
 
 func (c *Client) GetOperation(ctx context.Context, apiKey, opID string, wait string) (*Operation, error) {

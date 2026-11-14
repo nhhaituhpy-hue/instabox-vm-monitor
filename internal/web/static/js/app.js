@@ -98,7 +98,8 @@ const ICONS = {
   plus: () => svgIcon([
     { d: 'M12 5v14' },
     { d: 'M5 12h14' }
-  ])
+  ]),
+  check: () => svgIcon([{ tag: 'polyline', points: '20 6 9 17 4 12' }])
 };
 
 const state = {
@@ -487,15 +488,54 @@ function closeDrawer() {
   }, 420);
 }
 
+let syncDoneTimer = null;
 async function triggerSyncAll() {
+  if (state.syncing) return;
+  state.syncing = true;
+  clearTimeout(syncDoneTimer);
+  const syncBtn = document.getElementById('sync-all-btn');
+  if (syncBtn) {
+    delete syncBtn.dataset.syncDone;
+    syncBtn.dataset.syncing = 'true';
+    syncBtn.setAttribute('aria-busy', 'true');
+    const iconHost = syncBtn.querySelector('.btn-sync-icon');
+    if (iconHost) iconHost.replaceChildren(ICONS.refresh());
+  }
+  const startedAt = performance.now();
   try {
     state.machineOptionsCache.clear();
     const data = await apiFetch('/api/sync', { method: 'POST' });
+    const elapsed = performance.now() - startedAt;
+    if (elapsed < 380) {
+      await new Promise((r) => setTimeout(r, 380 - elapsed));
+    }
     applyMachinesPayload(data);
     updateDashboardInPlace();
     renderDrawerContent();
+    const btnAfter = document.getElementById('sync-all-btn');
+    if (btnAfter) {
+      delete btnAfter.dataset.syncing;
+      btnAfter.removeAttribute('aria-busy');
+      btnAfter.dataset.syncDone = 'true';
+      const iconHost = btnAfter.querySelector('.btn-sync-icon');
+      if (iconHost) iconHost.replaceChildren(ICONS.check());
+      syncDoneTimer = setTimeout(() => {
+        const cur = document.getElementById('sync-all-btn');
+        if (!cur || cur.dataset.syncing === 'true') return;
+        delete cur.dataset.syncDone;
+        const ih = cur.querySelector('.btn-sync-icon');
+        if (ih) ih.replaceChildren(ICONS.refresh());
+      }, 1100);
+    }
   } catch (err) {
+    const btnAfter = document.getElementById('sync-all-btn');
+    if (btnAfter) {
+      delete btnAfter.dataset.syncing;
+      btnAfter.removeAttribute('aria-busy');
+    }
     showToast(err.message, 'error');
+  } finally {
+    state.syncing = false;
   }
 }
 
@@ -657,12 +697,7 @@ function renderTopbar() {
     onClick: () => openDrawer()
   }, [ICONS.menu()]);
 
-  const brand = el('div', { className: 'brand' }, [
-    el('img', { className: 'brand-logo', src: '/assets/logo.svg', alt: '', width: '32', height: '32' }),
-    el('span', { className: 'brand-title', textContent: t('appName') })
-  ]);
-
-  const left = el('div', { className: 'topbar-left' }, [menuBtn, brand]);
+  const left = el('div', { className: 'topbar-left' }, [menuBtn]);
   inner.append(left);
 
   header.append(inner);
@@ -1016,8 +1051,57 @@ function createVmCardController(initialVm) {
     ])
   ]);
 
+  const keepaliveInputId = `ka-${vm.accountId}-${vm.id}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+  let keepaliveBusy = false;
+  const keepaliveInput = el('input', {
+    type: 'checkbox',
+    id: keepaliveInputId,
+    className: 'vm-keepalive-input'
+  });
+  const keepaliveText = el('span', { className: 'vm-keepalive-text' });
+  const keepaliveMeta = el('span', { className: 'vm-keepalive-meta mono', hidden: true });
+  const keepaliveToggle = el('label', {
+    className: 'vm-keepalive-toggle',
+    for: keepaliveInputId,
+    dataset: { active: 'false' }
+  }, [keepaliveInput, keepaliveText, keepaliveMeta]);
+
+  keepaliveInput.addEventListener('change', async () => {
+    if (keepaliveBusy) return;
+    const nextEnabled = keepaliveInput.checked;
+    keepaliveBusy = true;
+    keepaliveInput.disabled = true;
+    keepaliveToggle.dataset.busy = 'true';
+    try {
+      const res = await apiFetch(
+        `/api/machines/${encodeURIComponent(vm.accountId)}/${encodeURIComponent(vm.id)}/keepalive`,
+        { method: 'PATCH', body: JSON.stringify({ enabled: nextEnabled }) }
+      );
+      keepaliveBusy = false;
+      if (res?.machine) {
+        const idx = state.machines.findIndex((x) => x.accountId === vm.accountId && x.id === vm.id);
+        if (idx >= 0) state.machines[idx] = res.machine;
+        if (!updateDashboardInPlace()) update(res.machine);
+      }
+      showToast(`${t(nextEnabled ? 'keepaliveEnabledToast' : 'keepaliveDisabledToast')}: ${vm.name}`);
+      if (nextEnabled) {
+        setTimeout(() => refreshMachinesSilently(), 1200);
+        setTimeout(() => refreshMachinesSilently(), 4500);
+      }
+    } catch (err) {
+      keepaliveBusy = false;
+      keepaliveInput.checked = !nextEnabled;
+      keepaliveToggle.dataset.active = !nextEnabled ? 'true' : 'false';
+      showToast(err.message, 'error');
+    } finally {
+      keepaliveBusy = false;
+      keepaliveInput.disabled = false;
+      delete keepaliveToggle.dataset.busy;
+    }
+  });
+
   const statusBadge = el('span', { className: 'badge' });
-  head.append(ident, statusBadge);
+  head.append(ident, keepaliveToggle, statusBadge);
   const errEl = el('div', { className: 'account-err', hidden: true });
   col1.append(head, errEl);
 
@@ -1126,6 +1210,41 @@ function createVmCardController(initialVm) {
       setTextIfChanged(freeBadge, t('freePlan'));
     } else {
       freeBadge.hidden = true;
+    }
+
+    const kaEnabled = !!vm.keepaliveEnabled;
+    if (!keepaliveBusy) {
+      keepaliveInput.checked = kaEnabled;
+    }
+    keepaliveToggle.dataset.active = kaEnabled ? 'true' : 'false';
+    setTextIfChanged(keepaliveText, t('keepaliveLabel'));
+    keepaliveToggle.title = vm.keepaliveLastError || t('keepaliveDesc');
+    if (!kaEnabled) {
+      keepaliveMeta.hidden = true;
+      delete keepaliveMeta.dataset.tone;
+    } else if (vm.keepaliveLastError) {
+      keepaliveMeta.hidden = false;
+      keepaliveMeta.dataset.tone = 'error';
+      setTextIfChanged(keepaliveMeta, '!');
+    } else if (vm.keepaliveLastAction === 'cooldown_wait') {
+      keepaliveMeta.hidden = false;
+      keepaliveMeta.dataset.tone = 'warn';
+      setTextIfChanged(keepaliveMeta, t('keepaliveWaitCooldown'));
+    } else if (vm.keepaliveLastAction === 'manual_paused') {
+      keepaliveMeta.hidden = false;
+      keepaliveMeta.dataset.tone = 'muted';
+      setTextIfChanged(keepaliveMeta, t('keepaliveManualPaused'));
+    } else if (vm.keepaliveLeaseExpiresAt > 0) {
+      const remSec = Math.max(0, vm.keepaliveLeaseExpiresAt - Math.floor(upstreamNowMs() / 1000));
+      if (remSec > 0) {
+        keepaliveMeta.hidden = false;
+        keepaliveMeta.dataset.tone = 'ok';
+        setTextIfChanged(keepaliveMeta, fmtCompactDuration(remSec));
+      } else {
+        keepaliveMeta.hidden = true;
+      }
+    } else {
+      keepaliveMeta.hidden = true;
     }
 
     const diskSummary = vm.rootDiskGiB > 0
@@ -1323,35 +1442,28 @@ function populateStatsStrip(strip) {
 function updateDashboardHero(heroEl) {
   const hero = heroEl || document.getElementById('dashboard-hero');
   if (!hero || !hero._refs) return;
-  const { titleText, metaEl, addBtnText, syncBtnText } = hero._refs;
+  const { brandTitle, addBtnText, syncBtnText } = hero._refs;
 
-  const total = state.machines.length;
-  const running = state.machines.filter((m) => m.state === 'running').length;
-  let heading = t('heroAllStable');
-  if (state.accounts.length === 0) heading = t('heroNoAccounts');
-  else if (running > 0) heading = t('heroActive', { count: running });
-
-  setTextIfChanged(titleText, heading.replace(/\.+$/, ''));
-  setTextIfChanged(metaEl, t('heroMeta', { accounts: state.accounts.length, machines: total }));
+  setTextIfChanged(brandTitle, t('appName'));
   setTextIfChanged(addBtnText, t('addMachineBtn'));
-  setTextIfChanged(syncBtnText, `${t('refreshAll')} →`);
+  setTextIfChanged(syncBtnText, t('refreshAll'));
 }
 
 function renderDashboard() {
   const main = el('main', { className: 'main-wrap' });
 
-  // Editorial Hero Header + Pill Actions (CLIProxyAPI-inspired)
-  const titleText = el('span');
-  const heroTitle = el('h1', { className: 'hero-title' }, [
-    titleText,
-    el('span', { className: 'hero-dot', textContent: '.' })
+  // Brand Hero Header + Pill Actions
+  const brandTitle = el('h1', { className: 'hero-brand-title' });
+  const heroBrand = el('div', { className: 'hero-brand' }, [
+    el('img', { className: 'hero-brand-logo', src: '/assets/logo.svg', alt: '', width: '40', height: '40' }),
+    brandTitle
   ]);
-  const metaEl = el('p', { className: 'hero-meta mono' });
   const addBtnText = el('span');
   const syncBtnText = el('span');
+  const syncIconWrap = el('span', { className: 'btn-sync-icon', 'aria-hidden': 'true' }, [ICONS.refresh()]);
 
   const hero = el('section', { id: 'dashboard-hero', className: 'dashboard-hero' }, [
-    el('div', { className: 'hero-text' }, [heroTitle, metaEl]),
+    el('div', { className: 'hero-text' }, [heroBrand]),
     el('div', { className: 'hero-actions' }, [
       el('button', {
         type: 'button',
@@ -1359,13 +1471,14 @@ function renderDashboard() {
         onClick: () => openAddMachineDialog()
       }, [ICONS.plus(), addBtnText]),
       el('button', {
+        id: 'sync-all-btn',
         type: 'button',
-        className: 'btn-ghost-link',
+        className: 'btn-ghost-link btn-sync',
         onClick: () => triggerSyncAll()
-      }, [syncBtnText])
+      }, [syncIconWrap, syncBtnText])
     ])
   ]);
-  hero._refs = { titleText, metaEl, addBtnText, syncBtnText };
+  hero._refs = { brandTitle, addBtnText, syncBtnText };
   updateDashboardHero(hero);
   main.append(hero);
 

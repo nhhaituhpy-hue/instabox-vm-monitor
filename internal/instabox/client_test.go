@@ -241,3 +241,39 @@ func TestRenameAndDeleteMachineSendIdempotencyAndConfirmHeader(t *testing.T) {
 		t.Fatalf("unexpected delete state: idem=%q confirm=%q res=%+v", deleteIdem, confirmHdr, res)
 	}
 }
+
+func TestPutAndDeleteActivityLease(t *testing.T) {
+	var putTTL float64
+	var deleted atomic.Bool
+	client, _ := newMockClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/machines/m_1/activity-leases/ibmon-keepalive":
+			var body map[string]float64
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			putTTL = body["ttlSeconds"]
+			_, _ = w.Write([]byte(`{"id":"ibmon-keepalive","machineId":"m_1","expiresAt":"2026-11-14T03:00:00Z"}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/machines/m_1/activity-leases/ibmon-keepalive":
+			deleted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	ctx := context.Background()
+	lease, err := client.PutActivityLease(ctx, "ibk_test", "m_1", "ibmon-keepalive", 3600)
+	if err != nil {
+		t.Fatalf("PutActivityLease err = %v", err)
+	}
+	if putTTL != 3600 || lease.ID != "ibmon-keepalive" || lease.ExpiresAt != "2026-11-14T03:00:00Z" {
+		t.Fatalf("unexpected lease result: ttl=%v lease=%+v", putTTL, lease)
+	}
+
+	if err := client.DeleteActivityLease(ctx, "ibk_test", "m_1", "ibmon-keepalive"); err != nil {
+		t.Fatalf("DeleteActivityLease err = %v", err)
+	}
+	if !deleted.Load() {
+		t.Fatalf("expected DELETE activity-lease request to reach server")
+	}
+}

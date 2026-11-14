@@ -83,6 +83,7 @@ func NewRouter(st *store.Store, client *instabox.Client, poller *monitor.Poller,
 	mux.HandleFunc("GET /api/machines", s.withAuth(false, s.handleListMachines))
 	mux.HandleFunc("POST /api/machines", s.withAuth(true, s.handleCreateMachine))
 	mux.HandleFunc("PATCH /api/machines/{accountId}/{machineId}", s.withAuth(true, s.handleRenameMachine))
+	mux.HandleFunc("PATCH /api/machines/{accountId}/{machineId}/keepalive", s.withAuth(true, s.handleSetMachineKeepalive))
 	mux.HandleFunc("DELETE /api/machines/{accountId}/{machineId}", s.withAuth(true, s.handleDeleteMachine))
 	mux.HandleFunc("POST /api/sync", s.withAuth(true, s.handleSyncAll))
 	mux.HandleFunc("GET /api/machines/{accountId}/{machineId}/telemetry", s.withAuth(false, s.handleMachineTelemetry))
@@ -734,6 +735,35 @@ func (s *Server) handleRenameMachine(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("rename machine %s/%s error: %v", accountID, machineID, err)
 		writeError(w, http.StatusBadGateway, "upstream_error", "failed to rename machine on instabox.sh")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"machine": updated,
+	})
+}
+
+func (s *Server) handleSetMachineKeepalive(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	var req struct {
+		Enabled *bool `json:"enabled"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if req.Enabled == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "enabled boolean is required")
+		return
+	}
+	updated, err := s.poller.SetMachineKeepalive(r.Context(), accountID, machineID, *req.Enabled)
+	if err != nil {
+		if errors.Is(err, store.ErrAccountNotFound) || errors.Is(err, store.ErrMachineNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			return
+		}
+		log.Printf("set machine keepalive %s/%s error: %v", accountID, machineID, err)
+		writeError(w, http.StatusInternalServerError, "keepalive_failed", "failed to update keepalive setting")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{

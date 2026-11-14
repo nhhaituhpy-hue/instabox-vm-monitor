@@ -464,3 +464,1127 @@ func TestRenameAndDeleteMachineUpdateLocalStore(t *testing.T) {
 		t.Fatalf("expected deleted machine to be removed from store")
 	}
 }
+
+func TestKeepaliveRenewsLeaseWakesIdlePowerCyclesCapAndPreservesManualStop(t *testing.T) {
+	dir := t.TempDir()
+	key, _ := crypto.LoadOrCreateMasterKey(dir, "")
+	st, _ := store.Open(filepath.Join(dir, "mon.db"), key)
+	t.Cleanup(func() { _ = st.Close() })
+
+	type vmState struct {
+		state           string
+		runStartedAt    string
+		autoSuspendedAt string
+		cooldownUntil   string
+		maxRunMinutes   int
+	}
+	vms := map[string]*vmState{
+		"m_lease": {
+			state:         "running",
+			runStartedAt:  time.Now().UTC().Add(-15 * time.Minute).Format(time.RFC3339),
+			maxRunMinutes: 480,
+		},
+		"m_cap": {
+			state:         "running",
+			runStartedAt:  time.Now().UTC().Add(-(7*time.Hour + 5*time.Minute)).Format(time.RFC3339),
+			maxRunMinutes: 480,
+		},
+		"m_idle": {
+			state:           "suspended",
+			autoSuspendedAt: time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339),
+			maxRunMinutes:   480,
+		},
+		"m_manual": {
+			state:         "stopped",
+			maxRunMinutes: 480,
+		},
+	}
+
+	var mu sync.Mutex
+	var events []string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_lease":
+			v := vms["m_lease"]
+			_, _ = w.Write([]byte(`{"id":"m_lease","name":"vm-lease","state":"` + v.state + `","desiredState":"` + v.state + `","runStartedAt":"` + v.runStartedAt + `","maxRunMinutes":480,"free":true}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/machines/m_lease/activity-leases/ibmon-keepalive":
+			events = append(events, "put_lease:m_lease")
+			exp := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+			_, _ = w.Write([]byte(`{"id":"ibmon-keepalive","machineId":"m_lease","expiresAt":"` + exp + `"}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/machines/m_lease/activity-leases/ibmon-keepalive":
+			events = append(events, "delete_lease:m_lease")
+			w.WriteHeader(http.StatusNoContent)
+
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_cap":
+			v := vms["m_cap"]
+			_, _ = w.Write([]byte(`{"id":"m_cap","name":"vm-cap","state":"` + v.state + `","desiredState":"` + v.state + `","runStartedAt":"` + v.runStartedAt + `","maxRunMinutes":480,"free":true}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_cap/stop":
+			events = append(events, "stop:m_cap")
+			vms["m_cap"].state = "stopped"
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"id":"op_stop","machineId":"m_cap","state":"succeeded"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_cap/start":
+			events = append(events, "start:m_cap")
+			vms["m_cap"].state = "running"
+			vms["m_cap"].runStartedAt = time.Now().UTC().Format(time.RFC3339)
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"id":"op_start","machineId":"m_cap","state":"succeeded"}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/machines/m_cap/activity-leases/ibmon-keepalive":
+			events = append(events, "put_lease:m_cap")
+			exp := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+			_, _ = w.Write([]byte(`{"id":"ibmon-keepalive","machineId":"m_cap","expiresAt":"` + exp + `"}`))
+
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_idle":
+			v := vms["m_idle"]
+			_, _ = w.Write([]byte(`{"id":"m_idle","name":"vm-idle","state":"` + v.state + `","desiredState":"` + v.state + `","autoSuspendedAt":"` + v.autoSuspendedAt + `","cooldownUntil":"` + v.cooldownUntil + `","maxRunMinutes":480,"free":true}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_idle/wake":
+			events = append(events, "wake:m_idle")
+			// Keep suspended so fallback /resume triggers, just like render_watch.py!
+			_, _ = w.Write([]byte(`{"id":"m_idle","name":"vm-idle","state":"suspended","desiredState":"running","autoSuspendedAt":"` + vms["m_idle"].autoSuspendedAt + `"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_idle/resume":
+			events = append(events, "resume:m_idle")
+			vms["m_idle"].state = "running"
+			vms["m_idle"].autoSuspendedAt = ""
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"id":"op_res","machineId":"m_idle","state":"succeeded"}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/machines/m_idle/activity-leases/ibmon-keepalive":
+			events = append(events, "put_lease:m_idle")
+			exp := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+			_, _ = w.Write([]byte(`{"id":"ibmon-keepalive","machineId":"m_idle","expiresAt":"` + exp + `"}`))
+
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_manual":
+			v := vms["m_manual"]
+			_, _ = w.Write([]byte(`{"id":"m_manual","name":"vm-manual","state":"` + v.state + `","desiredState":"` + v.state + `","maxRunMinutes":480,"free":true}`))
+		case r.Method == http.MethodPost && (r.URL.Path == "/v1/machines/m_manual/start" || r.URL.Path == "/v1/machines/m_manual/wake" || r.URL.Path == "/v1/machines/m_manual/resume"):
+			events = append(events, "unexpected_wake_manual:"+r.URL.Path)
+			w.WriteHeader(http.StatusInternalServerError)
+
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	hc := srv.Client()
+	hc.Transport = &rt{u: u, t: srv.Client().Transport}
+	client, _ := instabox.NewClient("https://api.instabox.sh", hc)
+
+	acc, _ := st.CreateAccount(context.Background(), store.AccountInput{Alias: "A", APIKey: "ibk_a...9", OrgTier: "free"})
+	_ = st.SyncAccountMachines(context.Background(), acc.ID, []store.MachineRecord{
+		{AccountID: acc.ID, MachineID: "m_lease", Name: "vm-lease", State: "running", DesiredState: "running", MaxRunMinutes: 480},
+		{AccountID: acc.ID, MachineID: "m_cap", Name: "vm-cap", State: "running", DesiredState: "running", MaxRunMinutes: 480},
+		{AccountID: acc.ID, MachineID: "m_idle", Name: "vm-idle", State: "suspended", DesiredState: "suspended", AutoSuspendedAt: vms["m_idle"].autoSuspendedAt, MaxRunMinutes: 480},
+		{AccountID: acc.ID, MachineID: "m_manual", Name: "vm-manual", State: "stopped", DesiredState: "stopped", MaxRunMinutes: 480},
+	})
+	for _, mid := range []string{"m_lease", "m_cap", "m_idle", "m_manual"} {
+		if err := st.SetMachineKeepalive(context.Background(), acc.ID, mid, true); err != nil {
+			t.Fatalf("SetMachineKeepalive(%s): %v", mid, err)
+		}
+	}
+
+	p := monitor.NewPoller(st, client, 30*time.Second, 7)
+	p.SetKeepalivePollDelay(time.Millisecond)
+	defer p.Stop()
+
+	ctx := context.Background()
+	if err := p.RunKeepaliveCycle(ctx, acc.ID, "m_lease", true); err != nil {
+		t.Fatalf("m_lease cycle: %v", err)
+	}
+	if err := p.RunKeepaliveCycle(ctx, acc.ID, "m_cap", false); err != nil {
+		t.Fatalf("m_cap cycle: %v", err)
+	}
+	if err := p.RunKeepaliveCycle(ctx, acc.ID, "m_idle", false); err != nil {
+		t.Fatalf("m_idle cycle: %v", err)
+	}
+	if err := p.RunKeepaliveCycle(ctx, acc.ID, "m_manual", false); err != nil {
+		t.Fatalf("m_manual cycle: %v", err)
+	}
+
+	// Disabling keepalive on m_lease should release its activity lease
+	if _, err := p.SetMachineKeepalive(ctx, acc.ID, "m_lease", false); err != nil {
+		t.Fatalf("SetMachineKeepalive(false): %v", err)
+	}
+
+	mu.Lock()
+	gotEvents := append([]string(nil), events...)
+	mu.Unlock()
+
+	want := []string{
+		"put_lease:m_lease",
+		"stop:m_cap", "start:m_cap", "put_lease:m_cap",
+		"wake:m_idle", "resume:m_idle", "put_lease:m_idle",
+		"delete_lease:m_lease",
+	}
+	if len(gotEvents) != len(want) {
+		t.Fatalf("events mismatch:\n got: %v\nwant: %v", gotEvents, want)
+	}
+	for i := range want {
+		if gotEvents[i] != want[i] {
+			t.Fatalf("event[%d] mismatch: got %q want %q (all=%v)", i, gotEvents[i], want[i], gotEvents)
+		}
+	}
+
+	capRec, _ := st.GetMachine(ctx, acc.ID, "m_cap")
+	if capRec.KeepaliveLastAction != "power_cycle" || capRec.State != "running" {
+		t.Fatalf("expected m_cap power_cycle running, got %+v", capRec)
+	}
+	manualRec, _ := st.GetMachine(ctx, acc.ID, "m_manual")
+	if manualRec.KeepaliveLastAction != "manual_paused" {
+		t.Fatalf("expected m_manual preserved with manual_paused, got %+v", manualRec)
+	}
+
+	// Verify active cooldown prevents /wake spam
+	mu.Lock()
+	vms["m_idle"].state = "suspended"
+	vms["m_idle"].autoSuspendedAt = time.Now().UTC().Add(-2 * time.Minute).Format(time.RFC3339)
+	vms["m_idle"].cooldownUntil = time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339)
+	beforeLen := len(events)
+	mu.Unlock()
+
+	if err := p.RunKeepaliveCycle(ctx, acc.ID, "m_idle", false); err != nil {
+		t.Fatalf("m_idle cooldown cycle: %v", err)
+	}
+	mu.Lock()
+	afterLen := len(events)
+	mu.Unlock()
+	if afterLen != beforeLen {
+		t.Fatalf("expected zero wake/resume requests during cooldown, got %v", events[beforeLen:])
+	}
+	cdRec, _ := st.GetMachine(ctx, acc.ID, "m_idle")
+	if cdRec.KeepaliveLastAction != "cooldown_wait" {
+		t.Fatalf("expected cooldown_wait action, got %+v", cdRec)
+	}
+}
+
+func TestKeepaliveDisableCancelsAndFencesActiveCycle(t *testing.T) {
+	dir := t.TempDir()
+	key, _ := crypto.LoadOrCreateMasterKey(dir, "")
+	st, _ := store.Open(filepath.Join(dir, "mon.db"), key)
+	t.Cleanup(func() { _ = st.Close() })
+
+	wokeCh := make(chan struct{}, 1)
+	var mu sync.Mutex
+	var events []string
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_race":
+			_, _ = w.Write([]byte(`{"id":"m_race","name":"vm-race","state":"suspended","desiredState":"suspended","autoSuspendedAt":"2026-11-13T11:00:00Z","maxRunMinutes":480,"free":true}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_race/wake":
+			mu.Lock()
+			events = append(events, "wake")
+			mu.Unlock()
+			select {
+			case wokeCh <- struct{}{}:
+			default:
+			}
+			_, _ = w.Write([]byte(`{"id":"m_race","name":"vm-race","state":"suspended","desiredState":"running","autoSuspendedAt":"2026-11-13T11:00:00Z"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_race/resume":
+			mu.Lock()
+			events = append(events, "resume")
+			mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"id":"op_res","machineId":"m_race","state":"succeeded"}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/machines/m_race/activity-leases/ibmon-keepalive":
+			mu.Lock()
+			events = append(events, "put_lease")
+			mu.Unlock()
+			exp := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+			_, _ = w.Write([]byte(`{"id":"ibmon-keepalive","machineId":"m_race","expiresAt":"` + exp + `"}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/machines/m_race/activity-leases/ibmon-keepalive":
+			mu.Lock()
+			events = append(events, "delete_lease")
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	hc := srv.Client()
+	hc.Transport = &rt{u: u, t: srv.Client().Transport}
+	client, _ := instabox.NewClient("https://api.instabox.sh", hc)
+
+	acc, _ := st.CreateAccount(context.Background(), store.AccountInput{Alias: "A", APIKey: "ibk_a...9", OrgTier: "free"})
+	_ = st.SyncAccountMachines(context.Background(), acc.ID, []store.MachineRecord{
+		{AccountID: acc.ID, MachineID: "m_race", Name: "vm-race", State: "suspended", DesiredState: "suspended", AutoSuspendedAt: "2026-11-13T11:00:00Z", MaxRunMinutes: 480},
+	})
+	if err := st.SetMachineKeepalive(context.Background(), acc.ID, "m_race", true); err != nil {
+		t.Fatalf("SetMachineKeepalive(true): %v", err)
+	}
+
+	p := monitor.NewPoller(st, client, 30*time.Second, 7)
+	p.SetKeepalivePollDelay(150 * time.Millisecond)
+	defer p.Stop()
+
+	ctx := context.Background()
+	cycleDone := make(chan error, 1)
+	go func() {
+		cycleDone <- p.RunKeepaliveCycle(ctx, acc.ID, "m_race", false)
+	}()
+
+	select {
+	case <-wokeCh:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for /wake")
+	}
+
+	start := time.Now()
+	rec, err := p.SetMachineKeepalive(ctx, acc.ID, "m_race", false)
+	if err != nil {
+		t.Fatalf("SetMachineKeepalive(false): %v", err)
+	}
+	if rec.KeepaliveEnabled {
+		t.Fatalf("expected keepalive disabled immediately, got %+v", rec)
+	}
+
+	select {
+	case <-cycleDone:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected active RunKeepaliveCycle to cancel quickly on SetMachineKeepalive(false), elapsed=%v", time.Since(start))
+	}
+
+	mu.Lock()
+	gotEvents := append([]string(nil), events...)
+	mu.Unlock()
+	for _, ev := range gotEvents {
+		if ev == "resume" || ev == "put_lease" {
+			t.Fatalf("cancelled keepalive cycle continued to execute %q: events=%v", ev, gotEvents)
+		}
+	}
+	if len(gotEvents) != 2 || gotEvents[0] != "wake" || gotEvents[1] != "delete_lease" {
+		t.Fatalf("unexpected events: got=%v want=[wake delete_lease]", gotEvents)
+	}
+
+	stored, err := st.GetMachine(ctx, acc.ID, "m_race")
+	if err != nil || stored.KeepaliveEnabled || stored.KeepaliveLeaseExpiresAt != 0 || stored.KeepaliveLastAt != 0 || stored.KeepaliveLastAction != "" || stored.KeepaliveLastError != "" {
+		t.Fatalf("expected cleared keepalive DB fields after cancel, got err=%v m=%+v", err, stored)
+	}
+}
+
+func TestKeepaliveDisableFencesBlockedLockAndRapidDisableEnableRunsForceLease(t *testing.T) {
+	dir := t.TempDir()
+	key, _ := crypto.LoadOrCreateMasterKey(dir, "")
+	st, _ := store.Open(filepath.Join(dir, "mon.db"), key)
+	t.Cleanup(func() { _ = st.Close() })
+
+	metricsEntered := make(chan struct{}, 1)
+	metricsRelease := make(chan struct{})
+	getEntered := make(chan struct{}, 4)
+
+	var mu sync.Mutex
+	var events []string
+	var leasePutCount atomic.Int32
+	leasePutDone := make(chan struct{}, 4)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/me":
+			_, _ = w.Write([]byte(`{"userId":1,"login":"u","org":{"id":"org_1","name":"P","tier":"free","kind":"personal"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/usage":
+			_, _ = w.Write([]byte(`{"machines":1}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines":
+			_, _ = w.Write([]byte(`{"machines":[{"id":"m_fast","name":"vm-fast","state":"running","desiredState":"running","runStartedAt":"` + time.Now().UTC().Add(-10*time.Minute).Format(time.RFC3339) + `","maxRunMinutes":480,"free":true}],"nextCursor":null}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_fast/usage":
+			_, _ = w.Write([]byte(`{"runningSeconds":600}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_fast/metrics":
+			select {
+			case metricsEntered <- struct{}{}:
+			default:
+			}
+			select {
+			case <-metricsRelease:
+			case <-r.Context().Done():
+			}
+			_, _ = w.Write([]byte(`{"metrics":[]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_fast/disk":
+			_, _ = w.Write([]byte(`{"measuredAt":"2026-11-13T12:00:00Z","filesystems":[]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_fast":
+			select {
+			case getEntered <- struct{}{}:
+			default:
+			}
+			_, _ = w.Write([]byte(`{"id":"m_fast","name":"vm-fast","state":"running","desiredState":"running","runStartedAt":"` + time.Now().UTC().Add(-10*time.Minute).Format(time.RFC3339) + `","maxRunMinutes":480,"free":true}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/machines/m_fast/activity-leases/ibmon-keepalive":
+			mu.Lock()
+			events = append(events, "put_lease")
+			mu.Unlock()
+			leasePutCount.Add(1)
+			select {
+			case leasePutDone <- struct{}{}:
+			default:
+			}
+			exp := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+			_, _ = w.Write([]byte(`{"id":"ibmon-keepalive","machineId":"m_fast","expiresAt":"` + exp + `"}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/machines/m_fast/activity-leases/ibmon-keepalive":
+			mu.Lock()
+			events = append(events, "delete_lease")
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	hc := srv.Client()
+	hc.Transport = &rt{u: u, t: srv.Client().Transport}
+	client, _ := instabox.NewClient("https://api.instabox.sh", hc)
+
+	acc, _ := st.CreateAccount(context.Background(), store.AccountInput{Alias: "A", APIKey: "ibk_a...9", OrgTier: "free"})
+	_ = st.SyncAccountMachines(context.Background(), acc.ID, []store.MachineRecord{
+		{AccountID: acc.ID, MachineID: "m_fast", Name: "vm-fast", State: "running", DesiredState: "running", MaxRunMinutes: 480},
+	})
+	if err := st.SetMachineKeepalive(context.Background(), acc.ID, "m_fast", true); err != nil {
+		t.Fatalf("SetMachineKeepalive(true): %v", err)
+	}
+
+	p := monitor.NewPoller(st, client, 30*time.Second, 7)
+	p.SetKeepalivePollDelay(10 * time.Millisecond)
+	defer p.Stop()
+
+	ctx := context.Background()
+	syncDone := make(chan error, 1)
+	go func() {
+		syncDone <- p.SyncAccount(ctx, acc.ID)
+	}()
+
+	select {
+	case <-metricsEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for SyncAccount to enter /metrics")
+	}
+
+	// Start RunKeepaliveCycle while SyncAccount holds accountLock; it will block at syncSingleMachine.
+	oldCycleDone := make(chan error, 1)
+	go func() {
+		oldCycleDone <- p.RunKeepaliveCycle(ctx, acc.ID, "m_fast", false)
+	}()
+
+	select {
+	case <-getEntered:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for RunKeepaliveCycle GetMachine")
+	}
+	time.Sleep(25 * time.Millisecond)
+
+	// Disable while old cycle is blocked on accountLock, then immediately re-enable (forceLease=true).
+	disableDone := make(chan error, 1)
+	go func() {
+		_, err := p.SetMachineKeepalive(ctx, acc.ID, "m_fast", false)
+		disableDone <- err
+	}()
+
+	select {
+	case err := <-disableDone:
+		if err != nil {
+			t.Fatalf("SetMachineKeepalive(false) err = %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		close(metricsRelease)
+		t.Fatalf("SetMachineKeepalive(false) blocked on lockAccount-held SyncAccount instead of cancelling blocked cycle")
+	}
+
+	select {
+	case <-oldCycleDone:
+	case <-time.After(500 * time.Millisecond):
+		close(metricsRelease)
+		t.Fatalf("old RunKeepaliveCycle did not exit promptly after disable")
+	}
+
+	// Rapid re-enable MUST NOT be dropped; it should acquire the lease once accountLock clears.
+	if _, err := p.SetMachineKeepalive(ctx, acc.ID, "m_fast", true); err != nil {
+		close(metricsRelease)
+		t.Fatalf("SetMachineKeepalive(true) err = %v", err)
+	}
+
+	close(metricsRelease)
+	select {
+	case err := <-syncDone:
+		if err != nil {
+			t.Fatalf("SyncAccount err = %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("SyncAccount did not finish")
+	}
+
+	select {
+	case <-leasePutDone:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("rapid disable->enable dropped forceLease cycle (PutActivityLease never called)")
+	}
+
+	// Wait briefly to ensure old cycle didn't put a duplicate lease
+	time.Sleep(30 * time.Millisecond)
+	if leasePutCount.Load() != 1 {
+		t.Fatalf("expected exactly 1 PutActivityLease from new enabled cycle, got %d", leasePutCount.Load())
+	}
+	mu.Lock()
+	gotEvents := append([]string(nil), events...)
+	mu.Unlock()
+	if len(gotEvents) != 2 || gotEvents[0] != "delete_lease" || gotEvents[1] != "put_lease" {
+		t.Fatalf("expected [delete_lease put_lease], got %v", gotEvents)
+	}
+
+	stored, err := st.GetMachine(ctx, acc.ID, "m_fast")
+	if err != nil || !stored.KeepaliveEnabled || stored.KeepaliveLastAction != "lease_renewed" || stored.KeepaliveLeaseExpiresAt <= 0 {
+		t.Fatalf("expected machine keepalive active with renewed lease, got err=%v m=%+v", err, stored)
+	}
+}
+
+func TestKeepalivePowerCycleRecoveryAndShorterFreeMaxRunThreshold(t *testing.T) {
+	dir := t.TempDir()
+	key, _ := crypto.LoadOrCreateMasterKey(dir, "")
+	st, _ := store.Open(filepath.Join(dir, "mon.db"), key)
+	t.Cleanup(func() { _ = st.Close() })
+
+	type vmSim struct {
+		state        string
+		runStartedAt string
+		stopCount    int
+		startCount   int
+		failStarts   int
+		stayStopping bool
+		leasePutCh   chan struct{}
+	}
+	vms := map[string]*vmSim{
+		"m_short": {
+			state:        "running",
+			runStartedAt: time.Now().UTC().Add(-7015 * time.Second).Format(time.RFC3339),
+			failStarts:   1,
+			leasePutCh:   make(chan struct{}, 8),
+		},
+		"m_stop_timeout": {
+			state:        "running",
+			runStartedAt: time.Now().UTC().Add(-7025 * time.Second).Format(time.RFC3339),
+			stayStopping: true,
+			leasePutCh:   make(chan struct{}, 8),
+		},
+		"m_deadline": {
+			state:        "running",
+			runStartedAt: time.Now().UTC().Add(-7025 * time.Second).Format(time.RFC3339),
+			stayStopping: true,
+			leasePutCh:   make(chan struct{}, 8),
+		},
+	}
+
+	var mu sync.Mutex
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/me":
+			_, _ = w.Write([]byte(`{"userId":1,"login":"u","org":{"id":"org_1","name":"P","tier":"free","kind":"personal"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/usage":
+			_, _ = w.Write([]byte(`{"machines":3}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines":
+			_, _ = w.Write([]byte(`{"machines":[` +
+				`{"id":"m_short","name":"vm-short","state":"` + vms["m_short"].state + `","desiredState":"` + vms["m_short"].state + `","runStartedAt":"` + vms["m_short"].runStartedAt + `","maxRunMinutes":120,"free":true},` +
+				`{"id":"m_stop_timeout","name":"vm-stoptmo","state":"` + vms["m_stop_timeout"].state + `","desiredState":"` + vms["m_stop_timeout"].state + `","runStartedAt":"` + vms["m_stop_timeout"].runStartedAt + `","maxRunMinutes":120,"free":true},` +
+				`{"id":"m_deadline","name":"vm-deadline","state":"` + vms["m_deadline"].state + `","desiredState":"` + vms["m_deadline"].state + `","runStartedAt":"` + vms["m_deadline"].runStartedAt + `","maxRunMinutes":120,"free":true}` +
+				`],"nextCursor":null}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_short/usage",
+			r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_stop_timeout/usage",
+			r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_deadline/usage":
+			_, _ = w.Write([]byte(`{"runningSeconds":100}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_short/metrics",
+			r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_stop_timeout/metrics",
+			r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_deadline/metrics":
+			_, _ = w.Write([]byte(`{"metrics":[]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_short/disk",
+			r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_stop_timeout/disk",
+			r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_deadline/disk":
+			_, _ = w.Write([]byte(`{"measuredAt":"2026-11-13T12:00:00Z","filesystems":[]}`))
+		default:
+			for id, v := range vms {
+				base := "/v1/machines/" + id
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == base:
+					_, _ = w.Write([]byte(`{"id":"` + id + `","name":"` + id + `","state":"` + v.state + `","desiredState":"` + v.state + `","runStartedAt":"` + v.runStartedAt + `","maxRunMinutes":120,"free":true}`))
+					return
+				case r.Method == http.MethodPost && r.URL.Path == base+"/stop":
+					v.stopCount++
+					if v.stayStopping {
+						v.state = "stopping"
+					} else {
+						v.state = "stopped"
+					}
+					w.WriteHeader(http.StatusAccepted)
+					_, _ = w.Write([]byte(`{"id":"op_stop","machineId":"` + id + `","state":"succeeded"}`))
+					return
+				case r.Method == http.MethodPost && r.URL.Path == base+"/start":
+					v.startCount++
+					if v.failStarts > 0 {
+						v.failStarts--
+						w.WriteHeader(http.StatusInternalServerError)
+						_, _ = w.Write([]byte(`{"error":{"code":"transient_error","message":"start temporarily failed"}}`))
+						return
+					}
+					v.state = "running"
+					v.runStartedAt = time.Now().UTC().Format(time.RFC3339)
+					w.WriteHeader(http.StatusAccepted)
+					_, _ = w.Write([]byte(`{"id":"op_start","machineId":"` + id + `","state":"succeeded"}`))
+					return
+				case r.Method == http.MethodPut && r.URL.Path == base+"/activity-leases/ibmon-keepalive":
+					exp := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+					_, _ = w.Write([]byte(`{"id":"ibmon-keepalive","machineId":"` + id + `","expiresAt":"` + exp + `"}`))
+					select {
+					case v.leasePutCh <- struct{}{}:
+					default:
+					}
+					return
+				}
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	hc := srv.Client()
+	hc.Transport = &rt{u: u, t: srv.Client().Transport}
+	client, _ := instabox.NewClient("https://api.instabox.sh", hc)
+
+	acc, _ := st.CreateAccount(context.Background(), store.AccountInput{Alias: "A", APIKey: "ibk_a...9", OrgTier: "free"})
+	_ = st.SyncAccountMachines(context.Background(), acc.ID, []store.MachineRecord{
+		{AccountID: acc.ID, MachineID: "m_short", Name: "vm-short", State: "running", DesiredState: "running", MaxRunMinutes: 120},
+		{AccountID: acc.ID, MachineID: "m_stop_timeout", Name: "vm-stoptmo", State: "running", DesiredState: "running", MaxRunMinutes: 120},
+		{AccountID: acc.ID, MachineID: "m_deadline", Name: "vm-deadline", State: "running", DesiredState: "running", MaxRunMinutes: 120},
+	})
+	for _, id := range []string{"m_short", "m_stop_timeout", "m_deadline"} {
+		if err := st.SetMachineKeepalive(context.Background(), acc.ID, id, true); err != nil {
+			t.Fatalf("SetMachineKeepalive(%s): %v", id, err)
+		}
+	}
+
+	p := monitor.NewPoller(st, client, 30*time.Second, 7)
+	p.SetKeepalivePollDelay(2 * time.Millisecond)
+	defer p.Stop()
+
+	ctx := context.Background()
+
+	// 1. At 7015s (< 7020s threshold for maxRunMinutes=120), RunKeepaliveCycle only puts lease, no stop!
+	if err := p.RunKeepaliveCycle(ctx, acc.ID, "m_short", true); err != nil {
+		t.Fatalf("m_short below threshold cycle: %v", err)
+	}
+	mu.Lock()
+	if vms["m_short"].stopCount != 0 {
+		mu.Unlock()
+		t.Fatalf("expected 0 stops at 7015s (<7020s), got %d", vms["m_short"].stopCount)
+	}
+	// Advance runtime to exactly 7020s (117m for maxRunMinutes=120) -> triggers powerCycleForKeepalive; ActionStart fails once.
+	vms["m_short"].runStartedAt = time.Now().UTC().Add(-7020 * time.Second).Format(time.RFC3339)
+	mu.Unlock()
+
+	if err := p.RunKeepaliveCycle(ctx, acc.ID, "m_short", false); err == nil {
+		t.Fatalf("expected transient ActionStart failure error on m_short")
+	}
+	shortRec, _ := st.GetMachine(ctx, acc.ID, "m_short")
+	if !shortRec.KeepalivePendingRestart || shortRec.State != "stopped" {
+		t.Fatalf("expected KeepalivePendingRestart=true and state=stopped after start failure, got %+v", shortRec)
+	}
+
+	// 2. m_stop_timeout exceeds 20 stop poll iterations while "stopping", then transitions to "stopped".
+	if err := p.RunKeepaliveCycle(ctx, acc.ID, "m_stop_timeout", false); err == nil {
+		t.Fatalf("expected stop timeout error on m_stop_timeout")
+	}
+	stopTmoRec, _ := st.GetMachine(ctx, acc.ID, "m_stop_timeout")
+	if !stopTmoRec.KeepalivePendingRestart {
+		t.Fatalf("expected KeepalivePendingRestart=true after stop poll timeout, got %+v", stopTmoRec)
+	}
+
+	// 3. m_deadline hits context deadline during stop polling.
+	shortCtx, cancel := context.WithTimeout(ctx, 12*time.Millisecond)
+	_ = p.RunKeepaliveCycle(shortCtx, acc.ID, "m_deadline", false)
+	cancel()
+	deadlineRec, _ := st.GetMachine(ctx, acc.ID, "m_deadline")
+	if !deadlineRec.KeepalivePendingRestart {
+		t.Fatalf("expected KeepalivePendingRestart=true after context deadline expiry, got %+v", deadlineRec)
+	}
+
+	// Transition m_stop_timeout and m_deadline to "stopped" (finished stopping upstream) and run SyncAccount -> ALL 3 must recover!
+	mu.Lock()
+	vms["m_stop_timeout"].stayStopping = false
+	vms["m_stop_timeout"].state = "stopped"
+	vms["m_deadline"].stayStopping = false
+	vms["m_deadline"].state = "stopped"
+	mu.Unlock()
+
+	if err := p.SyncAccount(ctx, acc.ID); err != nil {
+		t.Fatalf("SyncAccount recovery err: %v", err)
+	}
+
+	for _, id := range []string{"m_short", "m_stop_timeout", "m_deadline"} {
+		select {
+		case <-vms[id].leasePutCh:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for %s recovery to acquire lease", id)
+		}
+		// Give updateKeepaliveState a brief moment after PutActivityLease
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			rec, _ := st.GetMachine(ctx, acc.ID, id)
+			if rec.State == "running" && !rec.KeepalivePendingRestart && rec.KeepaliveLastAction == "power_cycle" && rec.KeepaliveLastError == "" {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		rec, _ := st.GetMachine(ctx, acc.ID, id)
+		if rec.State != "running" || rec.KeepalivePendingRestart || rec.KeepaliveLastAction != "power_cycle" || rec.KeepaliveLastError != "" {
+			t.Fatalf("expected %s fully recovered via power_cycle, got %+v", id, rec)
+		}
+	}
+}
+
+func TestExecuteActionStopClearsKeepalivePendingRestart(t *testing.T) {
+	dir := t.TempDir()
+	key, _ := crypto.LoadOrCreateMasterKey(dir, "")
+	st, _ := store.Open(filepath.Join(dir, "mon.db"), key)
+	t.Cleanup(func() { _ = st.Close() })
+
+	var mu sync.Mutex
+	vmState := "running"
+	runStartedAt := time.Now().UTC().Add(-7030 * time.Second).Format(time.RFC3339)
+	startCalls := 0
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/me":
+			_, _ = w.Write([]byte(`{"userId":1,"login":"u","org":{"id":"org_1","name":"P","tier":"free","kind":"personal"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/usage":
+			_, _ = w.Write([]byte(`{"machines":1}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines":
+			_, _ = w.Write([]byte(`{"machines":[{"id":"m_stop","name":"vm-stop","state":"` + vmState + `","desiredState":"` + vmState + `","runStartedAt":"` + runStartedAt + `","maxRunMinutes":120,"free":true}],"nextCursor":null}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_stop":
+			_, _ = w.Write([]byte(`{"id":"m_stop","name":"vm-stop","state":"` + vmState + `","desiredState":"` + vmState + `","runStartedAt":"` + runStartedAt + `","maxRunMinutes":120,"free":true}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_stop/usage":
+			_, _ = w.Write([]byte(`{"runningSeconds":100}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_stop/metrics":
+			_, _ = w.Write([]byte(`{"metrics":[]}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_stop/stop":
+			vmState = "stopped"
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"id":"op_stop","machineId":"m_stop","state":"succeeded"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_stop/start":
+			startCalls++
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"code":"transient_error","message":"start failed"}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	hc := srv.Client()
+	hc.Transport = &rt{u: u, t: srv.Client().Transport}
+	client, _ := instabox.NewClient("https://api.instabox.sh", hc)
+
+	acc, _ := st.CreateAccount(context.Background(), store.AccountInput{Alias: "A", APIKey: "ibk_a...9", OrgTier: "free"})
+	_ = st.SyncAccountMachines(context.Background(), acc.ID, []store.MachineRecord{
+		{AccountID: acc.ID, MachineID: "m_stop", Name: "vm-stop", State: "running", DesiredState: "running", MaxRunMinutes: 120},
+	})
+	if err := st.SetMachineKeepalive(context.Background(), acc.ID, "m_stop", true); err != nil {
+		t.Fatalf("SetMachineKeepalive(true): %v", err)
+	}
+
+	p := monitor.NewPoller(st, client, 30*time.Second, 7)
+	p.SetKeepalivePollDelay(time.Millisecond)
+	defer p.Stop()
+
+	ctx := context.Background()
+	if err := p.RunKeepaliveCycle(ctx, acc.ID, "m_stop", false); err == nil {
+		t.Fatalf("expected ActionStart failure")
+	}
+	rec, _ := st.GetMachine(ctx, acc.ID, "m_stop")
+	if !rec.KeepalivePendingRestart {
+		t.Fatalf("expected KeepalivePendingRestart=true before manual stop, got %+v", rec)
+	}
+
+	if _, err := p.ExecuteAction(ctx, acc.ID, "m_stop", instabox.ActionStop); err != nil {
+		t.Fatalf("ExecuteAction(ActionStop) err: %v", err)
+	}
+	rec, _ = st.GetMachine(ctx, acc.ID, "m_stop")
+	if rec.KeepalivePendingRestart {
+		t.Fatalf("expected ExecuteAction(ActionStop) to clear KeepalivePendingRestart, got %+v", rec)
+	}
+
+	mu.Lock()
+	callsBefore := startCalls
+	mu.Unlock()
+	if err := p.SyncAccount(ctx, acc.ID); err != nil {
+		t.Fatalf("SyncAccount err: %v", err)
+	}
+	time.Sleep(40 * time.Millisecond)
+
+	mu.Lock()
+	callsAfter := startCalls
+	mu.Unlock()
+	if callsAfter != callsBefore {
+		t.Fatalf("expected stopped VM after explicit ActionStop NOT to retry start, got %d new starts", callsAfter-callsBefore)
+	}
+	rec, _ = st.GetMachine(ctx, acc.ID, "m_stop")
+	if rec.KeepaliveLastAction != "manual_paused" {
+		t.Fatalf("expected manual_paused after explicit ActionStop, got %+v", rec)
+	}
+}
+
+func TestSyncAccountReconcilesStaleKeepaliveMetadataWhenSkipped(t *testing.T) {
+	dir := t.TempDir()
+	key, _ := crypto.LoadOrCreateMasterKey(dir, "")
+	st, _ := store.Open(filepath.Join(dir, "mon.db"), key)
+	t.Cleanup(func() { _ = st.Close() })
+
+	var actionCalls atomic.Int32
+	cdUntil := time.Now().UTC().Add(15 * time.Minute).Format(time.RFC3339)
+	autoSusp := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/me":
+			_, _ = w.Write([]byte(`{"userId":1,"login":"u","org":{"id":"org_1","name":"P","tier":"free","kind":"personal"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/usage":
+			_, _ = w.Write([]byte(`{"machines":3}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines":
+			_, _ = w.Write([]byte(`{"machines":[` +
+				`{"id":"m_stop","name":"vm-stop","state":"stopped","desiredState":"stopped","maxRunMinutes":480,"free":true},` +
+				`{"id":"m_pause","name":"vm-pause","state":"suspended","desiredState":"suspended","maxRunMinutes":480,"free":true},` +
+				`{"id":"m_cd","name":"vm-cd","state":"suspended","desiredState":"suspended","autoSuspendedAt":"` + autoSusp + `","cooldownUntil":"` + cdUntil + `","maxRunMinutes":480,"free":true}` +
+				`],"nextCursor":null}`))
+		case r.Method == http.MethodGet && (r.URL.Path == "/v1/machines/m_stop/usage" || r.URL.Path == "/v1/machines/m_pause/usage" || r.URL.Path == "/v1/machines/m_cd/usage"):
+			_, _ = w.Write([]byte(`{"runningSeconds":100}`))
+		case r.Method == http.MethodGet && (r.URL.Path == "/v1/machines/m_stop/metrics" || r.URL.Path == "/v1/machines/m_pause/metrics" || r.URL.Path == "/v1/machines/m_cd/metrics"):
+			_, _ = w.Write([]byte(`{"metrics":[]}`))
+		default:
+			actionCalls.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	hc := srv.Client()
+	hc.Transport = &rt{u: u, t: srv.Client().Transport}
+	client, _ := instabox.NewClient("https://api.instabox.sh", hc)
+
+	acc, _ := st.CreateAccount(context.Background(), store.AccountInput{Alias: "A", APIKey: "ibk_a...9", OrgTier: "free"})
+	_ = st.SyncAccountMachines(context.Background(), acc.ID, []store.MachineRecord{
+		{AccountID: acc.ID, MachineID: "m_stop", Name: "vm-stop", State: "running", DesiredState: "running", MaxRunMinutes: 480},
+		{AccountID: acc.ID, MachineID: "m_pause", Name: "vm-pause", State: "running", DesiredState: "running", MaxRunMinutes: 480},
+		{AccountID: acc.ID, MachineID: "m_cd", Name: "vm-cd", State: "running", DesiredState: "running", MaxRunMinutes: 480},
+	})
+	ctx := context.Background()
+	futureExp := time.Now().UTC().Add(50 * time.Minute).Unix()
+	for _, id := range []string{"m_stop", "m_pause", "m_cd"} {
+		if err := st.SetMachineKeepalive(ctx, acc.ID, id, true); err != nil {
+			t.Fatalf("SetMachineKeepalive(%s): %v", id, err)
+		}
+		if err := st.UpdateMachineKeepaliveState(ctx, acc.ID, id, futureExp, time.Now().Unix(), "lease_renewed", "stale err"); err != nil {
+			t.Fatalf("UpdateMachineKeepaliveState(%s): %v", id, err)
+		}
+	}
+
+	p := monitor.NewPoller(st, client, 30*time.Second, 7)
+	defer p.Stop()
+
+	if err := p.SyncAccount(ctx, acc.ID); err != nil {
+		t.Fatalf("SyncAccount err: %v", err)
+	}
+	if actionCalls.Load() != 0 {
+		t.Fatalf("expected 0 upstream keepalive action calls, got %d", actionCalls.Load())
+	}
+
+	stopRec, _ := st.GetMachine(ctx, acc.ID, "m_stop")
+	if stopRec.KeepaliveLeaseExpiresAt != 0 || stopRec.KeepaliveLastAction != "manual_paused" || stopRec.KeepaliveLastError != "" {
+		t.Fatalf("expected m_stop reconciled to manual_paused with lease=0, got %+v", stopRec)
+	}
+	pauseRec, _ := st.GetMachine(ctx, acc.ID, "m_pause")
+	if pauseRec.KeepaliveLeaseExpiresAt != 0 || pauseRec.KeepaliveLastAction != "manual_paused" || pauseRec.KeepaliveLastError != "" {
+		t.Fatalf("expected m_pause reconciled to manual_paused with lease=0, got %+v", pauseRec)
+	}
+	cdRec, _ := st.GetMachine(ctx, acc.ID, "m_cd")
+	if cdRec.KeepaliveLeaseExpiresAt != 0 || cdRec.KeepaliveLastAction != "cooldown_wait" || cdRec.KeepaliveLastError != "" {
+		t.Fatalf("expected m_cd reconciled to cooldown_wait with lease=0, got %+v", cdRec)
+	}
+}
+
+func TestKeepaliveWakeDoesNotFallbackToResumeOnTransitionAndMapsResumeCooldown(t *testing.T) {
+	dir := t.TempDir()
+	key, _ := crypto.LoadOrCreateMasterKey(dir, "")
+	st, _ := store.Open(filepath.Join(dir, "mon.db"), key)
+	t.Cleanup(func() { _ = st.Close() })
+
+	autoSusp := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)
+	cdUntil := time.Now().UTC().Add(10 * time.Minute).Format(time.RFC3339)
+
+	type vmSim struct {
+		state           string
+		autoSuspendedAt string
+		cooldownUntil   string
+		afterWakeState  string
+		afterWakeAuto   string
+		afterWakeCD     string
+		resumeCooldown  bool
+	}
+	vms := map[string]*vmSim{
+		"m_to_stopped": {
+			state:           "suspended",
+			autoSuspendedAt: autoSusp,
+			afterWakeState:  "stopped",
+		},
+		"m_to_manual": {
+			state:           "suspended",
+			autoSuspendedAt: autoSusp,
+			afterWakeState:  "suspended",
+			afterWakeAuto:   "",
+		},
+		"m_to_cooldown": {
+			state:           "suspended",
+			autoSuspendedAt: autoSusp,
+			afterWakeState:  "suspended",
+			afterWakeAuto:   autoSusp,
+			afterWakeCD:     cdUntil,
+		},
+		"m_resume_cd": {
+			state:           "suspended",
+			autoSuspendedAt: autoSusp,
+			afterWakeState:  "suspended",
+			afterWakeAuto:   autoSusp,
+			resumeCooldown:  true,
+		},
+	}
+
+	var mu sync.Mutex
+	var events []string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
+		mu.Lock()
+		defer mu.Unlock()
+		for id, v := range vms {
+			base := "/v1/machines/" + id
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == base:
+				_, _ = w.Write([]byte(`{"id":"` + id + `","name":"` + id + `","state":"` + v.state + `","desiredState":"` + v.state + `","autoSuspendedAt":"` + v.autoSuspendedAt + `","cooldownUntil":"` + v.cooldownUntil + `","maxRunMinutes":480,"free":true}`))
+				return
+			case r.Method == http.MethodPost && r.URL.Path == base+"/wake":
+				events = append(events, "wake:"+id)
+				v.state = v.afterWakeState
+				v.autoSuspendedAt = v.afterWakeAuto
+				v.cooldownUntil = v.afterWakeCD
+				_, _ = w.Write([]byte(`{"id":"` + id + `","name":"` + id + `","state":"suspended","desiredState":"running","autoSuspendedAt":"` + autoSusp + `"}`))
+				return
+			case r.Method == http.MethodPost && r.URL.Path == base+"/resume":
+				events = append(events, "resume:"+id)
+				if v.resumeCooldown {
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = w.Write([]byte(`{"error":{"code":"machine_cooldown","message":"machine in cooldown"}}`))
+					return
+				}
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte(`{"id":"op_res","machineId":"` + id + `","state":"succeeded"}`))
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	hc := srv.Client()
+	hc.Transport = &rt{u: u, t: srv.Client().Transport}
+	client, _ := instabox.NewClient("https://api.instabox.sh", hc)
+
+	acc, _ := st.CreateAccount(context.Background(), store.AccountInput{Alias: "A", APIKey: "ibk_a...9", OrgTier: "free"})
+	var recs []store.MachineRecord
+	for id := range vms {
+		recs = append(recs, store.MachineRecord{
+			AccountID: acc.ID, MachineID: id, Name: id, State: "suspended", DesiredState: "suspended", AutoSuspendedAt: autoSusp, MaxRunMinutes: 480,
+		})
+	}
+	_ = st.SyncAccountMachines(context.Background(), acc.ID, recs)
+	ctx := context.Background()
+	for id := range vms {
+		if err := st.SetMachineKeepalive(ctx, acc.ID, id, true); err != nil {
+			t.Fatalf("SetMachineKeepalive(%s): %v", id, err)
+		}
+	}
+
+	p := monitor.NewPoller(st, client, 30*time.Second, 7)
+	p.SetKeepalivePollDelay(time.Millisecond)
+	defer p.Stop()
+
+	for _, id := range []string{"m_to_stopped", "m_to_manual", "m_to_cooldown", "m_resume_cd"} {
+		if err := p.RunKeepaliveCycle(ctx, acc.ID, id, false); err != nil {
+			t.Fatalf("RunKeepaliveCycle(%s) unexpected error: %v", id, err)
+		}
+	}
+
+	mu.Lock()
+	gotEvents := append([]string(nil), events...)
+	mu.Unlock()
+	wantEvents := []string{
+		"wake:m_to_stopped",
+		"wake:m_to_manual",
+		"wake:m_to_cooldown",
+		"wake:m_resume_cd",
+		"resume:m_resume_cd",
+	}
+	if len(gotEvents) != len(wantEvents) {
+		t.Fatalf("events mismatch:\n got: %v\nwant: %v", gotEvents, wantEvents)
+	}
+	for i := range wantEvents {
+		if gotEvents[i] != wantEvents[i] {
+			t.Fatalf("event[%d] mismatch: got %q want %q (all=%v)", i, gotEvents[i], wantEvents[i], gotEvents)
+		}
+	}
+
+	rStopped, _ := st.GetMachine(ctx, acc.ID, "m_to_stopped")
+	if rStopped.KeepaliveLastAction != "manual_paused" || rStopped.KeepaliveLeaseExpiresAt != 0 {
+		t.Fatalf("expected m_to_stopped -> manual_paused, got %+v", rStopped)
+	}
+	rManual, _ := st.GetMachine(ctx, acc.ID, "m_to_manual")
+	if rManual.KeepaliveLastAction != "manual_paused" || rManual.KeepaliveLeaseExpiresAt != 0 {
+		t.Fatalf("expected m_to_manual -> manual_paused, got %+v", rManual)
+	}
+	rCD, _ := st.GetMachine(ctx, acc.ID, "m_to_cooldown")
+	if rCD.KeepaliveLastAction != "cooldown_wait" || rCD.KeepaliveLeaseExpiresAt != 0 {
+		t.Fatalf("expected m_to_cooldown -> cooldown_wait, got %+v", rCD)
+	}
+	rResCD, _ := st.GetMachine(ctx, acc.ID, "m_resume_cd")
+	if rResCD.KeepaliveLastAction != "cooldown_wait" || rResCD.KeepaliveLastError != "" || rResCD.KeepaliveLeaseExpiresAt != 0 {
+		t.Fatalf("expected m_resume_cd -> cooldown_wait without error, got %+v", rResCD)
+	}
+}
+
+func TestKeepaliveLeaseRenewalUsesUpstreamClockUnderHostClockSkew(t *testing.T) {
+	runCase := func(t *testing.T, skew time.Duration, leaseTTLRemaining time.Duration, expectRenew bool) {
+		t.Helper()
+		dir := t.TempDir()
+		key, _ := crypto.LoadOrCreateMasterKey(dir, "")
+		st, _ := store.Open(filepath.Join(dir, "mon.db"), key)
+		t.Cleanup(func() { _ = st.Close() })
+
+		upstreamBase := time.Now().UTC().Add(skew)
+		runStarted := upstreamBase.Add(-5 * time.Minute).Format(time.RFC3339)
+
+		var putCount atomic.Int32
+		putCh := make(chan struct{}, 4)
+
+		srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Date", upstreamBase.Format(http.TimeFormat))
+			switch {
+			case r.Method == http.MethodGet && r.URL.Path == "/v1/me":
+				_, _ = w.Write([]byte(`{"userId":1,"login":"u","org":{"id":"org_1","name":"P","tier":"free","kind":"personal"}}`))
+			case r.Method == http.MethodGet && r.URL.Path == "/v1/usage":
+				_, _ = w.Write([]byte(`{"machines":1}`))
+			case r.Method == http.MethodGet && r.URL.Path == "/v1/machines":
+				_, _ = w.Write([]byte(`{"machines":[{"id":"m_skew","name":"vm-skew","state":"running","desiredState":"running","runStartedAt":"` + runStarted + `","maxRunMinutes":480,"free":true}],"nextCursor":null}`))
+			case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_skew":
+				_, _ = w.Write([]byte(`{"id":"m_skew","name":"vm-skew","state":"running","desiredState":"running","runStartedAt":"` + runStarted + `","maxRunMinutes":480,"free":true}`))
+			case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_skew/usage":
+				_, _ = w.Write([]byte(`{"runningSeconds":300}`))
+			case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_skew/metrics":
+				_, _ = w.Write([]byte(`{"metrics":[]}`))
+			case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_skew/disk":
+				_, _ = w.Write([]byte(`{"measuredAt":"2026-11-13T12:00:00Z","filesystems":[]}`))
+			case r.Method == http.MethodPut && r.URL.Path == "/v1/machines/m_skew/activity-leases/ibmon-keepalive":
+				n := putCount.Add(1)
+				exp := upstreamBase.Add(leaseTTLRemaining).Format(time.RFC3339)
+				if n > 1 {
+					exp = upstreamBase.Add(time.Hour).Format(time.RFC3339)
+				}
+				_, _ = w.Write([]byte(`{"id":"ibmon-keepalive","machineId":"m_skew","expiresAt":"` + exp + `"}`))
+				select {
+				case putCh <- struct{}{}:
+				default:
+				}
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		defer srv.Close()
+
+		u, _ := url.Parse(srv.URL)
+		hc := srv.Client()
+		hc.Transport = &rt{u: u, t: srv.Client().Transport}
+		client, _ := instabox.NewClient("https://api.instabox.sh", hc)
+
+		acc, _ := st.CreateAccount(context.Background(), store.AccountInput{Alias: "A", APIKey: "ibk_a...9", OrgTier: "free"})
+		_ = st.SyncAccountMachines(context.Background(), acc.ID, []store.MachineRecord{
+			{AccountID: acc.ID, MachineID: "m_skew", Name: "vm-skew", State: "running", DesiredState: "running", RunStartedAt: runStarted, MaxRunMinutes: 480},
+		})
+		ctx := context.Background()
+		if err := st.SetMachineKeepalive(ctx, acc.ID, "m_skew", true); err != nil {
+			t.Fatalf("SetMachineKeepalive: %v", err)
+		}
+
+		p := monitor.NewPoller(st, client, 30*time.Second, 7)
+		p.SetKeepalivePollDelay(time.Millisecond)
+		defer p.Stop()
+
+		// 1. Prime clockOffsetMs via SyncAccount (first sync sees runChanged -> puts initial lease expiring at upstreamBase + leaseTTLRemaining).
+		if err := p.SyncAccount(ctx, acc.ID); err != nil {
+			t.Fatalf("initial SyncAccount: %v", err)
+		}
+		select {
+		case <-putCh:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for initial PutActivityLease")
+		}
+		// Wait for UpdateMachineKeepaliveState after initial PutActivityLease
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			rec, _ := st.GetMachine(ctx, acc.ID, "m_skew")
+			if rec.KeepaliveLeaseExpiresAt > 0 {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+
+		// 2. Second SyncAccount checks KeepaliveLeaseExpiresAt against upstreamNow().
+		if err := p.SyncAccount(ctx, acc.ID); err != nil {
+			t.Fatalf("second SyncAccount: %v", err)
+		}
+		if expectRenew {
+			select {
+			case <-putCh:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("expected lease renewal when upstream clock is %v skewed and %v left on lease", skew, leaseTTLRemaining)
+			}
+		} else {
+			time.Sleep(50 * time.Millisecond)
+			if putCount.Load() != 1 {
+				t.Fatalf("expected NO premature lease renewal when upstream clock is %v skewed and %v left on lease, got %d puts", skew, leaseTTLRemaining, putCount.Load())
+			}
+		}
+	}
+
+	t.Run("upstream_ahead_needs_renewal", func(t *testing.T) {
+		runCase(t, 2*time.Hour, 30*time.Minute, true)
+	})
+	t.Run("upstream_behind_skips_premature_renewal", func(t *testing.T) {
+		runCase(t, -2*time.Hour, 55*time.Minute, false)
+	})
+}

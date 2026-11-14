@@ -239,13 +239,13 @@ select:focus-visible,
 
 /* Minimal Floating Corner Header (CLIProxyAPI-inspired) */
 .topbar {
-  padding-inline: max(1rem, env(safe-area-inset-left, 0px));
-  padding-block: 0.85rem 0.25rem;
+  padding-block: 0.72rem 0.1rem;
 }
 
 .topbar-inner {
   max-inline-size: 1420px;
   margin-inline: auto;
+  padding-inline: max(1rem, env(safe-area-inset-left, 0px));
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -653,19 +653,75 @@ select:focus-visible,
   font-size: 0.86rem;
   display: inline-flex;
   align-items: center;
-  gap: 0.35rem;
+  gap: 0.45rem;
   cursor: pointer;
   white-space: nowrap;
-  transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.1s ease;
+  transition: background-color 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease, translate 0.15s ease-out, scale 0.12s ease-out;
 }
 
-.btn-ghost-link:hover {
+.btn-ghost-link:hover:not(:disabled) {
   background: var(--surface-2);
-  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  box-shadow: 0 4px 14px rgba(37, 99, 235, 0.12);
+  translate: 0 -1px;
 }
 
-.btn-ghost-link:active {
-  transform: scale(0.98);
+.btn-ghost-link:active:not(:disabled) {
+  scale: 0.97;
+  translate: 0 0;
+}
+
+.btn-sync-icon {
+  inline-size: 16px;
+  block-size: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  transition: rotate 0.28s ease-out;
+}
+
+.btn-sync:hover:not([data-syncing="true"]) .btn-sync-icon {
+  rotate: 45deg;
+}
+
+.btn-sync[data-syncing="true"] {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  color: var(--accent);
+  cursor: progress;
+}
+
+.btn-sync[data-syncing="true"] .btn-sync-icon {
+  --sync-spin-duration: 0.85s;
+  animation: ib-sync-spin var(--sync-spin-duration) linear infinite;
+}
+
+.btn-sync[data-sync-done="true"] {
+  border-color: var(--ok-border);
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+@keyframes ib-sync-spin {
+  to {
+    rotate: 1turn;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn-ghost-link:hover:not(:disabled) {
+    translate: none;
+  }
+  .btn-ghost-link:active:not(:disabled) {
+    scale: 1;
+  }
+  .btn-sync:hover:not([data-syncing="true"]) .btn-sync-icon {
+    rotate: 0deg;
+  }
+  .btn-sync[data-syncing="true"] .btn-sync-icon {
+    --sync-spin-duration: 6s;
+  }
 }
 
 .btn-danger {
@@ -713,14 +769,14 @@ select:focus-visible,
 .main-wrap {
   max-inline-size: 1420px;
   margin-inline: auto;
-  padding: 0.7rem max(1rem, env(safe-area-inset-left, 0px)) max(3rem, env(safe-area-inset-bottom, 0px));
+  padding: 0.45rem max(1rem, env(safe-area-inset-left, 0px)) max(3rem, env(safe-area-inset-bottom, 0px));
 }
 
 /* Status Hero Header (CLIProxyAPI editorial style) */
 .dashboard-hero {
   display: flex;
   flex-wrap: wrap;
-  align-items: flex-end;
+  align-items: center;
   justify-content: space-between;
   gap: 0.9rem 1.5rem;
   margin-block: 0.45rem 1.25rem;
@@ -731,6 +787,27 @@ select:focus-visible,
   flex-direction: column;
   gap: 0.35rem;
   min-inline-size: 0;
+}
+
+.hero-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.82rem;
+  min-inline-size: 0;
+}
+
+.hero-brand-logo {
+  inline-size: 40px;
+  block-size: 40px;
+  flex: none;
+  display: block;
+}
+
+.hero-brand-title {
+  font-size: clamp(1.45rem, 1.15rem + 1.1vw, 1.95rem);
+  font-weight: 700;
+  letter-spacing: -0.028em;
+  line-height: 1.1;
 }
 
 .hero-title {
@@ -754,6 +831,16 @@ select:focus-visible,
   flex-wrap: wrap;
   align-items: center;
   gap: 0.65rem;
+}
+
+@media (max-width: 639px) {
+  .hero-actions {
+    inline-size: 100%;
+  }
+  .hero-actions > button {
+    flex: 1 1 auto;
+    justify-content: center;
+  }
 }
 
 /* Auth Shell */
@@ -1161,6 +1248,24 @@ select:focus-visible,
     gap: 0.72rem;
   }
 
+  .vm-container-cards .vm-head {
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: center;
+  }
+
+  .vm-container-cards .vm-keepalive-toggle {
+    grid-column: 2;
+    grid-row: 1;
+    justify-self: end;
+    align-self: center;
+  }
+
+  .vm-container-cards .vm-head > .badge {
+    grid-column: 3;
+    grid-row: 1;
+    align-self: center;
+  }
+
   .vm-container-cards .vm-title-block {
     display: flex;
     flex-wrap: wrap;
@@ -1222,11 +1327,157 @@ select:focus-visible,
 }
 
 .vm-head {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 0.6rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 0.48rem 0.65rem;
   min-inline-size: 0;
+}
+
+.vm-head > .badge {
+  grid-column: 2;
+  grid-row: 1;
+  justify-self: end;
+  align-self: start;
+}
+
+.vm-keepalive-toggle {
+  grid-column: 1 / -1;
+  grid-row: 2;
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.52rem;
+  min-block-size: 44px;
+  padding: 0.25rem 0.72rem;
+  border-radius: 0.68rem;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+  max-inline-size: 100%;
+  transition: background-color 0.14s ease, border-color 0.14s ease, opacity 0.14s ease;
+}
+
+.vm-keepalive-toggle:hover {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+}
+
+.vm-keepalive-toggle[data-active="true"] {
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+  border-color: color-mix(in srgb, var(--accent) 44%, var(--border));
+}
+
+.vm-keepalive-toggle[data-busy="true"] {
+  opacity: 0.65;
+  cursor: wait;
+}
+
+.vm-keepalive-input {
+  accent-color: var(--accent);
+  inline-size: 1.2em;
+  aspect-ratio: 1;
+  margin: 0;
+  cursor: pointer;
+  flex: none;
+}
+
+.vm-keepalive-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.vm-keepalive-input:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.vm-keepalive-text {
+  line-height: 1.25;
+  white-space: nowrap;
+}
+
+.vm-keepalive-meta {
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 0.1rem 0.42rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.vm-keepalive-meta[data-tone="ok"] {
+  color: var(--ok);
+  border-color: var(--ok-border);
+  background: var(--ok-soft);
+}
+
+.vm-keepalive-meta[data-tone="warn"] {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 40%, transparent);
+}
+
+.vm-keepalive-meta[data-tone="error"] {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+}
+
+@supports not (accent-color: #2563eb) {
+  .vm-keepalive-input {
+    position: absolute !important;
+    clip-path: inset(50%) !important;
+    overflow: hidden !important;
+    width: 1px !important;
+    height: 1px !important;
+    margin: -1px !important;
+    padding: 0 !important;
+    border: 0 !important;
+    white-space: nowrap !important;
+  }
+
+  .vm-keepalive-toggle {
+    position: relative;
+    padding-inline-start: 2.1rem;
+  }
+
+  .vm-keepalive-input + .vm-keepalive-text::before {
+    content: "";
+    position: absolute;
+    inset-inline-start: 0.65rem;
+    inset-block-start: 50%;
+    transform: translateY(-50%);
+    inline-size: 1.05rem;
+    block-size: 1.05rem;
+    border: 2px solid var(--muted);
+    border-radius: 4px;
+    background: var(--surface);
+  }
+
+  .vm-keepalive-input:focus-visible + .vm-keepalive-text::before {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .vm-keepalive-input:checked + .vm-keepalive-text::before {
+    background-color: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .vm-keepalive-input:checked + .vm-keepalive-text::after {
+    content: "✓";
+    position: absolute;
+    inset-inline-start: 0.82rem;
+    inset-block-start: 50%;
+    transform: translateY(-50%);
+    color: var(--accent-ink);
+    font-weight: 700;
+    font-size: 0.78rem;
+  }
 }
 
 .vm-identity {

@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/crypto"
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/store"
+	_ "modernc.org/sqlite"
 )
 
 func newTestStore(t *testing.T) (*store.Store, []byte) {
@@ -167,5 +169,173 @@ func TestAccountsEncryptedKeyStorageAndMachinesMetricsCascade(t *testing.T) {
 	samplesAfter, err := st.GetMachineMetrics(ctx, acc.ID, "m_vm1", 0)
 	if err != nil || len(samplesAfter) != 0 {
 		t.Fatalf("expected 0 samples after cascade, got %d err=%v", len(samplesAfter), err)
+	}
+}
+
+func TestMachineKeepalivePersistenceAndLegacyMigration(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "legacy.db")
+	key, err := crypto.LoadOrCreateMasterKey(dir, "")
+	if err != nil {
+		t.Fatalf("master key: %v", err)
+	}
+
+	// Simulate an existing production database before keepalive columns were added.
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open legacy sqlite: %v", err)
+	}
+	_, err = rawDB.Exec(`
+		CREATE TABLE accounts (
+			id TEXT PRIMARY KEY,
+			alias TEXT NOT NULL,
+			key_enc TEXT NOT NULL,
+			key_mask TEXT NOT NULL,
+			instabox_user_id INTEGER NOT NULL DEFAULT 0,
+			instabox_login TEXT NOT NULL DEFAULT '',
+			org_id TEXT NOT NULL DEFAULT '',
+			org_name TEXT NOT NULL DEFAULT '',
+			org_tier TEXT NOT NULL DEFAULT '',
+			org_usage_json TEXT NOT NULL DEFAULT '',
+			enabled INTEGER NOT NULL DEFAULT 1,
+			last_sync_at INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		);
+		CREATE TABLE machines (
+			account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+			machine_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			state TEXT NOT NULL,
+			desired_state TEXT NOT NULL,
+			vcpus INTEGER NOT NULL DEFAULT 0,
+			mem_mib INTEGER NOT NULL DEFAULT 0,
+			persistent_disk_gib INTEGER NOT NULL DEFAULT 0,
+			root_disk_gib INTEGER NOT NULL DEFAULT 0,
+			template_id TEXT NOT NULL DEFAULT '',
+			free INTEGER NOT NULL DEFAULT 0,
+			ready INTEGER NOT NULL DEFAULT 0,
+			processes_preserved INTEGER NOT NULL DEFAULT 0,
+			auto_suspend_after_seconds INTEGER,
+			max_run_minutes INTEGER NOT NULL DEFAULT 0,
+			run_started_at TEXT NOT NULL DEFAULT '',
+			auto_suspended_at TEXT NOT NULL DEFAULT '',
+			cooldown_until TEXT NOT NULL DEFAULT '',
+			cooldown_reason TEXT NOT NULL DEFAULT '',
+			operation_id TEXT NOT NULL DEFAULT '',
+			monthly_running_seconds INTEGER NOT NULL DEFAULT 0,
+			last_error_code TEXT NOT NULL DEFAULT '',
+			last_error_msg TEXT NOT NULL DEFAULT '',
+			disk_json TEXT NOT NULL DEFAULT '',
+			raw_json TEXT NOT NULL DEFAULT '',
+			updated_at INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (account_id, machine_id)
+		);
+		INSERT INTO accounts(id, alias, key_enc, key_mask, created_at, updated_at) VALUES ('acc_old', 'Legacy', 'enc', 'ibk_****1234', 100, 100);
+		INSERT INTO machines(account_id, machine_id, name, state, desired_state) VALUES ('acc_old', 'm_old', 'legacy-box', 'running', 'running');
+	`)
+	_ = rawDB.Close()
+	if err != nil {
+		t.Fatalf("seed legacy schema: %v", err)
+	}
+
+	st, err := store.Open(dbPath, key)
+	if err != nil {
+		t.Fatalf("store.Open legacy db: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	ctx := context.Background()
+	m, err := st.GetMachine(ctx, "acc_old", "m_old")
+	if err != nil || m.KeepaliveEnabled {
+		t.Fatalf("expected legacy machine migrated with keepalive=false, got err=%v m=%+v", err, m)
+	}
+
+	if !errors.Is(st.SetMachineKeepalive(ctx, "acc_old", "missing", true), store.ErrMachineNotFound) {
+		t.Fatalf("expected ErrMachineNotFound for missing machine")
+	}
+
+	if err := st.SetMachineKeepalive(ctx, "acc_old", "m_old", true); err != nil {
+		t.Fatalf("SetMachineKeepalive(true): %v", err)
+	}
+	if err := st.UpdateMachineKeepaliveState(ctx, "acc_old", "m_old", 1794624000, 1794620400, "lease_renewed", ""); err != nil {
+		t.Fatalf("UpdateMachineKeepaliveState: %v", err)
+	}
+
+	// SyncAccountMachines must NOT reset keepalive settings or status.
+	err = st.SyncAccountMachines(ctx, "acc_old", []store.MachineRecord{
+		{AccountID: "acc_old", MachineID: "m_old", Name: "legacy-box", State: "running", DesiredState: "running"},
+	})
+	if err != nil {
+		t.Fatalf("SyncAccountMachines: %v", err)
+	}
+
+	m, err = st.GetMachine(ctx, "acc_old", "m_old")
+	if err != nil || !m.KeepaliveEnabled || m.KeepaliveLeaseExpiresAt != 1794624000 || m.KeepaliveLastAction != "lease_renewed" {
+		t.Fatalf("expected keepalive preserved across sync, got err=%v m=%+v", err, m)
+	}
+
+	if err := st.SetMachineKeepalive(ctx, "acc_old", "m_old", false); err != nil {
+		t.Fatalf("SetMachineKeepalive(false): %v", err)
+	}
+	m, err = st.GetMachine(ctx, "acc_old", "m_old")
+	if err != nil || m.KeepaliveEnabled || m.KeepaliveLeaseExpiresAt != 0 || m.KeepaliveLastAction != "" {
+		t.Fatalf("expected keepalive cleared after disable, got err=%v m=%+v", err, m)
+	}
+
+	// UpdateMachineKeepaliveState MUST be fenced when keepalive_enabled=0.
+	if err := st.UpdateMachineKeepaliveState(ctx, "acc_old", "m_old", 1794699999, 1794690000, "lease_renewed", "stale_err"); err != nil {
+		t.Fatalf("UpdateMachineKeepaliveState when disabled: %v", err)
+	}
+	m, err = st.GetMachine(ctx, "acc_old", "m_old")
+	if err != nil || m.KeepaliveEnabled || m.KeepaliveLeaseExpiresAt != 0 || m.KeepaliveLastAt != 0 || m.KeepaliveLastAction != "" || m.KeepaliveLastError != "" {
+		t.Fatalf("expected UpdateMachineKeepaliveState ignored while disabled, got err=%v m=%+v", err, m)
+	}
+
+	// SetMachineKeepalivePendingRestart MUST be fenced when keepalive_enabled=0.
+	if err := st.SetMachineKeepalivePendingRestart(ctx, "acc_old", "m_old", true); err != nil {
+		t.Fatalf("SetMachineKeepalivePendingRestart(true) when disabled: %v", err)
+	}
+	m, err = st.GetMachine(ctx, "acc_old", "m_old")
+	if err != nil || m.KeepalivePendingRestart {
+		t.Fatalf("expected pending restart ignored while disabled, got err=%v m=%+v", err, m)
+	}
+
+	// Enable keepalive, set pending restart, verify preserved across SyncAccountMachines, cleared by false and disable.
+	if err := st.SetMachineKeepalive(ctx, "acc_old", "m_old", true); err != nil {
+		t.Fatalf("SetMachineKeepalive(true): %v", err)
+	}
+	if err := st.SetMachineKeepalivePendingRestart(ctx, "acc_old", "m_old", true); err != nil {
+		t.Fatalf("SetMachineKeepalivePendingRestart(true): %v", err)
+	}
+	err = st.SyncAccountMachines(ctx, "acc_old", []store.MachineRecord{
+		{AccountID: "acc_old", MachineID: "m_old", Name: "legacy-box", State: "stopped", DesiredState: "stopped"},
+	})
+	if err != nil {
+		t.Fatalf("SyncAccountMachines: %v", err)
+	}
+	m, err = st.GetMachine(ctx, "acc_old", "m_old")
+	if err != nil || !m.KeepalivePendingRestart {
+		t.Fatalf("expected keepalive_pending_restart preserved across sync, got err=%v m=%+v", err, m)
+	}
+	if err := st.SetMachineKeepalivePendingRestart(ctx, "acc_old", "m_old", false); err != nil {
+		t.Fatalf("SetMachineKeepalivePendingRestart(false): %v", err)
+	}
+	m, err = st.GetMachine(ctx, "acc_old", "m_old")
+	if err != nil || m.KeepalivePendingRestart {
+		t.Fatalf("expected keepalive_pending_restart cleared, got err=%v m=%+v", err, m)
+	}
+
+	// SetMachineKeepalive(false) must also clear pending restart.
+	if err := st.SetMachineKeepalivePendingRestart(ctx, "acc_old", "m_old", true); err != nil {
+		t.Fatalf("SetMachineKeepalivePendingRestart(true) again: %v", err)
+	}
+	if err := st.SetMachineKeepalive(ctx, "acc_old", "m_old", false); err != nil {
+		t.Fatalf("SetMachineKeepalive(false): %v", err)
+	}
+	m, err = st.GetMachine(ctx, "acc_old", "m_old")
+	if err != nil || m.KeepalivePendingRestart {
+		t.Fatalf("expected disable to clear pending restart, got err=%v m=%+v", err, m)
 	}
 }

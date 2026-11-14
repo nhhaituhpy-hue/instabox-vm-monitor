@@ -82,8 +82,20 @@ func setupTestServer(t *testing.T) (http.Handler, *store.Store) {
 		case "/v1/machines/m_1/stop":
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte(`{"id":"op_stop_1","machineId":"m_1","state":"succeeded"}`))
+		case "/v1/machines/m_1/activity-leases/ibmon-keepalive":
+			if r.Method == http.MethodPut {
+				_, _ = w.Write([]byte(`{"id":"ibmon-keepalive","machineId":"m_1","expiresAt":"2026-11-14T04:00:00Z"}`))
+				return
+			}
+			if r.Method == http.MethodDelete {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			w.WriteHeader(http.StatusMethodNotAllowed)
 		case "/v1/machines/m_1":
 			switch r.Method {
+			case http.MethodGet:
+				_, _ = w.Write([]byte(`{"id":"m_1","name":"vm-one","state":"running","desiredState":"running","spec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20,"rootDiskGiB":16},"storage":{"sizeGiB":20,"mountPath":"/data","persistent":true,"synced":true},"runtime":{"ready":true},"runStartedAt":"2026-11-13T10:00:00Z","maxRunMinutes":480,"free":true}`))
 			case http.MethodPatch:
 				var body map[string]string
 				_ = json.NewDecoder(r.Body).Decode(&body)
@@ -496,5 +508,103 @@ func TestRenameAndDeleteMachineEndpoints(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 on deleting removed machine, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMachineKeepaliveEndpoint(t *testing.T) {
+	h, _ := setupTestServer(t)
+
+	// Setup admin
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/setup", bytes.NewBufferString(`{"username":"admin","password":"SuperSecret!123"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	cookies := rec.Result().Cookies()
+	var setupResp struct {
+		CSRFToken string `json:"csrfToken"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &setupResp)
+
+	// Add account (populates m_1)
+	req = httptest.NewRequest(http.MethodPost, "/api/accounts", bytes.NewBufferString(`{"alias":"Box 1","apiKey":"ibk_valid_secret_key_9999"}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var accResp struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &accResp)
+
+	// Unauthenticated -> 401
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPatch, "/api/machines/"+accResp.ID+"/m_1/keepalive", bytes.NewBufferString(`{"enabled":true}`)))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauthenticated keepalive toggle, got %d", rec.Code)
+	}
+
+	// Missing CSRF -> 403
+	req = httptest.NewRequest(http.MethodPatch, "/api/machines/"+accResp.ID+"/m_1/keepalive", bytes.NewBufferString(`{"enabled":true}`))
+	req.AddCookie(cookies[0])
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 without CSRF, got %d", rec.Code)
+	}
+
+	// Missing enabled boolean -> 400
+	req = httptest.NewRequest(http.MethodPatch, "/api/machines/"+accResp.ID+"/m_1/keepalive", bytes.NewBufferString(`{}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when enabled is missing, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Wrong type for enabled -> 400
+	req = httptest.NewRequest(http.MethodPatch, "/api/machines/"+accResp.ID+"/m_1/keepalive", bytes.NewBufferString(`{"enabled":"true"}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 when enabled is not boolean, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Enable keepalive -> 200 with keepaliveEnabled: true
+	req = httptest.NewRequest(http.MethodPatch, "/api/machines/"+accResp.ID+"/m_1/keepalive", bytes.NewBufferString(`{"enabled":true}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"keepaliveEnabled":true`) {
+		t.Fatalf("expected 200 keepaliveEnabled=true, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Disable keepalive -> 200 with keepaliveEnabled: false
+	req = httptest.NewRequest(http.MethodPatch, "/api/machines/"+accResp.ID+"/m_1/keepalive", bytes.NewBufferString(`{"enabled":false}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"keepaliveEnabled":false`) {
+		t.Fatalf("expected 200 keepaliveEnabled=false, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Unknown machine -> 404
+	req = httptest.NewRequest(http.MethodPatch, "/api/machines/"+accResp.ID+"/m_missing/keepalive", bytes.NewBufferString(`{"enabled":true}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on unknown machine, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
