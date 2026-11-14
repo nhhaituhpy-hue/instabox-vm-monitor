@@ -3,6 +3,7 @@ package instabox
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/crypto"
+	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/ws"
 )
 
 type Action string
@@ -778,6 +780,90 @@ func (c *Client) GetOperation(ctx context.Context, apiKey, opID string, wait str
 		return nil, err
 	}
 	return &out, nil
+}
+
+type TerminalOptions struct {
+	Cols    int
+	Rows    int
+	Session string
+	Wake    string
+	Restart string
+}
+
+func (c *Client) dialTarget(u *url.URL) (string, *tls.Config) {
+	if c.http != nil && c.http.Transport != nil {
+		if ov, ok := c.http.Transport.(interface {
+			TerminalDialTarget() (string, *tls.Config)
+		}); ok {
+			if base, tlsCfg := ov.TerminalDialTarget(); base != "" {
+				if bu, err := url.Parse(base); err == nil {
+					cp := *u
+					switch strings.ToLower(bu.Scheme) {
+					case "https":
+						cp.Scheme = "wss"
+					case "http":
+						cp.Scheme = "ws"
+					default:
+						cp.Scheme = bu.Scheme
+					}
+					cp.Host = bu.Host
+					return cp.String(), tlsCfg
+				}
+			}
+		}
+		if tr, ok := c.http.Transport.(*http.Transport); ok && tr.TLSClientConfig != nil {
+			return u.String(), tr.TLSClientConfig
+		}
+	}
+	return u.String(), nil
+}
+
+func (c *Client) DialTerminal(ctx context.Context, apiKey, machineID string, opts TerminalOptions) (*ws.Conn, *APIError, error) {
+	u, err := url.Parse(c.baseURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		u.Scheme = "wss"
+	case "http":
+		u.Scheme = "ws"
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/v1/machines/" + url.PathEscape(machineID) + "/terminal"
+
+	q := url.Values{}
+	if opts.Cols >= 10 && opts.Cols <= 1000 {
+		q.Set("cols", strconv.Itoa(opts.Cols))
+	}
+	if opts.Rows >= 4 && opts.Rows <= 500 {
+		q.Set("rows", strconv.Itoa(opts.Rows))
+	}
+	if sess := strings.TrimSpace(opts.Session); sess != "" {
+		q.Set("session", sess)
+	}
+	if opts.Wake == "0" {
+		q.Set("wake", "0")
+	}
+	if opts.Restart == "1" {
+		q.Set("restart", "1")
+	}
+	u.RawQuery = q.Encode()
+
+	hdr := http.Header{}
+	hdr.Set("X-API-Key", apiKey)
+	hdr.Set("User-Agent", "instabox-vm-monitor/1.0")
+
+	targetURL, tlsCfg := c.dialTarget(u)
+	conn, err := ws.DialContext(ctx, targetURL, hdr, nil, tlsCfg)
+	if err != nil {
+		var he *ws.HandshakeError
+		if errors.As(err, &he) {
+			apiErr := decodeUpstreamError(he.StatusCode, he.Body)
+			return nil, apiErr, apiErr
+		}
+		return nil, nil, err
+	}
+	return conn, nil, nil
 }
 
 func (c *Client) PerformAction(ctx context.Context, apiKey, machineID string, action Action) (*ActionResult, error) {

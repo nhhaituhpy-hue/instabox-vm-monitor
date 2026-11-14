@@ -2,6 +2,8 @@ package api_test
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -16,11 +18,19 @@ import (
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/instabox"
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/monitor"
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/store"
+	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/ws"
 )
 
 type reroute struct {
 	u *url.URL
 	t http.RoundTripper
+}
+
+func (r *reroute) TerminalDialTarget() (string, *tls.Config) {
+	if tr, ok := r.t.(*http.Transport); ok {
+		return r.u.String(), tr.TLSClientConfig
+	}
+	return r.u.String(), nil
 }
 
 func (r *reroute) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -82,6 +92,31 @@ func setupTestServer(t *testing.T) (http.Handler, *store.Store) {
 		case "/v1/machines/m_1/stop":
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte(`{"id":"op_stop_1","machineId":"m_1","state":"succeeded"}`))
+		case "/v1/machines/m_1/terminal":
+			if r.URL.Query().Get("wake") == "0" {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`{"error":{"code":"machine_not_running","message":"machine is suspended"}}`))
+				return
+			}
+			up, err := ws.Upgrade(w, r, nil)
+			if err != nil {
+				return
+			}
+			defer up.Close()
+			sess := r.URL.Query().Get("session")
+			if sess == "" {
+				sess = "main"
+			}
+			_ = up.WriteMessage(ws.OpText, []byte(`{"type":"session","session":"`+sess+`","persistent":true}`))
+			for {
+				op, data, err := up.ReadMessage()
+				if err != nil {
+					return
+				}
+				if err := up.WriteMessage(op, data); err != nil {
+					return
+				}
+			}
 		case "/v1/machines/m_1/activity-leases/ibmon-keepalive":
 			if r.Method == http.MethodPut {
 				_, _ = w.Write([]byte(`{"id":"ibmon-keepalive","machineId":"m_1","expiresAt":"2026-11-14T04:00:00Z"}`))
@@ -735,5 +770,134 @@ func TestAPIKeysMCPAuthAndGatedDeleteOverHTTP(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expected 401 after key revocation, got %d", rec.Code)
+	}
+}
+
+func TestMachineTerminalWebSocketProxyAndOriginChecks(t *testing.T) {
+	h, _ := setupTestServer(t)
+
+	// Setup admin session
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/setup", bytes.NewBufferString(`{"username":"admin","password":"SuperSecret!123"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	cookies := rec.Result().Cookies()
+	var setupResp struct {
+		CSRFToken string `json:"csrfToken"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &setupResp)
+
+	// Create API key (must be rejected on browser terminal WS)
+	req = httptest.NewRequest(http.MethodPost, "/api/api-keys", bytes.NewBufferString(`{"name":"Hermes"}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var keyResp struct {
+		Token string `json:"token"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &keyResp)
+
+	// Add account (populates m_1)
+	req = httptest.NewRequest(http.MethodPost, "/api/accounts", bytes.NewBufferString(`{"alias":"Box 1","apiKey":"ibk_valid_secret_key_9999"}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var accResp struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &accResp)
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	termURL := srv.URL + "/api/machines/" + accResp.ID + "/m_1/terminal?cols=100&rows=30&session=dev-1"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// 1. Unauthenticated -> 401
+	_, err := ws.DialContext(ctx, termURL, http.Header{"Origin": {srv.URL}}, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "401") {
+		t.Fatalf("expected HTTP 401 for unauthenticated WS, got %v", err)
+	}
+
+	// 2. Bearer API key -> 403 session_required
+	_, err = ws.DialContext(ctx, termURL, http.Header{
+		"Origin":        {srv.URL},
+		"Authorization": {"Bearer " + keyResp.Token},
+	}, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("expected HTTP 403 for API key on WS terminal, got %v", err)
+	}
+
+	// 3. Cross-origin Origin header -> 403 origin_forbidden
+	cookieHeader := cookies[0].Name + "=" + cookies[0].Value
+	_, err = ws.DialContext(ctx, termURL, http.Header{
+		"Origin": {"https://evil.example"},
+		"Cookie": {cookieHeader},
+	}, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("expected HTTP 403 for cross-origin WS, got %v", err)
+	}
+
+	// 4. Invalid session name -> 400
+	badURL := srv.URL + "/api/machines/" + accResp.ID + "/m_1/terminal?session=BAD_SESSION!"
+	_, err = ws.DialContext(ctx, badURL, http.Header{
+		"Origin": {srv.URL},
+		"Cookie": {cookieHeader},
+	}, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "400") {
+		t.Fatalf("expected HTTP 400 for invalid session, got %v", err)
+	}
+
+	// 5. Valid same-origin session WS -> relays session banner, binary bytes, and resize control
+	conn, err := ws.DialContext(ctx, termURL, http.Header{
+		"Origin": {srv.URL},
+		"Cookie": {cookieHeader},
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("dial terminal WS: %v", err)
+	}
+	defer conn.Close()
+
+	op, msg, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read initial session msg: %v", err)
+	}
+	if op != ws.OpText || !strings.Contains(string(msg), `"session":"dev-1"`) {
+		t.Fatalf("expected session=dev-1 banner, got op=%d msg=%q", op, string(msg))
+	}
+
+	if err := conn.WriteMessage(ws.OpBinary, []byte("uname -a\r")); err != nil {
+		t.Fatalf("write binary: %v", err)
+	}
+	op, echoed, err := conn.ReadMessage()
+	if err != nil || op != ws.OpBinary || string(echoed) != "uname -a\r" {
+		t.Fatalf("binary echo mismatch: op=%d echoed=%q err=%v", op, string(echoed), err)
+	}
+
+	if err := conn.WriteMessage(ws.OpText, []byte(`{"type":"resize","cols":132,"rows":40}`)); err != nil {
+		t.Fatalf("write resize: %v", err)
+	}
+	op, ctrlEcho, err := conn.ReadMessage()
+	if err != nil || op != ws.OpText || !strings.Contains(string(ctrlEcho), `"cols":132`) {
+		t.Fatalf("resize echo mismatch: op=%d ctrl=%q err=%v", op, string(ctrlEcho), err)
+	}
+
+	// 6. Upstream 409 surfaces as structured JSON error frame over WS
+	errConn, err := ws.DialContext(ctx, termURL+"&wake=0", http.Header{
+		"Origin": {srv.URL},
+		"Cookie": {cookieHeader},
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("dial error case WS: %v", err)
+	}
+	defer errConn.Close()
+	op, errFrame, err := errConn.ReadMessage()
+	if err != nil || op != ws.OpText || !strings.Contains(string(errFrame), `"machine_not_running"`) {
+		t.Fatalf("expected machine_not_running error frame, got op=%d msg=%q err=%v", op, string(errFrame), err)
 	}
 }

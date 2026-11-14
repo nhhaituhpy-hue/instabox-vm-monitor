@@ -11,6 +11,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"path"
 	"sort"
 	"strconv"
@@ -24,6 +25,7 @@ import (
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/monitor"
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/store"
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/web"
+	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/ws"
 )
 
 const (
@@ -71,6 +73,7 @@ func NewRouter(st *store.Store, client *instabox.Client, poller *monitor.Poller,
 	mux.HandleFunc("GET /css/", s.handleStaticDir)
 	mux.HandleFunc("GET /js/", s.handleStaticDir)
 	mux.HandleFunc("GET /assets/", s.handleStaticDir)
+	mux.HandleFunc("GET /vendor/", s.handleStaticDir)
 
 	mux.HandleFunc("GET /api/auth/status", s.handleAuthStatus)
 	mux.HandleFunc("POST /api/auth/setup", s.withFetchMetadata(s.handleAuthSetup))
@@ -110,6 +113,7 @@ func NewRouter(st *store.Store, client *instabox.Client, poller *monitor.Poller,
 	mux.HandleFunc("GET /api/machines/{accountId}/{machineId}/connection-info", s.withAuth(false, s.handleConnectionInfo))
 	mux.HandleFunc("POST /api/machines/{accountId}/{machineId}/snapshots", s.withAuth(true, s.handleCreateSnapshot))
 	mux.HandleFunc("POST /api/machines/{accountId}/{machineId}/restore", s.withAuth(true, s.handleRestoreMachine))
+	mux.HandleFunc("GET /api/machines/{accountId}/{machineId}/terminal", s.withSessionAuth(false, s.handleMachineTerminal))
 
 	mux.HandleFunc("POST /mcp", s.withAuth(false, s.mcpHandler.ServeHTTP))
 	mux.HandleFunc("GET /mcp", s.withAuth(false, s.mcpHandler.ServeHTTP))
@@ -200,13 +204,21 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	connectSrc := "'self'"
+	if host := requestOriginHost(r); host != "" && !strings.ContainsAny(host, " ;\r\n") {
+		wsScheme := "ws://"
+		if isHTTPS(r) {
+			wsScheme = "wss://"
+		}
+		connectSrc += " " + wsScheme + host
+	}
 	csp := strings.Join([]string{
 		"default-src 'self'",
 		"script-src 'self' 'nonce-" + nonce + "'",
 		"style-src 'self' https://fonts.googleapis.com 'unsafe-inline'",
 		"font-src 'self' https://fonts.gstatic.com",
 		"img-src 'self' data: https:",
-		"connect-src 'self'",
+		"connect-src " + connectSrc,
 		"object-src 'none'",
 		"base-uri 'none'",
 		"frame-ancestors 'none'",
@@ -1178,6 +1190,162 @@ func (s *Server) handleGetOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, op)
+}
+
+func (s *Server) handleMachineTerminal(w http.ResponseWriter, r *http.Request) {
+	if !isSameOriginWebSocket(r) {
+		writeError(w, http.StatusForbidden, "origin_forbidden", "cross-origin WebSocket rejected")
+		return
+	}
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+
+	cols := 80
+	if rawCols := strings.TrimSpace(r.URL.Query().Get("cols")); rawCols != "" {
+		v, err := strconv.Atoi(rawCols)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_cols", "cols must be an integer")
+			return
+		}
+		if v < 10 {
+			v = 10
+		} else if v > 1000 {
+			v = 1000
+		}
+		cols = v
+	}
+	rows := 24
+	if rawRows := strings.TrimSpace(r.URL.Query().Get("rows")); rawRows != "" {
+		v, err := strconv.Atoi(rawRows)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid_rows", "rows must be an integer")
+			return
+		}
+		if v < 4 {
+			v = 4
+		} else if v > 500 {
+			v = 500
+		}
+		rows = v
+	}
+
+	sessionName := strings.TrimSpace(r.URL.Query().Get("session"))
+	if sessionName == "" {
+		sessionName = "main"
+	}
+	if !isValidTerminalSessionName(sessionName) {
+		writeError(w, http.StatusBadRequest, "invalid_session", "session must be 1-32 lowercase letters, digits or hyphens")
+		return
+	}
+
+	wake := strings.TrimSpace(r.URL.Query().Get("wake"))
+	if wake != "" && wake != "0" {
+		writeError(w, http.StatusBadRequest, "invalid_wake", "wake must be omitted or '0'")
+		return
+	}
+
+	restart := strings.TrimSpace(r.URL.Query().Get("restart"))
+	if restart != "" && restart != "1" {
+		writeError(w, http.StatusBadRequest, "invalid_restart", "restart must be omitted or '1'")
+		return
+	}
+
+	if err := s.poller.CheckMachineExists(r.Context(), accountID, machineID); err != nil {
+		if errors.Is(err, store.ErrAccountNotFound) || errors.Is(err, store.ErrMachineNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "db_error", "failed to inspect machine")
+		return
+	}
+
+	clientWS, err := ws.Upgrade(w, r, nil)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "websocket_upgrade_failed", err.Error())
+		return
+	}
+	defer clientWS.Close()
+
+	dialCtx, cancel := context.WithTimeout(r.Context(), 55*time.Second)
+	upstreamWS, apiErr, dialErr := s.poller.DialTerminal(dialCtx, accountID, machineID, instabox.TerminalOptions{
+		Cols:    cols,
+		Rows:    rows,
+		Session: sessionName,
+		Wake:    wake,
+		Restart: restart,
+	})
+	cancel()
+
+	if dialErr != nil {
+		msg := "failed to connect to machine terminal"
+		code := "upstream_error"
+		if apiErr != nil {
+			if apiErr.Message != "" {
+				msg = apiErr.Message
+			}
+			if apiErr.Code != "" {
+				code = apiErr.Code
+			}
+		}
+		payload, _ := json.Marshal(map[string]string{
+			"type":    "error",
+			"code":    code,
+			"message": msg,
+		})
+		_ = clientWS.WriteMessage(ws.OpText, payload)
+		_ = clientWS.CloseWithCode(ws.CloseNormalClosure, code)
+		return
+	}
+	defer upstreamWS.Close()
+
+	ws.Relay(r.Context(), clientWS, upstreamWS, 25*time.Second)
+}
+
+func isValidTerminalSessionName(s string) bool {
+	if len(s) < 1 || len(s) > 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func requestOriginHost(r *http.Request) string {
+	if isTrustedProxy(remoteHostIP(r.RemoteAddr)) {
+		if xfHost := strings.TrimSpace(r.Header.Get("X-Forwarded-Host")); xfHost != "" {
+			if idx := strings.IndexByte(xfHost, ','); idx >= 0 {
+				xfHost = strings.TrimSpace(xfHost[:idx])
+			}
+			if xfHost != "" {
+				return xfHost
+			}
+		}
+	}
+	return strings.TrimSpace(r.Host)
+}
+
+func isSameOriginWebSocket(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	expectedScheme := "http"
+	if isHTTPS(r) {
+		expectedScheme = "https"
+	}
+	expectedHost := requestOriginHost(r)
+	if expectedHost == "" {
+		return false
+	}
+	return strings.EqualFold(u.Scheme, expectedScheme) && strings.EqualFold(u.Host, expectedHost)
 }
 
 func (s *Server) handleListMachines(w http.ResponseWriter, r *http.Request) {

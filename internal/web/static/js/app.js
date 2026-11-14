@@ -109,6 +109,22 @@ const ICONS = {
   copy: () => svgIcon([
     { tag: 'rect', x: '9', y: '9', width: '13', height: '13', rx: '2' },
     { d: 'M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1' }
+  ]),
+  terminal: () => svgIcon([
+    { tag: 'polyline', points: '4 17 10 11 4 5' },
+    { d: 'M12 19h8' }
+  ]),
+  expand: () => svgIcon([
+    { tag: 'polyline', points: '15 3 21 3 21 9' },
+    { tag: 'polyline', points: '9 21 3 21 3 15' },
+    { d: 'M21 3l-7 7' },
+    { d: 'M3 21l7-7' }
+  ]),
+  compress: () => svgIcon([
+    { tag: 'polyline', points: '4 14 10 14 10 20' },
+    { tag: 'polyline', points: '20 10 14 10 14 4' },
+    { d: 'M14 10l7-7' },
+    { d: 'M3 21l7-7' }
   ])
 };
 
@@ -1052,6 +1068,14 @@ function createVmCardController(initialVm) {
     className: 'vm-name-btn',
     onClick: () => openTelemetryDialog(vm)
   });
+  const terminalBtn = el('button', {
+    type: 'button',
+    className: 'vm-inline-btn vm-inline-terminal',
+    onClick: (ev) => {
+      ev.stopPropagation();
+      openTerminalDialog(vm);
+    }
+  }, [ICONS.terminal()]);
   const renameBtn = el('button', {
     type: 'button',
     className: 'vm-inline-btn',
@@ -1068,7 +1092,7 @@ function createVmCardController(initialVm) {
       openDeleteMachineDialog(vm);
     }
   }, [ICONS.trash()]);
-  const nameRow = el('div', { className: 'vm-name-row' }, [nameBtn, renameBtn, deleteBtn]);
+  const nameRow = el('div', { className: 'vm-name-row' }, [nameBtn, terminalBtn, renameBtn, deleteBtn]);
 
   const aliasBadge = el('span', { className: 'badge' });
   const idBadge = el('span', { className: 'badge mono' });
@@ -1220,6 +1244,13 @@ function createVmCardController(initialVm) {
     setTextIfChanged(statusBadge, label);
 
     setTextIfChanged(nameBtn, vm.name);
+    const termAllowed = vm.state !== 'stopped' && vm.state !== 'stopping' && vm.state !== 'deleting';
+    const termLabel = termAllowed ? `${t('openTerminal')}: ${vm.name}` : t('terminalStoppedHint');
+    terminalBtn.disabled = !termAllowed;
+    if (terminalBtn.getAttribute('aria-label') !== termLabel) {
+      terminalBtn.setAttribute('aria-label', termLabel);
+      terminalBtn.title = termLabel;
+    }
     const renameLabel = `${t('renameMachine')}: ${vm.name}`;
     if (renameBtn.getAttribute('aria-label') !== renameLabel) {
       renameBtn.setAttribute('aria-label', renameLabel);
@@ -2929,6 +2960,424 @@ function renderAPIKeysDialogContent() {
 }
 
 // ============================================================
+// Interactive VM Console Terminal Modal (xterm.js + WS Proxy)
+// ============================================================
+let xtermModulesPromise = null;
+function loadXtermModules() {
+  if (!xtermModulesPromise) {
+    xtermModulesPromise = Promise.all([
+      import('/vendor/xterm/xterm.mjs'),
+      import('/vendor/xterm/addon-fit.mjs')
+    ]).then(([xtermMod, fitMod]) => ({
+      Terminal: xtermMod.Terminal,
+      FitAddon: fitMod.FitAddon
+    }));
+  }
+  return xtermModulesPromise;
+}
+
+let terminalDialog = null;
+let terminalSessionState = null;
+
+function disposeTerminalConnection() {
+  if (!terminalSessionState) return;
+  const st = terminalSessionState;
+  st.disposed = true;
+  if (st.resizeTimer) cancelAnimationFrame(st.resizeTimer);
+  try { st.resizeObserver?.disconnect(); } catch {}
+  try {
+    if (st.ws && (st.ws.readyState === WebSocket.OPEN || st.ws.readyState === WebSocket.CONNECTING)) {
+      st.ws.close(1000, 'closed');
+    }
+  } catch {}
+  try { st.term?.dispose(); } catch {}
+  terminalSessionState = null;
+}
+
+async function openTerminalDialog(vm) {
+  disposeTerminalConnection();
+
+  if (!terminalDialog) {
+    terminalDialog = el('dialog', {
+      className: 'app-dialog terminal-dialog',
+      'aria-labelledby': 'terminal-dialog-title'
+    });
+    terminalDialog.addEventListener('cancel', (e) => {
+      // Allow Esc key inside xterm instead of accidentally closing the shell window.
+      if (document.activeElement && terminalDialog.contains(document.activeElement) && document.activeElement.closest('.xterm')) {
+        e.preventDefault();
+      }
+    });
+    terminalDialog.addEventListener('close', () => {
+      terminalDialog.classList.remove('is-fullscreen');
+      disposeTerminalConnection();
+    });
+    document.body.append(terminalDialog);
+  }
+
+  let sessionName = 'main';
+  let isFullscreen = false;
+
+  const titleEl = el('h2', { id: 'terminal-dialog-title', textContent: vm.name });
+  const statusPill = el('span', { className: 'terminal-status-pill', dataset: { state: 'connecting' }, textContent: t('terminalStatusConnecting') });
+  const subtitleEl = el('div', { className: 'hint mono', textContent: `${vm.accountAlias || vm.accountId} · ${vm.id}` });
+
+  const sessionDatalist = el('datalist', { id: 'terminal-session-presets' }, [
+    el('option', { value: 'main' }),
+    el('option', { value: 'dev' }),
+    el('option', { value: 'logs' }),
+    el('option', { value: 'ops' })
+  ]);
+  const sessionInput = el('input', {
+    type: 'text',
+    className: 'terminal-session-input mono',
+    value: sessionName,
+    maxlength: '32',
+    placeholder: t('terminalSessionPlaceholder'),
+    list: 'terminal-session-presets',
+    'aria-label': t('terminalSessionLabel')
+  });
+  const sessionWrap = el('label', { className: 'terminal-session-wrap' }, [
+    el('span', { className: 'terminal-session-lbl', textContent: t('terminalSessionLabel') }),
+    sessionInput,
+    sessionDatalist
+  ]);
+
+  const reconnectBtn = el('button', {
+    type: 'button',
+    className: 'btn',
+    textContent: t('terminalReconnect')
+  });
+  const restartBtn = el('button', {
+    type: 'button',
+    className: 'btn btn-danger',
+    textContent: t('terminalRestartShell')
+  });
+  const fsIconHost = el('span', { style: 'display:inline-flex;' }, [ICONS.expand()]);
+  const fsBtn = el('button', {
+    type: 'button',
+    className: 'btn btn-icon-only',
+    title: t('terminalFullscreen'),
+    'aria-label': t('terminalFullscreen')
+  }, [fsIconHost]);
+  const closeBtn = el('button', {
+    type: 'button',
+    className: 'btn btn-icon-only',
+    title: t('close'),
+    'aria-label': t('close'),
+    onClick: () => terminalDialog.close()
+  }, [ICONS.close()]);
+
+  const header = el('div', { className: 'dialog-header terminal-head' }, [
+    el('div', { className: 'terminal-head-left' }, [
+      ICONS.terminal(),
+      el('div', { style: 'min-inline-size:0;' }, [
+        el('div', { className: 'terminal-title-row' }, [titleEl, statusPill]),
+        subtitleEl
+      ])
+    ]),
+    el('div', { className: 'terminal-controls' }, [
+      sessionWrap,
+      reconnectBtn,
+      restartBtn,
+      fsBtn,
+      closeBtn
+    ])
+  ]);
+
+  const bannerText = el('span');
+  const banner = el('div', { className: 'terminal-banner', role: 'status', hidden: true }, [bannerText]);
+
+  const stage = el('div', { className: 'terminal-stage' });
+  const footerNote = el('span', { className: 'hint', textContent: t('terminalPersistentNote', { session: sessionName }) });
+  const sizeBadge = el('span', { className: 'hint mono', textContent: '80×24' });
+
+  const quickButtons = [
+    { label: 'Esc', data: '\x1b' },
+    { label: 'Tab', data: '\t' },
+    { label: 'Ctrl+C', data: '\x03' },
+    { label: 'Ctrl+D', data: '\x04' },
+    { label: 'Ctrl+L', data: '\x0c' },
+    { label: '↑', data: '\x1b[A' },
+    { label: '↓', data: '\x1b[B' },
+    { label: '←', data: '\x1b[D' },
+    { label: '→', data: '\x1b[C' }
+  ];
+  const quickbar = el('div', { className: 'terminal-quickbar' },
+    quickButtons.map((q) => el('button', {
+      type: 'button',
+      className: 'terminal-key-btn mono',
+      textContent: q.label,
+      onClick: () => {
+        if (!terminalSessionState) return;
+        terminalSessionState.sendBytes(q.data);
+        terminalSessionState.term?.focus();
+      }
+    }))
+  );
+  quickbar.append(el('button', {
+    type: 'button',
+    className: 'terminal-key-btn',
+    textContent: 'Clear',
+    onClick: () => {
+      terminalSessionState?.term?.clear();
+      terminalSessionState?.term?.focus();
+    }
+  }));
+
+  const body = el('div', { className: 'terminal-body' }, [
+    banner,
+    stage,
+    quickbar,
+    el('div', { className: 'terminal-footer' }, [footerNote, sizeBadge])
+  ]);
+
+  terminalDialog.replaceChildren(el('div', { className: 'dialog-inner' }, [header, body]));
+  terminalDialog.classList.remove('is-fullscreen');
+  if (!terminalDialog.open) terminalDialog.showModal();
+
+  const setStatus = (stKey, labelText) => {
+    statusPill.dataset.state = stKey;
+    statusPill.textContent = labelText;
+  };
+  const showBanner = (msg, kind = 'error') => {
+    bannerText.textContent = msg;
+    banner.dataset.kind = kind;
+    banner.hidden = false;
+  };
+  const hideBanner = () => {
+    banner.hidden = true;
+  };
+
+  let TerminalCtor, FitAddonCtor;
+  try {
+    ({ Terminal: TerminalCtor, FitAddon: FitAddonCtor } = await loadXtermModules());
+  } catch (err) {
+    setStatus('error', t('terminalStatusError'));
+    showBanner(err?.message || 'Failed to load xterm.js');
+    return;
+  }
+  if (!terminalDialog.open) return;
+
+  const term = new TerminalCtor({
+    cursorBlink: true,
+    fontFamily: '"Google Sans Code", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+    fontSize: 13.5,
+    lineHeight: 1.32,
+    scrollback: 5000,
+    allowProposedApi: false,
+    theme: {
+      background: '#0b1020',
+      foreground: '#e5e7eb',
+      cursor: '#38bdf8',
+      cursorAccent: '#0b1020',
+      selectionBackground: 'rgba(56, 189, 248, 0.28)',
+      black: '#1e293b',
+      red: '#f87171',
+      green: '#34d399',
+      yellow: '#fbbf24',
+      blue: '#60a5fa',
+      magenta: '#c084fc',
+      cyan: '#22d3ee',
+      white: '#e2e8f0',
+      brightBlack: '#64748b',
+      brightRed: '#fca5a5',
+      brightGreen: '#6ee7b7',
+      brightYellow: '#fde047',
+      brightBlue: '#93c5fd',
+      brightMagenta: '#d8b4fe',
+      brightCyan: '#67e8f9',
+      brightWhite: '#f8fafc'
+    }
+  });
+  const fitAddon = new FitAddonCtor();
+  term.loadAddon(fitAddon);
+  term.open(stage);
+
+  const encoder = new TextEncoder();
+  const stateObj = {
+    disposed: false,
+    term,
+    fitAddon,
+    ws: null,
+    resizeObserver: null,
+    resizeTimer: 0,
+    sendBytes(text) {
+      if (stateObj.ws && stateObj.ws.readyState === WebSocket.OPEN) {
+        stateObj.ws.send(encoder.encode(text));
+      }
+    }
+  };
+  terminalSessionState = stateObj;
+
+  const safeFit = () => {
+    if (stateObj.disposed) return;
+    try {
+      fitAddon.fit();
+      sizeBadge.textContent = `${term.cols}×${term.rows}`;
+    } catch {}
+  };
+  requestAnimationFrame(() => {
+    safeFit();
+    term.focus();
+  });
+
+  if ('ResizeObserver' in window) {
+    stateObj.resizeObserver = new ResizeObserver(() => {
+      if (stateObj.resizeTimer) cancelAnimationFrame(stateObj.resizeTimer);
+      stateObj.resizeTimer = requestAnimationFrame(safeFit);
+    });
+    stateObj.resizeObserver.observe(stage);
+  }
+
+  term.onData((data) => {
+    if (stateObj.ws && stateObj.ws.readyState === WebSocket.OPEN) {
+      stateObj.ws.send(encoder.encode(data));
+    }
+  });
+  term.onBinary((raw) => {
+    if (stateObj.ws && stateObj.ws.readyState === WebSocket.OPEN) {
+      const buf = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i) & 0xff;
+      stateObj.ws.send(buf);
+    }
+  });
+  term.onResize(({ cols, rows }) => {
+    sizeBadge.textContent = `${cols}×${rows}`;
+    if (stateObj.ws && stateObj.ws.readyState === WebSocket.OPEN) {
+      stateObj.ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+    }
+  });
+
+  const connect = (restart = false) => {
+    if (stateObj.disposed) return;
+    const cand = sessionInput.value.trim().toLowerCase() || 'main';
+    if (!/^[a-z0-9-]{1,32}$/.test(cand)) {
+      showBanner(t('terminalInvalidSession'));
+      sessionInput.focus();
+      return;
+    }
+    sessionName = cand;
+    sessionInput.value = sessionName;
+    footerNote.textContent = t('terminalPersistentNote', { session: sessionName });
+
+    if (stateObj.ws) {
+      try {
+        stateObj.ws.onopen = null;
+        stateObj.ws.onmessage = null;
+        stateObj.ws.onerror = null;
+        stateObj.ws.onclose = null;
+        stateObj.ws.close(1000, 'reconnect');
+      } catch {}
+      stateObj.ws = null;
+    }
+
+    hideBanner();
+    safeFit();
+    setStatus('connecting', t('terminalStatusConnecting'));
+    if (restart) term.reset();
+
+    const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const qs = new URLSearchParams({
+      cols: String(Math.max(10, Math.min(1000, term.cols || 80))),
+      rows: String(Math.max(4, Math.min(500, term.rows || 24))),
+      session: sessionName
+    });
+    if (restart) qs.set('restart', '1');
+    const wsUrl = `${wsProto}//${window.location.host}/api/machines/${encodeURIComponent(vm.accountId)}/${encodeURIComponent(vm.id)}/terminal?${qs.toString()}`;
+
+    const sock = new WebSocket(wsUrl);
+    sock.binaryType = 'arraybuffer';
+    stateObj.ws = sock;
+
+    let gotServerErr = false;
+
+    sock.onopen = () => {
+      if (stateObj.disposed || stateObj.ws !== sock) return;
+      safeFit();
+      sock.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
+      setStatus('connected', t('terminalStatusConnected'));
+      term.focus();
+    };
+
+    sock.onmessage = (ev) => {
+      if (stateObj.disposed || stateObj.ws !== sock) return;
+      if (ev.data instanceof ArrayBuffer) {
+        term.write(new Uint8Array(ev.data));
+        return;
+      }
+      if (typeof ev.data === 'string') {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'session') {
+            setStatus('connected', t('terminalStatusConnected'));
+            hideBanner();
+            term.focus();
+          } else if (msg.type === 'exit') {
+            gotServerErr = true;
+            const code = msg.code ?? 0;
+            setStatus('disconnected', t('terminalStatusExited', { code: String(code) }));
+            showBanner(t('terminalStatusExited', { code: String(code) }), 'info');
+          } else if (msg.type === 'taken') {
+            gotServerErr = true;
+            setStatus('disconnected', t('terminalStatusTaken'));
+            showBanner(t('terminalStatusTaken'), 'info');
+          } else if (msg.type === 'error') {
+            gotServerErr = true;
+            setStatus('error', t('terminalStatusError'));
+            showBanner(msg.message || t('terminalStatusError'));
+          }
+        } catch {
+          term.write(ev.data);
+        }
+      }
+    };
+
+    sock.onerror = () => {
+      if (stateObj.disposed || stateObj.ws !== sock || gotServerErr) return;
+      setStatus('error', t('terminalStatusError'));
+    };
+
+    sock.onclose = (ev) => {
+      if (stateObj.disposed || stateObj.ws !== sock) return;
+      if (!gotServerErr) {
+        setStatus('disconnected', t('terminalStatusDisconnected'));
+        if (ev.code !== 1000) {
+          showBanner(ev.reason || t('terminalStatusDisconnected'));
+        }
+      }
+    };
+  };
+
+  reconnectBtn.addEventListener('click', () => connect(false));
+  sessionInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      connect(false);
+    }
+  });
+  restartBtn.addEventListener('click', () => {
+    const s = sessionInput.value.trim().toLowerCase() || 'main';
+    if (!window.confirm(t('terminalConfirmRestart', { session: s }))) return;
+    connect(true);
+  });
+  fsBtn.addEventListener('click', () => {
+    isFullscreen = !isFullscreen;
+    terminalDialog.classList.toggle('is-fullscreen', isFullscreen);
+    fsIconHost.replaceChildren(isFullscreen ? ICONS.compress() : ICONS.expand());
+    const lbl = t(isFullscreen ? 'terminalExitFullscreen' : 'terminalFullscreen');
+    fsBtn.title = lbl;
+    fsBtn.setAttribute('aria-label', lbl);
+    requestAnimationFrame(() => {
+      safeFit();
+      term.focus();
+    });
+  });
+
+  connect(false);
+}
+
+// ============================================================
 // Beszel-style Telemetry Detail Modal (persistent scroll container!)
 // ============================================================
 let telemetryDialog = null;
@@ -2950,17 +3399,30 @@ function ensureTelemetryDialogShell() {
 
   const titleEl = el('h2', { id: 'telemetry-dialog-title' });
   const subtitleEl = el('div', { className: 'hint mono' });
+  const termOpenBtn = el('button', {
+    type: 'button',
+    className: 'btn',
+    onClick: () => {
+      const curVm = telemetryDialog._currentVm;
+      if (!curVm) return;
+      telemetryDialog.close();
+      openTerminalDialog(curVm);
+    }
+  }, [ICONS.terminal(), el('span', { textContent: t('openTerminal') })]);
   const header = el('div', { className: 'dialog-header' }, [
     el('div', {}, [titleEl, subtitleEl]),
-    el('button', {
-      type: 'button',
-      className: 'btn btn-icon-only',
-      'aria-label': t('close'),
-      onClick: () => {
-        telemetryDialog.close();
-        state.telemetryTarget = null;
-      }
-    }, [ICONS.close()])
+    el('div', { className: 'dialog-header-actions' }, [
+      termOpenBtn,
+      el('button', {
+        type: 'button',
+        className: 'btn btn-icon-only',
+        'aria-label': t('close'),
+        onClick: () => {
+          telemetryDialog.close();
+          state.telemetryTarget = null;
+        }
+      }, [ICONS.close()])
+    ])
   ]);
 
   const body = el('div', { className: 'dialog-body' });
@@ -2995,13 +3457,18 @@ function ensureTelemetryDialogShell() {
   const inner = el('div', { className: 'dialog-inner' }, [header, body]);
   telemetryDialog.replaceChildren(inner);
 
-  telemetryDialog._shell = { titleEl, subtitleEl, body, rangeBtns, cpuBox, ramBox, diskBox, netBox };
+  telemetryDialog._shell = { titleEl, subtitleEl, termOpenBtn, body, rangeBtns, cpuBox, ramBox, diskBox, netBox };
   return telemetryDialog._shell;
 }
 
 async function openTelemetryDialog(vm) {
   state.telemetryTarget = { accountId: vm.accountId, machineId: vm.id };
   const shell = ensureTelemetryDialogShell();
+  telemetryDialog._currentVm = vm;
+  const termAllowed = vm.state !== 'stopped' && vm.state !== 'stopping' && vm.state !== 'deleting';
+  shell.termOpenBtn.disabled = !termAllowed;
+  shell.termOpenBtn.title = termAllowed ? t('openTerminal') : t('terminalStoppedHint');
+  setTextIfChanged(shell.termOpenBtn.lastChild, t('openTerminal'));
   setTextIfChanged(shell.titleEl, `${vm.name} · ${t('telemetryTitle')}`);
   setTextIfChanged(shell.subtitleEl, `${vm.accountAlias || vm.accountId} · ${vm.id}`);
   shell.body.scrollTop = 0;
@@ -3037,6 +3504,10 @@ async function fetchAndRenderTelemetry() {
 
 function renderTelemetryDialogContent(vm) {
   const shell = ensureTelemetryDialogShell();
+  telemetryDialog._currentVm = vm;
+  const termAllowed = vm.state !== 'stopped' && vm.state !== 'stopping' && vm.state !== 'deleting';
+  shell.termOpenBtn.disabled = !termAllowed;
+  shell.termOpenBtn.title = termAllowed ? t('openTerminal') : t('terminalStoppedHint');
   const prevScrollTop = shell.body.scrollTop;
 
   setTextIfChanged(shell.titleEl, `${vm.name} · ${t('telemetryTitle')}`);
@@ -3163,6 +3634,8 @@ function closeOpenDialogs() {
   try { if (accountsDialog?.open) accountsDialog.close(); } catch {}
   try { if (apiKeysDialog?.open) apiKeysDialog.close(); } catch {}
   try { if (telemetryDialog?.open) telemetryDialog.close(); } catch {}
+  try { if (terminalDialog?.open) terminalDialog.close(); } catch {}
+  disposeTerminalConnection();
   state.telemetryTarget = null;
   state.editingAccountId = null;
 }

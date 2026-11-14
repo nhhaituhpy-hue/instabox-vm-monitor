@@ -15,6 +15,7 @@ import (
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/crypto"
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/instabox"
 	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/store"
+	"github.com/nhhaituhpy-hue/instabox-vm-monitor/internal/ws"
 )
 
 var ErrDeleteConfirmationInvalid = errors.New("invalid or expired delete confirmation token")
@@ -752,6 +753,19 @@ func (p *Poller) resolveMachineKey(ctx context.Context, accountID, machineID str
 		return "", err
 	}
 	return apiKey, nil
+}
+
+func (p *Poller) CheckMachineExists(ctx context.Context, accountID, machineID string) error {
+	_, err := p.resolveMachineKey(ctx, accountID, machineID)
+	return err
+}
+
+func (p *Poller) DialTerminal(ctx context.Context, accountID, machineID string, opts instabox.TerminalOptions) (*ws.Conn, *instabox.APIError, error) {
+	apiKey, err := p.resolveMachineKey(ctx, accountID, machineID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return p.client.DialTerminal(ctx, apiKey, machineID, opts)
 }
 
 func (p *Poller) ExecMachine(ctx context.Context, accountID, machineID string, in instabox.ExecInput) (*instabox.ExecResult, error) {
