@@ -984,25 +984,42 @@ function createVmCardController(initialVm) {
     className: 'vm-name-btn',
     onClick: () => openTelemetryDialog(vm)
   });
+  const renameBtn = el('button', {
+    type: 'button',
+    className: 'vm-inline-btn',
+    onClick: (ev) => {
+      ev.stopPropagation();
+      openRenameMachineDialog(vm);
+    }
+  }, [ICONS.edit()]);
+  const deleteBtn = el('button', {
+    type: 'button',
+    className: 'vm-inline-btn vm-inline-danger',
+    onClick: (ev) => {
+      ev.stopPropagation();
+      openDeleteMachineDialog(vm);
+    }
+  }, [ICONS.trash()]);
+  const nameRow = el('div', { className: 'vm-name-row' }, [nameBtn, renameBtn, deleteBtn]);
 
   const aliasBadge = el('span', { className: 'badge' });
   const idBadge = el('span', { className: 'badge mono' });
   const tplBadge = el('span', { className: 'badge' });
   const freeBadge = el('span', { className: 'badge' });
+  const specEl = el('span', { className: 'vm-spec-inline' });
 
   const ident = el('div', { className: 'vm-identity' }, [
     statusPoint,
     el('div', { className: 'vm-title-block' }, [
-      nameBtn,
-      el('div', { className: 'vm-submeta' }, [aliasBadge, idBadge, tplBadge, freeBadge])
+      nameRow,
+      el('div', { className: 'vm-submeta vm-meta-inline' }, [aliasBadge, idBadge, tplBadge, freeBadge, specEl])
     ])
   ]);
 
   const statusBadge = el('span', { className: 'badge' });
   head.append(ident, statusBadge);
-  col1.append(head);
-
-  const specEl = el('div', { className: 'vm-submeta' });
+  const errEl = el('div', { className: 'account-err', hidden: true });
+  col1.append(head, errEl);
 
   const clockLabelEl = el('span', { className: 'hint' });
   const clockValueEl = el('span', {
@@ -1016,9 +1033,6 @@ function createVmCardController(initialVm) {
   ]);
   const clockRight = el('div', { className: 'clock-limit mono' });
   const clockRow = el('div', { className: 'vm-clock-row' }, [clockLeft, clockRight]);
-  const errEl = el('div', { className: 'account-err', hidden: true });
-  const metaBottom = el('div', { className: 'vm-meta-bottom' }, [specEl, clockRow, errEl]);
-  col1.append(metaBottom);
 
   // Column 2: Mini Beszel Charts (CPU, RAM, System (/), Data (/data))
   const cpuLbl = el('span', { className: 'mini-chart-lbl' });
@@ -1067,7 +1081,13 @@ function createVmCardController(initialVm) {
     wakeCtrl.slot, suspendCtrl.slot, startCtrl.slot, stopCtrl.slot
   ]);
 
-  card.append(col1, miniGrid, actionsBar);
+  const metricsRow = el('div', { className: 'vm-card-metrics-row' }, [
+    clockRow,
+    miniGrid,
+    actionsBar
+  ]);
+
+  card.append(col1, metricsRow);
   wrap.append(card);
 
   let lastChartSig = '';
@@ -1081,6 +1101,16 @@ function createVmCardController(initialVm) {
     setTextIfChanged(statusBadge, label);
 
     setTextIfChanged(nameBtn, vm.name);
+    const renameLabel = `${t('renameMachine')}: ${vm.name}`;
+    if (renameBtn.getAttribute('aria-label') !== renameLabel) {
+      renameBtn.setAttribute('aria-label', renameLabel);
+      renameBtn.title = renameLabel;
+    }
+    const deleteLabel = `${t('deleteMachine')}: ${vm.name}`;
+    if (deleteBtn.getAttribute('aria-label') !== deleteLabel) {
+      deleteBtn.setAttribute('aria-label', deleteLabel);
+      deleteBtn.title = deleteLabel;
+    }
     setTextIfChanged(aliasBadge, vm.accountAlias || vm.accountId);
     setTextIfChanged(idBadge, vm.id);
 
@@ -1099,7 +1129,7 @@ function createVmCardController(initialVm) {
     }
 
     const diskSummary = vm.rootDiskGiB > 0
-      ? `/ ${vm.rootDiskGiB} + /data ${vm.persistentDiskGiB}`
+      ? `/ ${vm.rootDiskGiB} GB + /data ${vm.persistentDiskGiB}`
       : `${vm.persistentDiskGiB}`;
     const specTxt = t('specFmt', {
       vcpu: vm.vcpus,
@@ -2075,6 +2105,222 @@ function renderAddMachineDialogContent(initialTab) {
 }
 
 // ============================================================
+// Rename Machine Dialog & Delete Machine Confirmation Dialog
+// ============================================================
+let renameMachineDialog = null;
+function openRenameMachineDialog(vm) {
+  if (!renameMachineDialog) {
+    renameMachineDialog = el('dialog', {
+      className: 'app-dialog app-dialog-narrow',
+      'aria-labelledby': 'rename-vm-title'
+    });
+    enableDialogLightDismiss(renameMachineDialog);
+    document.body.append(renameMachineDialog);
+  }
+
+  const header = el('div', { className: 'dialog-header' }, [
+    el('h2', { id: 'rename-vm-title', textContent: t('renameMachineTitle') }),
+    el('button', {
+      type: 'button',
+      className: 'btn btn-icon-only',
+      'aria-label': t('close'),
+      onClick: () => renameMachineDialog.close()
+    }, [ICONS.close()])
+  ]);
+
+  const body = el('div', { className: 'dialog-body' });
+  const errBanner = el('div', { className: 'form-error-banner', role: 'alert', hidden: true });
+  const form = el('form', { novalidate: true, 'aria-labelledby': 'rename-vm-title' });
+
+  const nameHint = el('span', { id: 'rename-vm-hint', className: 'hint', textContent: t('machineNameHint') });
+  const nameInput = el('input', {
+    className: 'input',
+    id: 'rename-vm-input',
+    name: 'name',
+    type: 'text',
+    required: true,
+    maxlength: '63',
+    pattern: '^[a-z0-9][a-z0-9-]{0,62}$',
+    value: vm.name || '',
+    autocorrect: 'off',
+    autocapitalize: 'none',
+    spellcheck: 'false',
+    autofocus: true,
+    'aria-invalid': 'false',
+    'aria-describedby': 'rename-vm-hint',
+    dataset: { error: 'rename-vm-err' }
+  });
+  const nameErr = el('div', { id: 'rename-vm-err', className: 'error-msg', textContent: t('errMachineName') });
+  const nameField = el('div', { className: 'field', style: 'margin-block-end:0;', dataset: { invalid: 'false' } }, [
+    el('label', { for: 'rename-vm-input', textContent: t('newMachineName') }),
+    nameHint,
+    nameInput,
+    nameErr
+  ]);
+
+  const syncValidity = (announce = false) => {
+    const raw = nameInput.value.trim();
+    if (raw !== nameInput.value) nameInput.value = raw;
+    const valid = /^[a-z0-9][a-z0-9-]{0,62}$/.test(raw);
+    nameInput.setCustomValidity(valid ? '' : t('errMachineName'));
+    nameInput.setAttribute('aria-invalid', valid ? 'false' : 'true');
+    nameField.dataset.invalid = valid ? 'false' : 'true';
+    nameInput.setAttribute('aria-describedby', valid ? 'rename-vm-hint' : 'rename-vm-hint rename-vm-err');
+    if (!valid && announce) liveAnnouncer.textContent = `${t('newMachineName')}: ${t('errMachineName')}`;
+    return valid;
+  };
+  nameInput.addEventListener('blur', () => syncValidity(true));
+  nameInput.addEventListener('input', () => {
+    nameInput.setCustomValidity('');
+    if (nameField.dataset.invalid === 'true') syncValidity(false);
+  });
+
+  const btnRow = el('div', { className: 'dialog-actions-row' }, [
+    el('button', {
+      type: 'button',
+      className: 'btn',
+      textContent: t('cancelEdit'),
+      onClick: () => renameMachineDialog.close()
+    }),
+    el('button', {
+      type: 'submit',
+      className: 'btn btn-primary',
+      textContent: t('saveRename')
+    })
+  ]);
+  const saveBtn = btnRow.lastElementChild;
+
+  form.append(errBanner, el('div', { className: 'form-stack' }, [
+    el('div', { className: 'hint mono', textContent: `${vm.accountAlias || vm.accountId} · ${vm.id}` }),
+    nameField,
+    btnRow
+  ]));
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    errBanner.hidden = true;
+    if (!syncValidity(false)) {
+      nameInput.focus();
+      return;
+    }
+    const nextName = nameInput.value.trim();
+    if (nextName === vm.name) {
+      renameMachineDialog.close();
+      return;
+    }
+    if (saveBtn.getAttribute('aria-disabled') === 'true') return;
+    saveBtn.setAttribute('aria-disabled', 'true');
+    try {
+      const res = await apiFetch(
+        `/api/machines/${encodeURIComponent(vm.accountId)}/${encodeURIComponent(vm.id)}`,
+        { method: 'PATCH', body: JSON.stringify({ name: nextName }) }
+      );
+      if (res?.machine) {
+        const idx = state.machines.findIndex((x) => x.accountId === vm.accountId && x.id === vm.id);
+        if (idx >= 0) state.machines[idx] = res.machine;
+        if (!updateDashboardInPlace()) render();
+      } else {
+        await loadDashboardData();
+        if (!updateDashboardInPlace()) render();
+      }
+      renameMachineDialog.close();
+      showToast(`${t('machineRenamed')}: ${nextName}`);
+    } catch (err) {
+      errBanner.textContent = err.message;
+      errBanner.hidden = false;
+    } finally {
+      saveBtn.removeAttribute('aria-disabled');
+    }
+  });
+
+  body.append(form);
+  renameMachineDialog.replaceChildren(el('div', { className: 'dialog-inner' }, [header, body]));
+  if (!renameMachineDialog.open) renameMachineDialog.showModal();
+  requestAnimationFrame(() => {
+    nameInput.focus();
+    nameInput.select();
+  });
+}
+
+let deleteMachineDialog = null;
+function openDeleteMachineDialog(vm) {
+  if (!deleteMachineDialog) {
+    deleteMachineDialog = el('dialog', {
+      className: 'app-dialog app-dialog-narrow',
+      'aria-labelledby': 'delete-vm-title'
+    });
+    enableDialogLightDismiss(deleteMachineDialog);
+    document.body.append(deleteMachineDialog);
+  }
+
+  const header = el('div', { className: 'dialog-header' }, [
+    el('h2', { id: 'delete-vm-title', textContent: t('deleteMachineTitle') }),
+    el('button', {
+      type: 'button',
+      className: 'btn btn-icon-only',
+      'aria-label': t('close'),
+      onClick: () => deleteMachineDialog.close()
+    }, [ICONS.close()])
+  ]);
+
+  const errBanner = el('div', { className: 'form-error-banner', role: 'alert', hidden: true });
+  const desc = el('p', {
+    textContent: t('deleteMachineDesc', { name: vm.name, id: vm.id })
+  });
+  const metaPill = el('div', { className: 'hint mono', textContent: `${vm.accountAlias || vm.accountId} · ${vm.id}` });
+
+  const cancelBtn = el('button', {
+    type: 'button',
+    className: 'btn',
+    autofocus: true,
+    textContent: t('cancelEdit'),
+    onClick: () => deleteMachineDialog.close()
+  });
+
+  const confirmBtn = el('button', {
+    type: 'button',
+    className: 'btn btn-danger-solid',
+    textContent: t('confirmDeleteMachineBtn'),
+    onClick: async () => {
+      if (confirmBtn.getAttribute('aria-disabled') === 'true') return;
+      errBanner.hidden = true;
+      confirmBtn.setAttribute('aria-disabled', 'true');
+      try {
+        const res = await apiFetch(
+          `/api/machines/${encodeURIComponent(vm.accountId)}/${encodeURIComponent(vm.id)}`,
+          { method: 'DELETE' }
+        );
+        applyMachinesPayload(res);
+        if (!updateDashboardInPlace()) render();
+        renderDrawerContent();
+        deleteMachineDialog.close();
+        showToast(`${t('machineDeleted')}: ${vm.name}`);
+        setTimeout(() => refreshMachinesSilently(), 1800);
+        setTimeout(() => refreshMachinesSilently(), 4500);
+      } catch (err) {
+        errBanner.textContent = err.message;
+        errBanner.hidden = false;
+      } finally {
+        confirmBtn.removeAttribute('aria-disabled');
+      }
+    }
+  });
+
+  const body = el('div', { className: 'dialog-body' }, [
+    el('div', { className: 'form-stack' }, [
+      errBanner,
+      desc,
+      metaPill,
+      el('div', { className: 'dialog-actions-row' }, [cancelBtn, confirmBtn])
+    ])
+  ]);
+
+  deleteMachineDialog.replaceChildren(el('div', { className: 'dialog-inner' }, [header, body]));
+  if (!deleteMachineDialog.open) deleteMachineDialog.showModal();
+  requestAnimationFrame(() => cancelBtn.focus());
+}
+
+// ============================================================
 // Accounts Manager Dialog
 // ============================================================
 let accountsDialog = null;
@@ -2506,6 +2752,8 @@ async function loadDashboardData() {
 function closeOpenDialogs() {
   try { if (navDrawer?.open) navDrawer.close(); } catch {}
   try { if (addMachineDialog?.open) addMachineDialog.close(); } catch {}
+  try { if (renameMachineDialog?.open) renameMachineDialog.close(); } catch {}
+  try { if (deleteMachineDialog?.open) deleteMachineDialog.close(); } catch {}
   try { if (accountsDialog?.open) accountsDialog.close(); } catch {}
   try { if (telemetryDialog?.open) telemetryDialog.close(); } catch {}
   state.telemetryTarget = null;

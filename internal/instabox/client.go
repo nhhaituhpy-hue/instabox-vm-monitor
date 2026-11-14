@@ -385,6 +385,31 @@ func (c *Client) CreateMachine(ctx context.Context, apiKey string, in CreateMach
 	return &ActionResult{Operation: &op}, nil
 }
 
+func (c *Client) RenameMachine(ctx context.Context, apiKey, machineID, name string) (*Machine, error) {
+	var out Machine
+	payload := struct {
+		Name string `json:"name"`
+	}{Name: name}
+	_, err := c.doJSON(ctx, http.MethodPatch, "/v1/machines/"+url.PathEscape(machineID), apiKey, payload, true, &out)
+	if err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func (c *Client) DeleteMachine(ctx context.Context, apiKey, machineID, confirmValue string) (*ActionResult, error) {
+	if confirmValue == "" {
+		confirmValue = machineID
+	}
+	var op Operation
+	extra := map[string]string{"X-Confirm-Delete": confirmValue}
+	_, err := c.doJSONWithHeaders(ctx, http.MethodDelete, "/v1/machines/"+url.PathEscape(machineID), apiKey, nil, true, extra, &op)
+	if err != nil {
+		return nil, err
+	}
+	return &ActionResult{Operation: &op}, nil
+}
+
 func (c *Client) GetOperation(ctx context.Context, apiKey, opID string, wait string) (*Operation, error) {
 	path := "/v1/operations/" + url.PathEscape(opID)
 	if wait != "" {
@@ -420,6 +445,10 @@ func (c *Client) PerformAction(ctx context.Context, apiKey, machineID string, ac
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path, apiKey string, body any, needIdem bool, out any) (time.Time, error) {
+	return c.doJSONWithHeaders(ctx, method, path, apiKey, body, needIdem, nil, out)
+}
+
+func (c *Client) doJSONWithHeaders(ctx context.Context, method, path, apiKey string, body any, needIdem bool, extraHeaders map[string]string, out any) (time.Time, error) {
 	var bodyReader io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -440,6 +469,9 @@ func (c *Client) doJSON(ctx context.Context, method, path, apiKey string, body a
 	}
 	if needIdem {
 		req.Header.Set("Idempotency-Key", crypto.NewUUID())
+	}
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
 	}
 
 	resp, err := c.http.Do(req)

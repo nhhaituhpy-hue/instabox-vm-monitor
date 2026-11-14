@@ -82,6 +82,23 @@ func setupTestServer(t *testing.T) (http.Handler, *store.Store) {
 		case "/v1/machines/m_1/stop":
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte(`{"id":"op_stop_1","machineId":"m_1","state":"succeeded"}`))
+		case "/v1/machines/m_1":
+			switch r.Method {
+			case http.MethodPatch:
+				var body map[string]string
+				_ = json.NewDecoder(r.Body).Decode(&body)
+				_, _ = w.Write([]byte(`{"id":"m_1","name":"` + body["name"] + `","state":"running","desiredState":"running","spec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20,"rootDiskGiB":16},"storage":{"sizeGiB":20,"mountPath":"/data","persistent":true,"synced":true},"runtime":{"ready":true},"runStartedAt":"2026-11-13T10:00:00Z","maxRunMinutes":480,"free":true}`))
+			case http.MethodDelete:
+				if r.Header.Get("X-Confirm-Delete") == "" {
+					w.WriteHeader(http.StatusConflict)
+					_, _ = w.Write([]byte(`{"error":{"code":"delete_confirmation_required","message":"confirm required"}}`))
+					return
+				}
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte(`{"id":"op_del_1","machineId":"m_1","type":"delete","state":"succeeded"}`))
+			default:
+				w.WriteHeader(http.StatusMethodNotAllowed)
+			}
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -385,5 +402,99 @@ func TestMachineOptionsAndCreateMachineEndpoints(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), `"op_create_2"`) {
 		t.Fatalf("expected operation id in response, got %s", rec.Body.String())
+	}
+}
+
+func TestRenameAndDeleteMachineEndpoints(t *testing.T) {
+	h, _ := setupTestServer(t)
+
+	// Setup admin
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/setup", bytes.NewBufferString(`{"username":"admin","password":"SuperSecret!123"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	cookies := rec.Result().Cookies()
+	var setupResp struct {
+		CSRFToken string `json:"csrfToken"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &setupResp)
+
+	// Add account (populates m_1)
+	req = httptest.NewRequest(http.MethodPost, "/api/accounts", bytes.NewBufferString(`{"alias":"Box 1","apiKey":"ibk_valid_secret_key_9999"}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var accResp struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &accResp)
+
+	// Unauth rename -> 401
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPatch, "/api/machines/"+accResp.ID+"/m_1", bytes.NewBufferString(`{"name":"new-box"}`)))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauthenticated rename, got %d", rec.Code)
+	}
+
+	// Missing CSRF on delete -> 403
+	req = httptest.NewRequest(http.MethodDelete, "/api/machines/"+accResp.ID+"/m_1", nil)
+	req.AddCookie(cookies[0])
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 on delete without CSRF, got %d", rec.Code)
+	}
+
+	// Invalid machine name -> 400
+	req = httptest.NewRequest(http.MethodPatch, "/api/machines/"+accResp.ID+"/m_1", bytes.NewBufferString(`{"name":"Invalid Name!"}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on invalid rename, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Valid rename -> 200 and updates machine name
+	req = httptest.NewRequest(http.MethodPatch, "/api/machines/"+accResp.ID+"/m_1", bytes.NewBufferString(`{"name":"vm-one-renamed"}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on rename, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"vm-one-renamed"`) {
+		t.Fatalf("expected renamed machine in response, got %s", rec.Body.String())
+	}
+
+	// Valid delete -> 200 and removes m_1 from store
+	req = httptest.NewRequest(http.MethodDelete, "/api/machines/"+accResp.ID+"/m_1", nil)
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 on delete, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var delBody struct {
+		Machines []json.RawMessage `json:"machines"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &delBody); err != nil || len(delBody.Machines) != 0 {
+		t.Fatalf("expected 0 remaining machines after delete, got err=%v body=%s", err, rec.Body.String())
+	}
+
+	// Delete unknown machine -> 404
+	req = httptest.NewRequest(http.MethodDelete, "/api/machines/"+accResp.ID+"/m_1", nil)
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on deleting removed machine, got %d: %s", rec.Code, rec.Body.String())
 	}
 }

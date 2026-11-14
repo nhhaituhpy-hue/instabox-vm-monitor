@@ -515,6 +515,57 @@ func (p *Poller) CreateMachine(ctx context.Context, accountID string, in instabo
 	return res, nil
 }
 
+func (p *Poller) RenameMachine(ctx context.Context, accountID, machineID, name string) (*store.MachineRecord, error) {
+	apiKey, err := p.store.GetAccountAPIKey(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.store.GetMachine(ctx, accountID, machineID); err != nil {
+		return nil, err
+	}
+	updated, err := p.client.RenameMachine(ctx, apiKey, machineID, name)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.syncSingleMachine(ctx, accountID, *updated); err != nil {
+		return nil, err
+	}
+	return p.store.GetMachine(ctx, accountID, machineID)
+}
+
+func (p *Poller) DeleteMachine(ctx context.Context, accountID, machineID string) (*instabox.ActionResult, error) {
+	apiKey, err := p.store.GetAccountAPIKey(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	m, err := p.store.GetMachine(ctx, accountID, machineID)
+	if err != nil {
+		return nil, err
+	}
+	res, err := p.client.DeleteMachine(ctx, apiKey, machineID, m.MachineID)
+	if err != nil {
+		return nil, err
+	}
+
+	usageKey := accountID + ":" + machineID
+	if res.Operation != nil && res.Operation.State == "succeeded" {
+		unlock := p.lockAccount(accountID)
+		_ = p.store.DeleteMachine(ctx, accountID, machineID)
+		unlock()
+		p.lastUsageCheck.Delete(usageKey)
+		p.inactiveMetricDone.Delete(usageKey)
+		return res, nil
+	}
+
+	syncCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	_ = p.SyncAccount(syncCtx, accountID)
+	if res.Operation != nil && res.Operation.ID != "" && res.Operation.State != "succeeded" && res.Operation.State != "failed" {
+		p.trackOperation(accountID, apiKey, res.Operation.ID)
+	}
+	return res, nil
+}
+
 func (p *Poller) trackOperation(accountID, apiKey, opID string) {
 	if p.ctx.Err() != nil {
 		return

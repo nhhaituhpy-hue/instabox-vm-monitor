@@ -383,3 +383,84 @@ func TestGetAccountMachineOptionsAndCreateMachine(t *testing.T) {
 		t.Fatalf("expected newly created machine to be synced into store, err=%v m=%+v", err, m)
 	}
 }
+
+func TestRenameAndDeleteMachineUpdateLocalStore(t *testing.T) {
+	dir := t.TempDir()
+	key, _ := crypto.LoadOrCreateMasterKey(dir, "")
+	st, _ := store.Open(filepath.Join(dir, "mon.db"), key)
+	t.Cleanup(func() { _ = st.Close() })
+
+	var deleted atomic.Bool
+	var curName = "box-old"
+	var mu sync.Mutex
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Date", time.Now().UTC().Format(http.TimeFormat))
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/me":
+			_, _ = w.Write([]byte(`{"userId":1,"login":"u","org":{"id":"org_1","name":"P","tier":"free","kind":"personal"}}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/usage":
+			_, _ = w.Write([]byte(`{"machines":1}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines":
+			if deleted.Load() {
+				_, _ = w.Write([]byte(`{"machines":[],"nextCursor":null}`))
+				return
+			}
+			mu.Lock()
+			nm := curName
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"machines":[{"id":"m_target","name":"` + nm + `","state":"running","desiredState":"running","spec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20,"rootDiskGiB":16},"storage":{"sizeGiB":20,"mountPath":"/data","persistent":true,"synced":true},"runtime":{"ready":true},"free":true}],"nextCursor":null}`))
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1/machines/m_target":
+			mu.Lock()
+			curName = "box-renamed"
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"id":"m_target","name":"box-renamed","state":"running","desiredState":"running","spec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20,"rootDiskGiB":16},"storage":{"sizeGiB":20,"mountPath":"/data","persistent":true,"synced":true},"runtime":{"ready":true},"free":true}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/machines/m_target":
+			if r.Header.Get("X-Confirm-Delete") == "" {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`{"error":{"code":"delete_confirmation_required","message":"missing X-Confirm-Delete"}}`))
+				return
+			}
+			deleted.Store(true)
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"id":"op_del_99","machineId":"m_target","type":"delete","state":"succeeded"}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_target/usage":
+			_, _ = w.Write([]byte(`{"runningSeconds":10}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_target/metrics":
+			_, _ = w.Write([]byte(`{"metrics":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	hc := srv.Client()
+	hc.Transport = &rt{u: u, t: srv.Client().Transport}
+	client, _ := instabox.NewClient("https://api.instabox.sh", hc)
+
+	acc, _ := st.CreateAccount(context.Background(), store.AccountInput{Alias: "A", APIKey: "ibk_a...9", OrgTier: "free"})
+	p := monitor.NewPoller(st, client, 30*time.Second, 7)
+
+	if err := p.SyncAccount(context.Background(), acc.ID); err != nil {
+		t.Fatalf("initial sync err = %v", err)
+	}
+
+	renamed, err := p.RenameMachine(context.Background(), acc.ID, "m_target", "box-renamed")
+	if err != nil || renamed.Name != "box-renamed" {
+		t.Fatalf("RenameMachine failed: err=%v rec=%+v", err, renamed)
+	}
+	stored, err := st.GetMachine(context.Background(), acc.ID, "m_target")
+	if err != nil || stored.Name != "box-renamed" {
+		t.Fatalf("expected renamed machine in store, err=%v stored=%+v", err, stored)
+	}
+
+	delRes, err := p.DeleteMachine(context.Background(), acc.ID, "m_target")
+	if err != nil || delRes.Operation == nil || delRes.Operation.ID != "op_del_99" {
+		t.Fatalf("DeleteMachine failed: err=%v res=%+v", err, delRes)
+	}
+	if _, err := st.GetMachine(context.Background(), acc.ID, "m_target"); err == nil {
+		t.Fatalf("expected deleted machine to be removed from store")
+	}
+}

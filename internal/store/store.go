@@ -581,6 +581,9 @@ func (s *Store) SyncAccountMachines(ctx context.Context, accountID string, recor
 	}
 
 	if len(seen) == 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM machine_metrics WHERE account_id = ?`, accountID); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM machines WHERE account_id = ?`, accountID); err != nil {
 			return err
 		}
@@ -591,9 +594,33 @@ func (s *Store) SyncAccountMachines(ctx context.Context, accountID string, recor
 		for _, id := range seen {
 			args = append(args, id)
 		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM machine_metrics WHERE account_id = ? AND machine_id NOT IN (`+placeholders+`)`, args...); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM machines WHERE account_id = ? AND machine_id NOT IN (`+placeholders+`)`, args...); err != nil {
 			return err
 		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) DeleteMachine(ctx context.Context, accountID, machineID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	res, err := tx.ExecContext(ctx, `DELETE FROM machines WHERE account_id = ? AND machine_id = ?`, accountID, machineID)
+	if err != nil {
+		return err
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return ErrMachineNotFound
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM machine_metrics WHERE account_id = ? AND machine_id = ?`, accountID, machineID); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

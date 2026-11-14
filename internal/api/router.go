@@ -82,6 +82,8 @@ func NewRouter(st *store.Store, client *instabox.Client, poller *monitor.Poller,
 
 	mux.HandleFunc("GET /api/machines", s.withAuth(false, s.handleListMachines))
 	mux.HandleFunc("POST /api/machines", s.withAuth(true, s.handleCreateMachine))
+	mux.HandleFunc("PATCH /api/machines/{accountId}/{machineId}", s.withAuth(true, s.handleRenameMachine))
+	mux.HandleFunc("DELETE /api/machines/{accountId}/{machineId}", s.withAuth(true, s.handleDeleteMachine))
 	mux.HandleFunc("POST /api/sync", s.withAuth(true, s.handleSyncAll))
 	mux.HandleFunc("GET /api/machines/{accountId}/{machineId}/telemetry", s.withAuth(false, s.handleMachineTelemetry))
 	mux.HandleFunc("POST /api/machines/{accountId}/{machineId}/actions/{action}", s.withAuth(true, s.handleMachineAction))
@@ -693,6 +695,96 @@ func (s *Server) handleCreateMachine(w http.ResponseWriter, r *http.Request) {
 		resp["machines"] = machines
 	}
 	writeJSON(w, http.StatusAccepted, resp)
+}
+
+func (s *Server) handleRenameMachine(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	var req struct {
+		Name string `json:"name"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if !isValidMachineName(req.Name) {
+		writeError(w, http.StatusBadRequest, "invalid_name", "machine name must be 1-63 lowercase letters, digits or hyphens, starting with a letter or digit")
+		return
+	}
+	updated, err := s.poller.RenameMachine(r.Context(), accountID, machineID, req.Name)
+	if err != nil {
+		if errors.Is(err, store.ErrAccountNotFound) || errors.Is(err, store.ErrMachineNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			return
+		}
+		var apiErr *instabox.APIError
+		if errors.As(err, &apiErr) {
+			writeJSON(w, clampUpstreamStatus(apiErr.Status), map[string]any{
+				"error": map[string]any{
+					"code":              apiErr.Code,
+					"message":           apiErr.Message,
+					"retryable":         apiErr.Retryable,
+					"operationId":       apiErr.OperationID,
+					"retryAfterSeconds": apiErr.RetryAfterSeconds,
+					"reason":            apiErr.Reason,
+					"hint":              apiErr.Hint,
+				},
+			})
+			return
+		}
+		log.Printf("rename machine %s/%s error: %v", accountID, machineID, err)
+		writeError(w, http.StatusBadGateway, "upstream_error", "failed to rename machine on instabox.sh")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"machine": updated,
+	})
+}
+
+func (s *Server) handleDeleteMachine(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	res, err := s.poller.DeleteMachine(r.Context(), accountID, machineID)
+	if err != nil {
+		if errors.Is(err, store.ErrAccountNotFound) || errors.Is(err, store.ErrMachineNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			return
+		}
+		var apiErr *instabox.APIError
+		if errors.As(err, &apiErr) {
+			writeJSON(w, clampUpstreamStatus(apiErr.Status), map[string]any{
+				"error": map[string]any{
+					"code":              apiErr.Code,
+					"message":           apiErr.Message,
+					"retryable":         apiErr.Retryable,
+					"operationId":       apiErr.OperationID,
+					"retryAfterSeconds": apiErr.RetryAfterSeconds,
+					"reason":            apiErr.Reason,
+					"hint":              apiErr.Hint,
+				},
+			})
+			return
+		}
+		log.Printf("delete machine %s/%s error: %v", accountID, machineID, err)
+		writeError(w, http.StatusBadGateway, "upstream_error", "failed to delete machine on instabox.sh")
+		return
+	}
+	accounts, accErr := s.store.ListAccounts(r.Context())
+	machines, machErr := s.store.ListMachines(r.Context())
+	resp := map[string]any{
+		"ok":            true,
+		"operation":     res.Operation,
+		"serverTimeMs":  time.Now().UTC().UnixMilli(),
+		"clockOffsetMs": s.poller.ClockOffsetMs(),
+	}
+	if accErr == nil && accounts != nil {
+		resp["accounts"] = accounts
+	}
+	if machErr == nil && machines != nil {
+		resp["machines"] = machines
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleListMachines(w http.ResponseWriter, r *http.Request) {

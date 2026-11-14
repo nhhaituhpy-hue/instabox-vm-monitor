@@ -203,3 +203,41 @@ func TestListTemplatesAndCreateMachine(t *testing.T) {
 		t.Fatalf("unexpected create result: %+v", res)
 	}
 }
+
+func TestRenameAndDeleteMachineSendIdempotencyAndConfirmHeader(t *testing.T) {
+	var patchIdem, deleteIdem, confirmHdr string
+	var patchBody map[string]any
+	client, _ := newMockClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1/machines/m_1":
+			patchIdem = r.Header.Get("Idempotency-Key")
+			_ = json.NewDecoder(r.Body).Decode(&patchBody)
+			_, _ = w.Write([]byte(`{"id":"m_1","name":"renamed-box","state":"running","desiredState":"running","spec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20},"storage":{"sizeGiB":20,"mountPath":"/data","persistent":true,"synced":true},"runtime":{"ready":true}}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/machines/m_1":
+			deleteIdem = r.Header.Get("Idempotency-Key")
+			confirmHdr = r.Header.Get("X-Confirm-Delete")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"id":"op_del_1","machineId":"m_1","type":"delete","state":"queued"}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	ctx := context.Background()
+	m, err := client.RenameMachine(ctx, "ibk_test", "m_1", "renamed-box")
+	if err != nil {
+		t.Fatalf("RenameMachine err = %v", err)
+	}
+	if patchIdem == "" || patchBody["name"] != "renamed-box" || m.Name != "renamed-box" {
+		t.Fatalf("unexpected rename state: idem=%q body=%+v m=%+v", patchIdem, patchBody, m)
+	}
+
+	res, err := client.DeleteMachine(ctx, "ibk_test", "m_1", "m_1")
+	if err != nil {
+		t.Fatalf("DeleteMachine err = %v", err)
+	}
+	if deleteIdem == "" || confirmHdr != "m_1" || res.Operation == nil || res.Operation.ID != "op_del_1" {
+		t.Fatalf("unexpected delete state: idem=%q confirm=%q res=%+v", deleteIdem, confirmHdr, res)
+	}
+}
