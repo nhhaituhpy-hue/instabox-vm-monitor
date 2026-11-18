@@ -388,3 +388,54 @@ func TestAPIKeyLifecycleAndVerification(t *testing.T) {
 		t.Fatalf("expected revoked key to fail auth, got %v", err)
 	}
 }
+
+func TestListMachinesPrioritizesRunningFirst(t *testing.T) {
+	st, _ := newTestStore(t)
+	ctx := context.Background()
+
+	acc1, err := st.CreateAccount(ctx, store.AccountInput{Alias: "Box 1", APIKey: "ibk_acc1_1234567890"})
+	if err != nil {
+		t.Fatalf("CreateAccount 1: %v", err)
+	}
+	acc2, err := st.CreateAccount(ctx, store.AccountInput{Alias: "Box 2", APIKey: "ibk_acc2_1234567890"})
+	if err != nil {
+		t.Fatalf("CreateAccount 2: %v", err)
+	}
+
+	if err := st.SyncAccountMachines(ctx, acc1.ID, []store.MachineRecord{
+		{AccountID: acc1.ID, MachineID: "m_stop_a", Name: "alpha-stopped", State: "stopped", DesiredState: "stopped"},
+		{AccountID: acc1.ID, MachineID: "m_susp_a", Name: "bravo-paused", State: "suspended", DesiredState: "suspended"},
+		{AccountID: acc1.ID, MachineID: "m_run_a", Name: "zulu-running", State: "running", DesiredState: "running"},
+	}); err != nil {
+		t.Fatalf("SyncAccountMachines 1: %v", err)
+	}
+	if err := st.SyncAccountMachines(ctx, acc2.ID, []store.MachineRecord{
+		{AccountID: acc2.ID, MachineID: "m_err_b", Name: "charlie-error", State: "error", DesiredState: "running"},
+		{AccountID: acc2.ID, MachineID: "m_boot_b", Name: "delta-booting", State: "starting", DesiredState: "running"},
+		{AccountID: acc2.ID, MachineID: "m_run_b", Name: "alpha-running", State: "running", DesiredState: "running"},
+	}); err != nil {
+		t.Fatalf("SyncAccountMachines 2: %v", err)
+	}
+
+	listed, err := st.ListMachines(ctx)
+	if err != nil {
+		t.Fatalf("ListMachines: %v", err)
+	}
+	// Running machines must always come first, followed by booting, suspended, stopped, error.
+	if len(listed) != 6 {
+		t.Fatalf("expected 6 machines, got %d", len(listed))
+	}
+	gotStates := make([]string, len(listed))
+	for i, m := range listed {
+		gotStates[i] = m.State
+	}
+	wantStates := []string{"running", "running", "starting", "suspended", "stopped", "error"}
+	for i, w := range wantStates {
+		if gotStates[i] != w {
+			t.Fatalf("state order mismatch at %d: got %v, want %v", i, gotStates, wantStates)
+		}
+	}
+	if listed[0].MachineID != "m_run_b" || listed[1].MachineID != "m_run_a" {
+		t.Fatalf("expected running machines sorted deterministically by name when created_at ties, got %s then %s", listed[0].MachineID, listed[1].MachineID)
+	}
+}

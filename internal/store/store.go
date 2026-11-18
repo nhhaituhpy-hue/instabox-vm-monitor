@@ -875,7 +875,14 @@ func (s *Store) GetMachine(ctx context.Context, accountID, machineID string) (*M
 }
 
 func (s *Store) ListMachines(ctx context.Context) ([]MachineRecord, error) {
-	return s.queryMachines(ctx, `ORDER BY a.created_at ASC, m.name ASC, m.machine_id ASC`)
+	return s.queryMachines(ctx, `ORDER BY CASE
+		WHEN m.state = 'running' THEN 0
+		WHEN m.state IN ('starting', 'resuming', 'creating') THEN 1
+		WHEN m.state = 'suspended' THEN 2
+		WHEN m.state IN ('stopping', 'suspending', 'deleting') THEN 3
+		WHEN m.state = 'stopped' THEN 4
+		ELSE 5
+	END ASC, a.created_at ASC, m.name ASC, m.machine_id ASC`)
 }
 
 func (s *Store) queryMachines(ctx context.Context, clause string, args ...any) ([]MachineRecord, error) {

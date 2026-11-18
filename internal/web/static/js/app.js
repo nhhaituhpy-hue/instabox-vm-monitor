@@ -536,16 +536,14 @@ async function triggerSyncAll() {
     delete syncBtn.dataset.syncDone;
     syncBtn.dataset.syncing = 'true';
     syncBtn.setAttribute('aria-busy', 'true');
-    const iconHost = syncBtn.querySelector('.btn-sync-icon');
-    if (iconHost) iconHost.replaceChildren(ICONS.refresh());
   }
   const startedAt = performance.now();
   try {
     state.machineOptionsCache.clear();
     const data = await apiFetch('/api/sync', { method: 'POST' });
     const elapsed = performance.now() - startedAt;
-    if (elapsed < 380) {
-      await new Promise((r) => setTimeout(r, 380 - elapsed));
+    if (elapsed < 450) {
+      await new Promise((r) => setTimeout(r, 450 - elapsed));
     }
     applyMachinesPayload(data);
     updateDashboardInPlace();
@@ -555,15 +553,11 @@ async function triggerSyncAll() {
       delete btnAfter.dataset.syncing;
       btnAfter.removeAttribute('aria-busy');
       btnAfter.dataset.syncDone = 'true';
-      const iconHost = btnAfter.querySelector('.btn-sync-icon');
-      if (iconHost) iconHost.replaceChildren(ICONS.check());
       syncDoneTimer = setTimeout(() => {
         const cur = document.getElementById('sync-all-btn');
         if (!cur || cur.dataset.syncing === 'true') return;
         delete cur.dataset.syncDone;
-        const ih = cur.querySelector('.btn-sync-icon');
-        if (ih) ih.replaceChildren(ICONS.refresh());
-      }, 1100);
+      }, 1150);
     }
   } catch (err) {
     const btnAfter = document.getElementById('sync-all-btn');
@@ -1407,19 +1401,55 @@ function createVmCardController(initialVm) {
 }
 
 // ============================================================
-// Modern KPI Cards (Subgrid-aligned, in-place updates)
+// Modern KPI Cards (Subgrid-aligned, interactive status filters)
 // ============================================================
+function syncStateFilterUI() {
+  const sel = document.getElementById('filter-state-select');
+  if (sel && sel.value !== state.filterState) {
+    sel.value = state.filterState;
+  }
+  const strip = document.getElementById('stats-strip');
+  if (strip?._kpi?.cards) {
+    for (const item of strip._kpi.cards) {
+      const active = state.filterState === item.filterKey;
+      item.card.dataset.active = active ? 'true' : 'false';
+      item.card.setAttribute('aria-pressed', active ? 'true' : 'false');
+    }
+  }
+}
+
 function ensureKpiCards(strip) {
   if (strip._kpi) return strip._kpi;
 
-  const makeCard = ({ tone = '', showLivePill = false }) => {
-    const card = el('article', { className: 'kpi-card' });
+  const cards = [];
+  const makeCard = ({ filterKey, tone = '', showLivePill = false }) => {
+    const active = state.filterState === filterKey;
+    const card = el('button', {
+      type: 'button',
+      className: 'kpi-card',
+      dataset: {
+        filter: filterKey,
+        ...(tone ? { tone } : {}),
+        active: active ? 'true' : 'false'
+      },
+      'aria-pressed': active ? 'true' : 'false',
+      onClick: () => {
+        if (state.accounts.length === 0) return;
+        state.filterState =
+          filterKey === 'all'
+            ? 'all'
+            : state.filterState === filterKey
+              ? 'all'
+              : filterKey;
+        syncStateFilterUI();
+        renderVmListOnly();
+      }
+    });
 
-    const rule = el('span', { className: 'kpi-accent-rule', dataset: tone ? { tone } : {} });
     const lbl = el('span', { className: 'kpi-label' });
-    const eyebrow = el('div', { className: 'kpi-eyebrow' }, [rule, lbl]);
+    const eyebrow = el('span', { className: 'kpi-eyebrow' }, [lbl]);
 
-    const head = el('header', { className: 'kpi-head' }, [eyebrow]);
+    const head = el('div', { className: 'kpi-head' }, [eyebrow]);
     if (showLivePill) {
       const liveText = el('span');
       const pill = el('span', { className: 'live-pill' }, [
@@ -1432,33 +1462,34 @@ function ensureKpiCards(strip) {
 
     const val = el('div', { className: 'kpi-value', dataset: tone ? { tone } : {} });
     const track = el('div', { className: 'kpi-track' });
-    const foot = el('p', { className: 'kpi-foot' });
+    const foot = el('div', { className: 'kpi-foot' });
 
     card.append(head, val, track, foot);
+    cards.push({ card, filterKey });
     return { card, lbl, val, track, foot, liveText: card._liveText };
   };
 
-  const cTotal = makeCard({ showLivePill: true });
+  const cTotal = makeCard({ filterKey: 'all', showLivePill: true });
   const segRun = el('span', { className: 'kpi-fill', dataset: { tone: 'running' } });
   const segIdle = el('span', { className: 'kpi-fill', dataset: { tone: 'idle' } });
   const segStop = el('span', { className: 'kpi-fill', dataset: { tone: 'stopped' } });
   const segErr = el('span', { className: 'kpi-fill', dataset: { tone: 'error' } });
   cTotal.track.append(segRun, segIdle, segStop, segErr);
 
-  const cRun = makeCard({ tone: 'running' });
+  const cRun = makeCard({ filterKey: 'running', tone: 'running' });
   const runFill = el('span', { className: 'kpi-fill', dataset: { tone: 'running' } });
   cRun.track.append(runFill);
 
-  const cPause = makeCard({ tone: 'idle' });
+  const cPause = makeCard({ filterKey: 'suspended', tone: 'idle' });
   const pauseFill = el('span', { className: 'kpi-fill', dataset: { tone: 'idle' } });
   cPause.track.append(pauseFill);
 
-  const cStop = makeCard({ tone: 'stopped' });
+  const cStop = makeCard({ filterKey: 'stopped', tone: 'stopped' });
   const stopFill = el('span', { className: 'kpi-fill', dataset: { tone: 'stopped' } });
   cStop.track.append(stopFill);
 
   strip.replaceChildren(cTotal.card, cRun.card, cPause.card, cStop.card);
-  strip._kpi = { cTotal, segRun, segIdle, segStop, segErr, cRun, runFill, cPause, pauseFill, cStop, stopFill };
+  strip._kpi = { cards, cTotal, segRun, segIdle, segStop, segErr, cRun, runFill, cPause, pauseFill, cStop, stopFill };
   return strip._kpi;
 }
 
@@ -1503,6 +1534,12 @@ function populateStatsStrip(strip) {
   setTextIfChanged(kpi.cStop.val, String(stopped));
   kpi.stopFill.style.width = widthPct(stopped);
   setTextIfChanged(kpi.cStop.foot, t('kpiMonthlyFleet', { dur: fmtCompactDuration(totalMonthlySec) }));
+
+  for (const item of kpi.cards) {
+    const active = state.filterState === item.filterKey;
+    item.card.dataset.active = active ? 'true' : 'false';
+    item.card.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
 }
 
 function updateDashboardHero(heroEl) {
@@ -1526,7 +1563,10 @@ function renderDashboard() {
   ]);
   const addBtnText = el('span');
   const syncBtnText = el('span');
-  const syncIconWrap = el('span', { className: 'btn-sync-icon', 'aria-hidden': 'true' }, [ICONS.refresh()]);
+  const syncIconWrap = el('span', { className: 'btn-sync-icon', 'aria-hidden': 'true' }, [
+    el('span', { className: 'btn-sync-glyph btn-sync-glyph-refresh' }, [ICONS.refresh()]),
+    el('span', { className: 'btn-sync-glyph btn-sync-glyph-check' }, [ICONS.check()])
+  ]);
 
   const hero = el('section', { id: 'dashboard-hero', className: 'dashboard-hero' }, [
     el('div', { className: 'hero-text' }, [heroBrand]),
@@ -1596,10 +1636,12 @@ function renderDashboard() {
   syncAccountFilterSelect(accSelect);
 
   const stateSelect = el('select', {
+    id: 'filter-state-select',
     className: 'select-compact',
     'aria-label': t('allStates'),
     onChange: (e) => {
       state.filterState = e.target.value;
+      syncStateFilterUI();
       renderVmListOnly();
     }
   }, [
@@ -1647,17 +1689,40 @@ function renderDashboard() {
   return main;
 }
 
+function machineStateRank(vm) {
+  switch (vm?.state) {
+    case 'running':
+      return 0;
+    case 'starting':
+    case 'resuming':
+    case 'creating':
+      return 1;
+    case 'suspended':
+      return 2;
+    case 'stopping':
+    case 'suspending':
+    case 'deleting':
+      return 3;
+    case 'stopped':
+      return 4;
+    default:
+      return 5;
+  }
+}
+
 function getFilteredMachines() {
   const q = state.searchQuery.trim().toLowerCase();
-  return state.machines.filter((vm) => {
-    if (state.filterAccount !== 'all' && vm.accountId !== state.filterAccount) return false;
-    if (state.filterState !== 'all' && vm.state !== state.filterState) return false;
-    if (q) {
-      const hay = `${vm.name} ${vm.id} ${vm.templateId} ${vm.accountAlias || ''}`.toLowerCase();
-      if (!hay.includes(q)) return false;
-    }
-    return true;
-  });
+  return state.machines
+    .filter((vm) => {
+      if (state.filterAccount !== 'all' && vm.accountId !== state.filterAccount) return false;
+      if (state.filterState !== 'all' && vm.state !== state.filterState) return false;
+      if (q) {
+        const hay = `${vm.name} ${vm.id} ${vm.templateId} ${vm.accountAlias || ''}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    })
+    .sort((a, b) => machineStateRank(a) - machineStateRank(b));
 }
 
 function populateVmList(host) {
