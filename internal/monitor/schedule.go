@@ -307,6 +307,7 @@ func (p *Poller) SetMachineSchedule(ctx context.Context, accountID, machineID st
 		return nil, err
 	}
 	normalized := ""
+	clearWindows := false
 	if enabled {
 		if tzOffsetMin == 0 {
 			tzOffsetMin = 420
@@ -319,8 +320,12 @@ func (p *Poller) SetMachineSchedule(ctx context.Context, accountID, machineID st
 		if err != nil {
 			return nil, err
 		}
+	} else if strings.TrimSpace(windowsText) == "[]" {
+		// Disabling normally preserves the configured windows for re-enable, but an
+		// explicit empty list means "clear my schedule" (the editor's wipe-and-disable).
+		clearWindows = true
 	}
-	if err := p.store.SetMachineSchedule(ctx, accountID, machineID, enabled, normalized, tzOffsetMin); err != nil {
+	if err := p.store.SetMachineSchedule(ctx, accountID, machineID, enabled, normalized, tzOffsetMin, clearWindows); err != nil {
 		return nil, err
 	}
 	if enabled {

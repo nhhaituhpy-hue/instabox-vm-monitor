@@ -3865,11 +3865,19 @@ async function openScheduleDialog(vmRef) {
 
   // Seed rows from the stored windows.
   rowsHost.replaceChildren();
+  const refreshSaveMode = () => {
+    const empty = rowsHost.children.length === 0;
+    saveBtn.dataset.mode = empty ? 'clear' : 'save';
+    setTextIfChanged(saveBtn, empty ? t('schedClearBtn') : t('schedSave'));
+    errEl.hidden = true;
+  };
   const addRow = (start, end) => {
     const row = scheduleWindowRow(start, end, () => {
       row.remove();
+      refreshSaveMode();
     });
     rowsHost.append(row);
+    refreshSaveMode();
     return row;
   };
   let seeded = [];
@@ -3880,6 +3888,7 @@ async function openScheduleDialog(vmRef) {
     // Only a machine that never had any window configured gets the starter row.
     addRow('06:00', '08:00');
   }
+  refreshSaveMode();
   addBtn.onclick = () => {
     if (rowsHost.children.length >= 12) {
       errEl.hidden = false;
@@ -3892,27 +3901,36 @@ async function openScheduleDialog(vmRef) {
 
   saveBtn.onclick = async () => {
     const rows = [...rowsHost.children];
-    const { entries, error } = validateWindowRows(rows);
-    if (error) {
-      errEl.hidden = false;
-      setTextIfChanged(errEl, error);
-      return;
+    let body;
+    let toastKey;
+    if (rows.length === 0) {
+      // Explicitly cleared: disable the schedule and wipe the stored windows.
+      body = { enabled: false, windows: '[]', tzOffsetMin: 420 };
+      toastKey = 'schedClearedToast';
+    } else {
+      const { entries, error } = validateWindowRows(rows);
+      if (error) {
+        errEl.hidden = false;
+        setTextIfChanged(errEl, error);
+        return;
+      }
+      body = { enabled: true, windows: entries.map((w) => `${w.start}-${w.end}`).join(', '), tzOffsetMin: 420 };
+      toastKey = 'schedEnabledToast';
     }
     errEl.hidden = true;
     saveBtn.disabled = true;
     setTextIfChanged(saveBtn, t('schedSaving'));
     try {
-      const windowsText = entries.map((w) => `${w.start}-${w.end}`).join(', ');
       const res = await apiFetch(
         `/api/machines/${encodeURIComponent(vm.accountId)}/${encodeURIComponent(vm.id)}/schedule`,
-        { method: 'PUT', body: JSON.stringify({ enabled: true, windows: windowsText, tzOffsetMin: 420 }) }
+        { method: 'PUT', body: JSON.stringify(body) }
       );
       if (res?.machine) {
         const idx = state.machines.findIndex((x) => x.accountId === vm.accountId && x.id === vm.id);
         if (idx >= 0) state.machines[idx] = res.machine;
         updateDashboardInPlace();
       }
-      showToast(`${t('schedEnabledToast')}: ${vm.name}`);
+      showToast(`${t(toastKey)}: ${vm.name}`);
       scheduleDialog.close();
       setTimeout(() => refreshMachinesSilently(), 1200);
     } catch (err) {
@@ -3920,7 +3938,7 @@ async function openScheduleDialog(vmRef) {
       setTextIfChanged(errEl, err.message);
     } finally {
       saveBtn.disabled = false;
-      setTextIfChanged(saveBtn, t('schedSave'));
+      refreshSaveMode();
     }
   };
 

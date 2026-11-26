@@ -857,7 +857,7 @@ func (s *Store) SetMachineKeepalive(ctx context.Context, accountID, machineID st
 // SetMachineSchedule persists a machine's time-window schedule. windowsJSON is the
 // validated, normalized JSON array of {"start":"HH:MM","end":"HH:MM"} entries.
 // Enabling the schedule disables keepalive (the two driving modes are mutually exclusive).
-func (s *Store) SetMachineSchedule(ctx context.Context, accountID, machineID string, enabled bool, windowsJSON string, tzOffsetMin int) error {
+func (s *Store) SetMachineSchedule(ctx context.Context, accountID, machineID string, enabled bool, windowsJSON string, tzOffsetMin int, clearWindows ...bool) error {
 	var res sql.Result
 	var err error
 	if enabled {
@@ -871,12 +871,21 @@ func (s *Store) SetMachineSchedule(ctx context.Context, accountID, machineID str
 		// Disabling keeps the configured windows: users expect their schedule
 		// back when re-enabling or opening the editor, and wiping config on a
 		// pause toggle is destructive.
-		res, err = s.db.ExecContext(ctx, `
-			UPDATE machines
-			SET schedule_enabled = 0, schedule_last_action = '',
-			    schedule_last_at = 0, schedule_last_error = ''
-			WHERE account_id = ? AND machine_id = ?
-		`, accountID, machineID)
+		if len(clearWindows) > 0 && clearWindows[0] {
+			res, err = s.db.ExecContext(ctx, `
+				UPDATE machines
+				SET schedule_enabled = 0, schedule_windows = '', schedule_last_action = '',
+				    schedule_last_at = 0, schedule_last_error = ''
+				WHERE account_id = ? AND machine_id = ?
+			`, accountID, machineID)
+		} else {
+			res, err = s.db.ExecContext(ctx, `
+				UPDATE machines
+				SET schedule_enabled = 0, schedule_last_action = '',
+				    schedule_last_at = 0, schedule_last_error = ''
+				WHERE account_id = ? AND machine_id = ?
+			`, accountID, machineID)
+		}
 	}
 	if err != nil {
 		return err
