@@ -100,6 +100,8 @@ type MachineRecord struct {
 	AutoSuspendedAt         string          `json:"autoSuspendedAt"`
 	CooldownUntil           string          `json:"cooldownUntil"`
 	CooldownReason          string          `json:"cooldownReason"`
+	ArchiveAt               string          `json:"archiveAt,omitempty"`
+	DeleteAt                string          `json:"deleteAt,omitempty"`
 	OperationID             string          `json:"operationId"`
 	MonthlyRunningSeconds   int64           `json:"monthlyRunningSeconds"`
 	LastErrorCode           string          `json:"lastErrorCode"`
@@ -218,6 +220,8 @@ func (s *Store) migrate(ctx context.Context) error {
 		auto_suspended_at TEXT NOT NULL DEFAULT '',
 		cooldown_until TEXT NOT NULL DEFAULT '',
 		cooldown_reason TEXT NOT NULL DEFAULT '',
+		archive_at TEXT NOT NULL DEFAULT '',
+		delete_at TEXT NOT NULL DEFAULT '',
 		operation_id TEXT NOT NULL DEFAULT '',
 		monthly_running_seconds INTEGER NOT NULL DEFAULT 0,
 		last_error_code TEXT NOT NULL DEFAULT '',
@@ -303,6 +307,8 @@ func (s *Store) ensureMachineColumns(ctx context.Context) error {
 		{"keepalive_last_action", `ALTER TABLE machines ADD COLUMN keepalive_last_action TEXT NOT NULL DEFAULT ''`},
 		{"keepalive_last_error", `ALTER TABLE machines ADD COLUMN keepalive_last_error TEXT NOT NULL DEFAULT ''`},
 		{"keepalive_pending_restart", `ALTER TABLE machines ADD COLUMN keepalive_pending_restart INTEGER NOT NULL DEFAULT 0`},
+		{"archive_at", `ALTER TABLE machines ADD COLUMN archive_at TEXT NOT NULL DEFAULT ''`},
+		{"delete_at", `ALTER TABLE machines ADD COLUMN delete_at TEXT NOT NULL DEFAULT ''`},
 	}
 	for _, m := range migrations {
 		if existing[m.name] {
@@ -700,9 +706,9 @@ func (s *Store) SyncAccountMachines(ctx context.Context, accountID string, recor
 			INSERT INTO machines(
 				account_id, machine_id, name, state, desired_state, vcpus, mem_mib, persistent_disk_gib, root_disk_gib,
 				template_id, free, ready, processes_preserved, auto_suspend_after_seconds, max_run_minutes,
-				run_started_at, auto_suspended_at, cooldown_until, cooldown_reason, operation_id,
+				run_started_at, auto_suspended_at, cooldown_until, cooldown_reason, archive_at, delete_at, operation_id,
 				monthly_running_seconds, last_error_code, last_error_msg, disk_json, raw_json, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(account_id, machine_id) DO UPDATE SET
 				name = excluded.name,
 				state = excluded.state,
@@ -721,6 +727,8 @@ func (s *Store) SyncAccountMachines(ctx context.Context, accountID string, recor
 				auto_suspended_at = excluded.auto_suspended_at,
 				cooldown_until = excluded.cooldown_until,
 				cooldown_reason = excluded.cooldown_reason,
+				archive_at = excluded.archive_at,
+				delete_at = excluded.delete_at,
 				operation_id = excluded.operation_id,
 				monthly_running_seconds = CASE
 					WHEN excluded.monthly_running_seconds > 0 THEN excluded.monthly_running_seconds
@@ -739,7 +747,7 @@ func (s *Store) SyncAccountMachines(ctx context.Context, accountID string, recor
 				updated_at = excluded.updated_at
 		`, accountID, r.MachineID, r.Name, r.State, r.DesiredState, r.VCPUs, r.MemMiB, r.PersistentDiskGiB, r.RootDiskGiB,
 			r.TemplateID, freeInt, readyInt, procInt, autoSusp, r.MaxRunMinutes,
-			r.RunStartedAt, r.AutoSuspendedAt, r.CooldownUntil, r.CooldownReason, r.OperationID,
+			r.RunStartedAt, r.AutoSuspendedAt, r.CooldownUntil, r.CooldownReason, r.ArchiveAt, r.DeleteAt, r.OperationID,
 			r.MonthlyRunningSeconds, r.LastErrorCode, r.LastErrorMsg, string(r.DiskJSON), string(r.RawJSON), now)
 		if err != nil {
 			return err
@@ -890,7 +898,7 @@ func (s *Store) queryMachines(ctx context.Context, clause string, args ...any) (
 		SELECT m.account_id, a.alias, a.org_tier, m.machine_id, m.name, m.state, m.desired_state,
 		       m.vcpus, m.mem_mib, m.persistent_disk_gib, m.root_disk_gib, m.template_id,
 		       m.free, m.ready, m.processes_preserved, m.auto_suspend_after_seconds, m.max_run_minutes,
-		       m.run_started_at, m.auto_suspended_at, m.cooldown_until, m.cooldown_reason, m.operation_id,
+		       m.run_started_at, m.auto_suspended_at, m.cooldown_until, m.cooldown_reason, m.archive_at, m.delete_at, m.operation_id,
 		       m.monthly_running_seconds, m.last_error_code, m.last_error_msg, m.disk_json,
 		       m.keepalive_enabled, m.keepalive_lease_expires_at, m.keepalive_last_at, m.keepalive_last_action, m.keepalive_last_error, m.keepalive_pending_restart,
 		       m.updated_at
@@ -912,7 +920,7 @@ func (s *Store) queryMachines(ctx context.Context, clause string, args ...any) (
 			&r.AccountID, &r.AccountAlias, &r.AccountOrgTier, &r.MachineID, &r.Name, &r.State, &r.DesiredState,
 			&r.VCPUs, &r.MemMiB, &r.PersistentDiskGiB, &r.RootDiskGiB, &r.TemplateID,
 			&freeInt, &readyInt, &procInt, &autoSusp, &r.MaxRunMinutes,
-			&r.RunStartedAt, &r.AutoSuspendedAt, &r.CooldownUntil, &r.CooldownReason, &r.OperationID,
+			&r.RunStartedAt, &r.AutoSuspendedAt, &r.CooldownUntil, &r.CooldownReason, &r.ArchiveAt, &r.DeleteAt, &r.OperationID,
 			&r.MonthlyRunningSeconds, &r.LastErrorCode, &r.LastErrorMsg, &diskStr,
 			&keepaliveInt, &r.KeepaliveLeaseExpiresAt, &r.KeepaliveLastAt, &r.KeepaliveLastAction, &r.KeepaliveLastError, &pendingRestartInt,
 			&r.UpdatedAt,

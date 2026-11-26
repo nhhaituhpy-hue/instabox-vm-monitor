@@ -624,6 +624,29 @@ func (p *Poller) UpdateMachine(ctx context.Context, accountID, machineID string,
 	return p.store.GetMachine(ctx, accountID, machineID)
 }
 
+func (p *Poller) ForkMachine(ctx context.Context, accountID, machineID string, in instabox.ForkMachineInput) (*instabox.ActionResult, error) {
+	apiKey, err := p.store.GetAccountAPIKey(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.store.GetMachine(ctx, accountID, machineID); err != nil {
+		return nil, err
+	}
+	res, err := p.client.ForkMachine(ctx, apiKey, machineID, in)
+	if err != nil {
+		return nil, err
+	}
+	if res.Operation != nil && res.Operation.ID != "" {
+		if res.Operation.Machine != nil {
+			_ = p.syncSingleMachine(ctx, accountID, *res.Operation.Machine)
+		}
+		if res.Operation.State != "succeeded" && res.Operation.State != "failed" {
+			p.trackOperation(accountID, apiKey, res.Operation.ID)
+		}
+	}
+	return res, nil
+}
+
 func (p *Poller) DeleteMachine(ctx context.Context, accountID, machineID string) (*instabox.ActionResult, error) {
 	apiKey, err := p.store.GetAccountAPIKey(ctx, accountID)
 	if err != nil {
@@ -943,6 +966,8 @@ func toMachineRecord(accountID string, m instabox.Machine) store.MachineRecord {
 		AutoSuspendedAt:         m.AutoSuspendedAt,
 		CooldownUntil:           m.CooldownUntil,
 		CooldownReason:          m.CooldownReason,
+		ArchiveAt:               m.ArchiveAt,
+		DeleteAt:                m.DeleteAt,
 		OperationID:             m.OperationID,
 		RawJSON:                 raw,
 	}

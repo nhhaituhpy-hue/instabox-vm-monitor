@@ -913,3 +913,64 @@ func TestMachineTerminalWebSocketProxyAndOriginChecks(t *testing.T) {
 		t.Fatalf("expected machine_not_running error frame, got op=%d msg=%q err=%v", op, string(errFrame), err)
 	}
 }
+
+func TestCreateMachineLifetimeValidationAndPassthrough(t *testing.T) {
+	h, _ := setupTestServer(t)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/setup", bytes.NewBufferString(`{"username":"«redacted-vault-secret»","password":"SuperSecret!123"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	cookies := rec.Result().Cookies()
+	var setupResp struct {
+		CSRFToken string `json:"csrfToken"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &setupResp)
+
+	req = httptest.NewRequest(http.MethodPost, "/api/accounts", bytes.NewBufferString(`{"alias":"Box 1","apiKey":"ibk_valid_secret_key_9999"}`))
+	req.AddCookie(cookies[0])
+	req.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var accResp struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &accResp)
+
+	post := func(body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/api/machines", bytes.NewBufferString(body))
+		r.AddCookie(cookies[0])
+		r.Header.Set("X-CSRF-Token", setupResp.CSRFToken)
+		r.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, r)
+		return rr
+	}
+
+	// autoSuspend not a whole minute -> 400 (new upstream rule: whole minutes 5-30 or 0)
+	rr := post(`{"accountId":"` + accResp.ID + `","templateId":"android","autoSuspendAfterSeconds":450}`)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-minute autoSuspend, got %d: %s", rr.Code, rr.Body.String())
+	}
+	// autoSuspend outside 5-30 -> 400
+	rr = post(`{"accountId":"` + accResp.ID + `","templateId":"android","autoSuspendAfterSeconds":3600}`)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for out-of-range autoSuspend, got %d: %s", rr.Code, rr.Body.String())
+	}
+	// deleteAfterSeconds out of range -> 400
+	rr = post(`{"accountId":"` + accResp.ID + `","templateId":"android","deleteAfterSeconds":30}`)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for deleteAfterSeconds < 60, got %d: %s", rr.Code, rr.Body.String())
+	}
+	// valid: whole minute + valid deleteAfter/archiveSeconds -> 202
+	rr = post(`{"accountId":"` + accResp.ID + `","templateId":"android","autoSuspendAfterSeconds":600,"deleteAfterSeconds":3600,"archiveSeconds":7200}`)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 for valid lifetime create, got %d: %s", rr.Code, rr.Body.String())
+	}
+	// autoSuspend=0 (always-on) is a valid wire value upstream for paid plans
+	rr = post(`{"accountId":"` + accResp.ID + `","templateId":"android","autoSuspendAfterSeconds":0}`)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 for autoSuspend=0, got %d: %s", rr.Code, rr.Body.String())
+	}
+}

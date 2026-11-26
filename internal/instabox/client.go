@@ -128,15 +128,30 @@ type CreateMachineInput struct {
 	DesiredState            string            `json:"desiredState,omitempty"`
 	AutoSuspendAfterSeconds *int              `json:"autoSuspendAfterSeconds,omitempty"`
 	MaxRunMinutes           *int              `json:"maxRunMinutes,omitempty"`
+	DeleteAfterSeconds      int               `json:"deleteAfterSeconds,omitempty"`
+	ArchiveSeconds          int               `json:"archiveSeconds,omitempty"`
 	Env                     map[string]string `json:"env,omitempty"`
 }
 
 type UpdateMachineInput struct {
 	Name                    *string           `json:"name,omitempty"`
+	VCPUs                   int               `json:"vcpus,omitempty"`
+	MemMiB                  int               `json:"memMiB,omitempty"`
 	AutoSuspendAfterSeconds *int              `json:"autoSuspendAfterSeconds,omitempty"`
 	MaxRunMinutes           *int              `json:"maxRunMinutes,omitempty"`
 	Metadata                map[string]string `json:"metadata,omitempty"`
+	CancelScheduled         bool              `json:"cancelScheduled,omitempty"`
 	Apply                   string            `json:"apply,omitempty"`
+}
+
+type ForkMachineInput struct {
+	Name                    string            `json:"name,omitempty"`
+	VCPUs                   int               `json:"vcpus,omitempty"`
+	MemMiB                  int               `json:"memMiB,omitempty"`
+	AutoSuspendAfterSeconds *int              `json:"autoSuspendAfterSeconds,omitempty"`
+	MaxRunMinutes           *int              `json:"maxRunMinutes,omitempty"`
+	DeleteAfterSeconds      int               `json:"deleteAfterSeconds,omitempty"`
+	Metadata                map[string]string `json:"metadata,omitempty"`
 }
 
 type ExecInput struct {
@@ -335,6 +350,11 @@ func (e *APIError) Error() string {
 	return fmt.Sprintf("instabox api %d: %s", e.Status, e.Message)
 }
 
+type MachineQueue struct {
+	Position  int    `json:"position,omitempty"`
+	ExpiresAt string `json:"expiresAt,omitempty"`
+}
+
 type Machine struct {
 	ID                      string            `json:"id"`
 	Name                    string            `json:"name"`
@@ -352,6 +372,11 @@ type Machine struct {
 	RunStartedAt            string            `json:"runStartedAt"`
 	CooldownUntil           string            `json:"cooldownUntil"`
 	CooldownReason          string            `json:"cooldownReason,omitempty"`
+	ArchiveAt               string            `json:"archiveAt,omitempty"`
+	DeleteAt                string            `json:"deleteAt,omitempty"`
+	ReadyAt                 string            `json:"readyAt,omitempty"`
+	Suspendable             *bool             `json:"suspendable,omitempty"`
+	Queue                   *MachineQueue     `json:"queue,omitempty"`
 	LastError               *APIErrorBody     `json:"lastError,omitempty"`
 	Metadata                map[string]string `json:"metadata"`
 	GuestUser               string            `json:"guestUser"`
@@ -866,12 +891,35 @@ func (c *Client) DialTerminal(ctx context.Context, apiKey, machineID string, opt
 	return conn, nil, nil
 }
 
+func (c *Client) ForkMachine(ctx context.Context, apiKey, machineID string, in ForkMachineInput) (*ActionResult, error) {
+	var op Operation
+	_, err := c.doJSON(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/fork", apiKey, in, true, &op)
+	if err != nil {
+		return nil, err
+	}
+	return &ActionResult{Operation: &op}, nil
+}
+
 func (c *Client) PerformAction(ctx context.Context, apiKey, machineID string, action Action) (*ActionResult, error) {
 	switch action {
 	case ActionWake:
 		var m Machine
 		_, err := c.doJSON(ctx, http.MethodPost, "/v1/machines/"+url.PathEscape(machineID)+"/wake", apiKey, map[string]any{}, false, &m)
 		if err != nil {
+			// Per current instabox.sh docs: while the auto-resume operation is still
+			// running after the 45s wait, /wake answers a retryable 409 operation_conflict
+			// that names the operation. The resume itself is in progress, so treat the
+			// operation as the action result instead of surfacing a hard failure.
+			var apiErr *APIError
+			if errors.As(err, &apiErr) && apiErr.Status == http.StatusConflict &&
+				(apiErr.Code == "operation_conflict" || apiErr.Code == "machine_not_running") &&
+				apiErr.OperationID != "" {
+				op, opErr := c.GetOperation(ctx, apiKey, apiErr.OperationID, "")
+				if opErr == nil && op != nil {
+					return &ActionResult{Operation: op}, nil
+				}
+				return &ActionResult{Operation: &Operation{ID: apiErr.OperationID, MachineID: machineID, State: "running"}}, nil
+			}
 			return nil, err
 		}
 		return &ActionResult{Machine: &m}, nil

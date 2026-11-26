@@ -27,7 +27,7 @@
 
 - **Single lightweight Go binary**: Pure Go (`CGO_ENABLED=0`) with embedded static web UI (`embed.FS`) and embedded pure-Go SQLite storage (`modernc.org/sqlite`), inspired by CLIProxyAPI and Beszel.
 - **First-run Admin Setup**: Locks registration after creating the initial administrator account (`scrypt` password hashing, `HttpOnly` session cookies, CSRF + Fetch Metadata protection).
-- **Multi-Account Management & 2-Tab Add Machine**: Bind multiple `instabox.sh` accounts (`ibk_...`, encrypted at rest with AES-256-GCM and never returned to the browser) or create new VMs directly across saved accounts with live quota/capacity inspection, template/snapshot selection, specs, idle policy, and `maxRunMinutes`.
+- **Multi-Account Management & 2-Tab Add Machine**: Bind multiple `instabox.sh` accounts (`ibk_...`, encrypted at rest with AES-256-GCM and never returned to the browser) or create new VMs directly across saved accounts with live quota/capacity inspection, template/snapshot selection, specs, idle policy (whole minutes 5-30 or 0=never on paid plans), `maxRunMinutes`, and `deleteAfterSeconds`/`archiveSeconds` hard lifetime deadlines (the retired `timeout`/`onTimeout` fields are never sent). Fork any VM's disks into a new machine in seconds (`POST /api/machines/{accountId}/{machineId}/fork`) and resize stopped VMs (`vcpus`/`memMiB` via PATCH, optionally `apply: restart`).
 - **Inline Rename, Confirmed Delete & Card/Grid Views**: Color-coded live status dots (`running`, `booting`, `idle-paused`, `paused`, `stopped`, `error/cooldown` — accurately handling `runtime.ready=false` on resumed/headless VMs), aligned desktop Card View & Grid View, inline rename (`PATCH`), and confirmation-gated VM deletion.
 - **Interactive Console Terminal (`xterm.js` over WebSocket)**: Open a live PTY (`xterm-256color`) terminal window directly for any running or idle-paused VM (`GET /api/machines/{accountId}/{machineId}/terminal`), with persistent named sessions (`main`, `dev`, `logs`, ...), auto-fit resize, fullscreen toggle, shell restart, and mobile quick-key bar—proxied securely through the Go backend without exposing `ibk_*` keys.
 - **Per-VM Keep-Awake & Auto-Cycle (`keepalive`)**: Optional per-machine background service that renews `ibmon-keepalive` activity leases (`3600s`), wakes auto-idled VMs after cooldown, and power-cycles before the 8h / `maxRunMinutes` cap while strictly preserving manual stops/suspends.
@@ -35,6 +35,17 @@
 - **Live Runtime Clock & Beszel-style Charts**: Real-time 1-second session uptime clock synced to `instabox.sh` `runStartedAt` + server clock offset, monthly usage totals, and interactive CPU, RAM, Disk (`/data` & `/`), Network, and Disk I/O area charts (30s background polling, 24h backfill, 7-day default retention).
 - **Service API Keys (`ibmon_*`) & Remote MCP (`/mcp`)**: Create and revoke SHA-256-hashed bearer tokens from **Menu → API Keys & MCP** so AI agents (such as Hermes Agent) or scripts can orchestrate every saved VM (`exec`, `files`, `ports`, `processes`, `logs`, `connection-info`, `snapshots`, `restore`, lifecycle & keepalive) without ever exposing upstream `ibk_*` account keys. Machine deletion via API key or MCP enforces a mandatory single-use, 5-minute, machine-scoped confirmation challenge before deleting.
 - **Modern Web & PWA**: Google Sans typography, automatic + manual Light/Dark/System theme (`color-scheme` + `light-dark()`), custom SVG/PNG icons, `manifest.webmanifest`, service worker, and 11-language UI.
+
+## instabox.sh upstream compatibility (November 2026)
+
+This monitor tracks the current instabox.sh API and encodes these recent upstream semantics:
+
+- **Lifetime timeouts retired (2026-10-20)**: `timeoutSeconds`/`onTimeout`/`timeout` are never sent. Use `deleteAfterSeconds` (hard delete 60s-24h) and `archiveSeconds` (stop, files kept) instead; both show as live countdowns on the VM card.
+- **Auto-suspend rules**: paid plans accept whole minutes 300-1800s (5-30 min) or `0` (never); free-plan machines are fixed at 1800s. Invalid values are rejected locally before hitting upstream.
+- **Wake semantics**: `/wake` of an idle-paused VM can answer a retryable `409 operation_conflict` naming the in-progress resume; the monitor follows that operation instead of failing the action.
+- **Cooldowns**: max-run cooldowns escalate on the free plan (5-20 / 60-75 / 120-135 min for consecutive pauses) and abuse-lock cooldowns (`cooldownReason` `abuse_*`, up to 24h) are labelled distinctly on the card clock.
+- **Fork**: `POST /v1/machines/{id}/fork` copies disks into a new machine in seconds; exposed via REST, MCP (`fork_machine`) and accepts `deleteAfterSeconds`.
+- **Resize**: `PATCH /v1/machines/{id}` accepts `vcpus`/`memMiB` for stopped machines, or `apply: restart` for a running/paused machine.
 
 ## Quick Start (Docker)
 
@@ -60,7 +71,7 @@ mcp_servers:
     enabled: true
 ```
 
-3. Run `/reload-mcp` (or `hermes mcp test instabox`). Available MCP tools: `list_fleet`, `get_account_options`, `create_machine`, `control_machine`, `delete_machine` *(2-step confirmation gated)*, `exec_command`, `read_files`, `write_file`, `manage_ports`, `inspect_machine`, `manage_snapshots`, and `get_operation`.
+3. Run `/reload-mcp` (or `hermes mcp test instabox`). Available MCP tools: `list_fleet`, `get_account_options`, `create_machine` (with `deleteAfterSeconds`/`archiveSeconds`), `control_machine` (lifecycle + rename + resize + idle/max-run), `fork_machine`, `delete_machine` *(2-step confirmation gated)*, `exec_command`, `read_files`, `write_file`, `manage_ports`, `inspect_machine`, `manage_snapshots`, and `get_operation`.
 
 ## Configuration
 

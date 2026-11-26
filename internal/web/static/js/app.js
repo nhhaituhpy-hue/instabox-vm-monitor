@@ -1321,15 +1321,39 @@ function createVmCardController(initialVm) {
     setTextIfChanged(specEl, `${specTxt} · ${policyTxt}`);
 
     const clockInfo = formatClockDisplay(vm);
-    setTextIfChanged(clockLabelEl, clockInfo.mode === 'cooldown' ? t('cooldownLeft') : t('runtimeClock'));
     setTextIfChanged(clockValueEl, clockInfo.text);
     if (clockValueEl.dataset.mode !== clockInfo.mode) clockValueEl.dataset.mode = clockInfo.mode;
 
-    if (vm.maxRunMinutes > 0 && clockInfo.mode === 'running') {
+    // instabox.sh now schedules machine deletion (`deleteAt` / deleteAfterSeconds)
+    // and stop-archive (`archiveAt` / archiveSeconds). Show the nearest deadline in
+    // place of the max-run cap so the user always sees what ends this machine.
+    const nowMs2 = upstreamNowMs();
+    const deadlineEntries = [];
+    const delAt = vm.deleteAt ? Date.parse(vm.deleteAt) : NaN;
+    const arcAt = vm.archiveAt ? Date.parse(vm.archiveAt) : NaN;
+    if (Number.isFinite(delAt) && delAt > nowMs2) deadlineEntries.push({ at: delAt, icon: 'delete', label: t('deleteInLabel') });
+    if (Number.isFinite(arcAt) && arcAt > nowMs2) deadlineEntries.push({ at: arcAt, icon: 'archive', label: t('archiveInLabel') });
+    deadlineEntries.sort((a, b) => a.at - b.at);
+    if (deadlineEntries.length > 0) {
+      clockLimitEl.hidden = false;
+      const d = deadlineEntries[0];
+      setTextIfChanged(clockLimitEl, `${d.label} ${fmtCompactDuration(Math.max(0, (d.at - nowMs2) / 1000))}`);
+    } else if (vm.maxRunMinutes > 0 && clockInfo.mode === 'running') {
       clockLimitEl.hidden = false;
       setTextIfChanged(clockLimitEl, `/ ${fmtHMS(vm.maxRunMinutes * 60)}`);
     } else {
       clockLimitEl.hidden = true;
+    }
+    // Abuse-lock cooldowns (cooldownReason abuse_*) look identical to a free-plan
+    // max-run cooldown upstream, but they can last up to 24h and cannot be woken
+    // even by admins. Surface the reason so users do not misread it as a max-run pause.
+    if (clockInfo.mode === 'cooldown') {
+      const abuseReason = (vm.cooldownReason || '').startsWith('abuse_')
+        ? vm.cooldownReason
+        : '';
+      setTextIfChanged(clockLabelEl, abuseReason ? t('abuseLockLeft', { reason: abuseReason }) : t('cooldownLeft'));
+    } else {
+      setTextIfChanged(clockLabelEl, t('runtimeClock'));
     }
     setTextIfChanged(clockRight, `${t('monthlyUsage')}: ${fmtCompactDuration(vm.monthlyRunningSeconds || 0)}`);
 
@@ -2160,6 +2184,39 @@ function renderAddMachineDialogContent(initialTab) {
     });
     loadOptionsForAccount(accSelect.value);
 
+    // Lifetime fields, per the current instabox.sh API:
+    //  - Idle pause (autoSuspendAfterSeconds): paid plans take 5-30 whole minutes
+    //    (or 0 = never); the free plan is fixed at 30m — show the effective choice.
+    //  - Max run (maxRunMinutes): pause after N running minutes even while busy.
+    //  - Delete after (deleteAfterSeconds): hard self-destruct deadline 60-86400s,
+    //    replacing the retired `timeout`/`onTimeout` lifetime fields.
+    const idleSelect = el('select', { id: 'addm-idle', name: 'idlePause', className: 'input' }, [
+      el('option', { value: '', textContent: t('idlePolicyDefault') }),
+      el('option', { value: '300', textContent: '5m' }),
+      el('option', { value: '600', textContent: '10m' }),
+      el('option', { value: '900', textContent: '15m' }),
+      el('option', { value: '1800', textContent: '30m' }),
+      el('option', { value: '0', textContent: t('alwaysOn') + ' (0)' })
+    ]);
+    const idleField = el('div', { className: 'field', style: 'margin-block-end:0;' }, [
+      el('label', { for: 'addm-idle', textContent: t('idlePolicyLabel') }),
+      el('span', { className: 'hint', textContent: t('idlePolicyHint') }),
+      idleSelect
+    ]);
+
+    const deleteAfterSelect = el('select', { id: 'addm-delete-after', name: 'deleteAfter', className: 'input' }, [
+      el('option', { value: '', textContent: t('deleteAfterNever') }),
+      el('option', { value: '3600', textContent: '1h' }),
+      el('option', { value: '14400', textContent: '4h' }),
+      el('option', { value: '28800', textContent: '8h' }),
+      el('option', { value: '86400', textContent: '24h' })
+    ]);
+    const deleteAfterField = el('div', { className: 'field', style: 'margin-block-end:0;' }, [
+      el('label', { for: 'addm-delete-after', textContent: t('deleteAfterLabel') }),
+      el('span', { className: 'hint', textContent: t('deleteAfterHint') }),
+      deleteAfterSelect
+    ]);
+
     const createBtn = el('button', {
       type: 'submit',
       className: 'btn btn-primary',
@@ -2174,6 +2231,7 @@ function renderAddMachineDialogContent(initialTab) {
         nameField,
         el('div', { className: 'form-row-2' }, [tplField, specField]),
         tplPreview,
+        el('div', { className: 'form-row-2' }, [idleField, deleteAfterField]),
         createBtn
       ])
     );
@@ -2195,6 +2253,12 @@ function renderAddMachineDialogContent(initialTab) {
           vcpus: Number(vcpusStr) || 0,
           memMiB: Number(memStr) || 0
         };
+        if (idleSelect.value !== '') {
+          payload.autoSuspendAfterSeconds = Number(idleSelect.value);
+        }
+        if (deleteAfterSelect.value !== '') {
+          payload.deleteAfterSeconds = Number(deleteAfterSelect.value);
+        }
         const res = await apiFetch('/api/machines', {
           method: 'POST',
           body: JSON.stringify(payload)

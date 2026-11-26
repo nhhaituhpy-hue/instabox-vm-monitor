@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log"
@@ -113,6 +114,7 @@ func NewRouter(st *store.Store, client *instabox.Client, poller *monitor.Poller,
 	mux.HandleFunc("GET /api/machines/{accountId}/{machineId}/connection-info", s.withAuth(false, s.handleConnectionInfo))
 	mux.HandleFunc("POST /api/machines/{accountId}/{machineId}/snapshots", s.withAuth(true, s.handleCreateSnapshot))
 	mux.HandleFunc("POST /api/machines/{accountId}/{machineId}/restore", s.withAuth(true, s.handleRestoreMachine))
+	mux.HandleFunc("POST /api/machines/{accountId}/{machineId}/fork", s.withAuth(true, s.handleForkMachine))
 	mux.HandleFunc("GET /api/machines/{accountId}/{machineId}/terminal", s.withSessionAuth(false, s.handleMachineTerminal))
 
 	mux.HandleFunc("POST /mcp", s.withAuth(false, s.mcpHandler.ServeHTTP))
@@ -721,13 +723,49 @@ func (s *Server) handleAccountMachineOptions(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, opts)
 }
 
+func validateMachineLifetimeFields(autoSuspend *int, maxRun *int, deleteAfter, archiveSeconds int) error {
+	// Mirrors the current instabox.sh API rules (2026-11):
+	//  - autoSuspendAfterSeconds: 0 (off, paid plans only) or whole minutes 300-1800.
+	//    The free plan accepts only the fixed 1800s; that is enforced upstream per account.
+	//  - maxRunMinutes: -1 (unlimited) or a positive minute count; 0 pauses immediately and
+	//    blocks wake until changed, so we keep accepting it but require it to be explicit.
+	//  - deleteAfterSeconds / archiveSeconds at create: 0 (unset) or 60-86400.
+	if autoSuspend != nil {
+		v := *autoSuspend
+		if v != 0 && (v < 300 || v > 1800 || v%60 != 0) {
+			return fmt.Errorf("autoSuspendAfterSeconds must be 0 (always-on, paid plans only) or a whole minute 5-30 (300-1800s); free-plan machines accept only 1800")
+		}
+	}
+	if maxRun != nil {
+		v := *maxRun
+		if v < -1 {
+			return fmt.Errorf("maxRunMinutes must be -1 (unlimited), 0 (pause immediately) or a positive number of minutes")
+		}
+	}
+	if deleteAfter != 0 && (deleteAfter < 60 || deleteAfter > 86400) {
+		return fmt.Errorf("deleteAfterSeconds must be 0 or 60-86400")
+	}
+	if archiveSeconds != 0 && (archiveSeconds < 60 || archiveSeconds > 86400) {
+		return fmt.Errorf("archiveSeconds must be 0 or 60-86400")
+	}
+	return nil
+}
+
+func validateForkLifetimeFields(autoSuspend *int, maxRun *int, deleteAfter int) error {
+	return validateMachineLifetimeFields(autoSuspend, maxRun, deleteAfter, 0)
+}
+
 func (s *Server) handleCreateMachine(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		AccountID  string `json:"accountId"`
-		Name       string `json:"name"`
-		TemplateID string `json:"templateId"`
-		VCPUs      int    `json:"vcpus"`
-		MemMiB     int    `json:"memMiB"`
+		AccountID               string `json:"accountId"`
+		Name                    string `json:"name"`
+		TemplateID              string `json:"templateId"`
+		VCPUs                   int    `json:"vcpus"`
+		MemMiB                  int    `json:"memMiB"`
+		AutoSuspendAfterSeconds *int   `json:"autoSuspendAfterSeconds"`
+		MaxRunMinutes           *int   `json:"maxRunMinutes"`
+		DeleteAfterSeconds      int    `json:"deleteAfterSeconds"`
+		ArchiveSeconds          int    `json:"archiveSeconds"`
 	}
 	if !decodeJSON(w, r, &req) {
 		return
@@ -751,12 +789,20 @@ func (s *Server) handleCreateMachine(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_spec", "vcpus and memMiB must be non-negative")
 		return
 	}
+	if err := validateMachineLifetimeFields(req.AutoSuspendAfterSeconds, req.MaxRunMinutes, req.DeleteAfterSeconds, req.ArchiveSeconds); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_lifetime", err.Error())
+		return
+	}
 
 	in := instabox.CreateMachineInput{
-		Name:       req.Name,
-		TemplateID: req.TemplateID,
-		VCPUs:      req.VCPUs,
-		MemMiB:     req.MemMiB,
+		Name:                    req.Name,
+		TemplateID:              req.TemplateID,
+		VCPUs:                   req.VCPUs,
+		MemMiB:                  req.MemMiB,
+		AutoSuspendAfterSeconds: req.AutoSuspendAfterSeconds,
+		MaxRunMinutes:           req.MaxRunMinutes,
+		DeleteAfterSeconds:      req.DeleteAfterSeconds,
+		ArchiveSeconds:          req.ArchiveSeconds,
 	}
 	res, err := s.poller.CreateMachine(r.Context(), req.AccountID, in)
 	if err != nil {
@@ -806,9 +852,12 @@ func (s *Server) handleUpdateMachine(w http.ResponseWriter, r *http.Request) {
 	machineID := r.PathValue("machineId")
 	var req struct {
 		Name                    *string           `json:"name"`
+		VCPUs                   int               `json:"vcpus"`
+		MemMiB                  int               `json:"memMiB"`
 		AutoSuspendAfterSeconds *int              `json:"autoSuspendAfterSeconds"`
 		MaxRunMinutes           *int              `json:"maxRunMinutes"`
 		Metadata                map[string]string `json:"metadata"`
+		CancelScheduled         bool              `json:"cancelScheduled"`
 		Apply                   string            `json:"apply"`
 	}
 	if !decodeJSON(w, r, &req) {
@@ -822,15 +871,30 @@ func (s *Server) handleUpdateMachine(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Name = &trimmed
 	}
-	if req.Name == nil && req.AutoSuspendAfterSeconds == nil && req.MaxRunMinutes == nil && req.Metadata == nil && req.Apply == "" {
+	if req.VCPUs < 0 || req.MemMiB < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_spec", "vcpus and memMiB must be non-negative")
+		return
+	}
+	if err := validateMachineLifetimeFields(req.AutoSuspendAfterSeconds, req.MaxRunMinutes, 0, 0); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_lifetime", err.Error())
+		return
+	}
+	if req.Apply != "" && req.Apply != "restart" {
+		writeError(w, http.StatusBadRequest, "invalid_apply", "apply must be restart or empty")
+		return
+	}
+	if req.Name == nil && req.VCPUs == 0 && req.MemMiB == 0 && req.AutoSuspendAfterSeconds == nil && req.MaxRunMinutes == nil && req.Metadata == nil && !req.CancelScheduled && req.Apply == "" {
 		writeError(w, http.StatusBadRequest, "invalid_request", "no update fields provided")
 		return
 	}
 	updated, err := s.poller.UpdateMachine(r.Context(), accountID, machineID, instabox.UpdateMachineInput{
 		Name:                    req.Name,
+		VCPUs:                   req.VCPUs,
+		MemMiB:                  req.MemMiB,
 		AutoSuspendAfterSeconds: req.AutoSuspendAfterSeconds,
 		MaxRunMinutes:           req.MaxRunMinutes,
 		Metadata:                req.Metadata,
+		CancelScheduled:         req.CancelScheduled,
 		Apply:                   strings.TrimSpace(req.Apply),
 	})
 	if err != nil {
@@ -869,6 +933,54 @@ func (s *Server) handleSetMachineKeepalive(w http.ResponseWriter, r *http.Reques
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
 		"machine": updated,
+	})
+}
+
+func (s *Server) handleForkMachine(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	var req struct {
+		Name                    string            `json:"name"`
+		VCPUs                   int               `json:"vcpus"`
+		MemMiB                  int               `json:"memMiB"`
+		AutoSuspendAfterSeconds *int              `json:"autoSuspendAfterSeconds"`
+		MaxRunMinutes           *int              `json:"maxRunMinutes"`
+		DeleteAfterSeconds      int               `json:"deleteAfterSeconds"`
+		Metadata                map[string]string `json:"metadata"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name != "" && !isValidMachineName(req.Name) {
+		writeError(w, http.StatusBadRequest, "invalid_name", "machine name must be 1-63 lowercase letters, digits or hyphens, starting with a letter or digit")
+		return
+	}
+	if req.VCPUs < 0 || req.MemMiB < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_spec", "vcpus and memMiB must be non-negative")
+		return
+	}
+	if err := validateForkLifetimeFields(req.AutoSuspendAfterSeconds, req.MaxRunMinutes, req.DeleteAfterSeconds); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_lifetime", err.Error())
+		return
+	}
+	res, err := s.poller.ForkMachine(r.Context(), accountID, machineID, instabox.ForkMachineInput{
+		Name:                    req.Name,
+		VCPUs:                   req.VCPUs,
+		MemMiB:                  req.MemMiB,
+		AutoSuspendAfterSeconds: req.AutoSuspendAfterSeconds,
+		MaxRunMinutes:           req.MaxRunMinutes,
+		DeleteAfterSeconds:      req.DeleteAfterSeconds,
+		Metadata:                req.Metadata,
+	})
+	if err != nil {
+		s.writePollerOrUpstreamError(w, "fork machine", accountID, machineID, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"ok":            true,
+		"operation":     res.Operation,
+		"clockOffsetMs": s.poller.ClockOffsetMs(),
 	})
 }
 

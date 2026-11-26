@@ -381,3 +381,96 @@ func TestExecFilesPortsProcessesLogsSnapshotsAndUpdate(t *testing.T) {
 		t.Fatalf("UpdateMachine failed: err=%v upd=%+v", err, upd)
 	}
 }
+
+func TestWakeTreats409OperationConflictAsInProgressOperation(t *testing.T) {
+	client, _ := newMockClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/machines/m_1/wake":
+			// Current instabox.sh behaviour: when the auto-resume is still running
+			// after the 45s wait, /wake answers a retryable 409 operation_conflict
+			// that names the operation in flight.
+			w.WriteHeader(http.StatusConflict)
+			_, _ = w.Write([]byte(`{"error":{"code":"operation_conflict","message":"resume operation in progress","requestId":"req_9","retryable":true,"operationId":"op_resume_1"}}`))
+		case r.URL.Path == "/v1/operations/op_resume_1":
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "op_resume_1", "machineId": "m_1", "state": "running"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	res, err := client.PerformAction(context.Background(), "ibk_test", "m_1", instabox.ActionWake)
+	if err != nil {
+		t.Fatalf("wake with in-progress resume must not hard-fail: %v", err)
+	}
+	if res.Operation == nil || res.Operation.ID != "op_resume_1" {
+		t.Fatalf("expected the named operation as result, got %+v", res)
+	}
+}
+
+func TestWakeMachineCooldownWithoutOperationIDStillErrors(t *testing.T) {
+	client, _ := newMockClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":{"code":"machine_cooldown","message":"cooling down","requestId":"req_1","retryable":true,"retryAfterSeconds":300}}`))
+	})
+	_, err := client.PerformAction(context.Background(), "ibk_test", "m_1", instabox.ActionWake)
+	var apiErr *instabox.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "machine_cooldown" {
+		t.Fatalf("cooldown without operation must still surface as error, got %v", err)
+	}
+}
+
+func TestForkMachineSendsDeleteAfterAndSize(t *testing.T) {
+	var capturedBody map[string]any
+	client, _ := newMockClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_1/fork" {
+			if r.Header.Get("Idempotency-Key") == "" {
+				t.Error("fork must send Idempotency-Key")
+			}
+			_ = json.NewDecoder(r.Body).Decode(&capturedBody)
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "op_fork_1", "machineId": "m_2", "state": "queued"})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+
+	res, err := client.ForkMachine(context.Background(), "ibk_test", "m_1", instabox.ForkMachineInput{
+		Name:               "copy-1",
+		DeleteAfterSeconds: 3600,
+		VCPUs:              4,
+		MemMiB:             8192,
+	})
+	if err != nil || res.Operation == nil || res.Operation.ID != "op_fork_1" {
+		t.Fatalf("ForkMachine err=%v res=%+v", err, res)
+	}
+	if capturedBody["deleteAfterSeconds"].(float64) != 3600 {
+		t.Fatalf("deleteAfterSeconds not sent: %+v", capturedBody)
+	}
+	if capturedBody["vcpus"].(float64) != 4 {
+		t.Fatalf("vcpus not sent: %+v", capturedBody)
+	}
+}
+
+func TestMachineUnmarshalsNewLifecycleFields(t *testing.T) {
+	// archiveAt/deleteAt/readyAt/queue are the new instabox.sh machine fields (2026-11).
+	raw := []byte(`{"id":"m_9","name":"job","state":"stopped","desiredState":"stopped",
+		"spec":{"vcpus":4,"memMiB":8192,"persistentDiskGiB":20},"storage":{"sizeGiB":20,"mountPath":"/data","persistent":true,"synced":true},
+		"runtime":{"ready":false},"maxRunMinutes":-1,
+		"archiveAt":"2026-11-27T01:00:00Z","deleteAt":"2026-11-27T02:00:00Z",
+		"readyAt":"2026-11-26T01:00:00Z","cooldownUntil":null,
+		"queue":{"position":2,"expiresAt":"2026-11-27T03:00:00Z"},
+		"metadata":{},"guestUser":"dev","orgId":"org_1","createdAt":"2026-11-26T00:00:00Z","updatedAt":"2026-11-26T00:00:00Z"}`)
+	var m instabox.Machine
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if m.ArchiveAt != "2026-11-27T01:00:00Z" || m.DeleteAt != "2026-11-27T02:00:00Z" || m.ReadyAt == "" {
+		t.Fatalf("lifecycle fields missing: %+v", m)
+	}
+	if m.Queue == nil || m.Queue.Position != 2 {
+		t.Fatalf("queue field missing: %+v", m.Queue)
+	}
+}

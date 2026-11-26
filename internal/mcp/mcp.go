@@ -397,6 +397,8 @@ func (s *Server) dispatchTool(ctx context.Context, name string, rawArgs json.Raw
 			DesiredState            string            `json:"desiredState"`
 			AutoSuspendAfterSeconds *int              `json:"autoSuspendAfterSeconds"`
 			MaxRunMinutes           *int              `json:"maxRunMinutes"`
+			DeleteAfterSeconds      int               `json:"deleteAfterSeconds"`
+			ArchiveSeconds          int               `json:"archiveSeconds"`
 			Env                     map[string]string `json:"env"`
 			WaitSeconds             int               `json:"waitSeconds"`
 		}
@@ -407,6 +409,12 @@ func (s *Server) dispatchTool(ctx context.Context, name string, rawArgs json.Raw
 		if in.AccountID == "" {
 			return errPayload(errors.New("accountId is required")), true
 		}
+		if in.DeleteAfterSeconds != 0 && (in.DeleteAfterSeconds < 60 || in.DeleteAfterSeconds > 86400) {
+			return errPayload(errors.New("deleteAfterSeconds must be 0 or 60-86400")), true
+		}
+		if in.ArchiveSeconds != 0 && (in.ArchiveSeconds < 60 || in.ArchiveSeconds > 86400) {
+			return errPayload(errors.New("archiveSeconds must be 0 or 60-86400")), true
+		}
 		res, err := s.poller.CreateMachine(ctx, in.AccountID, instabox.CreateMachineInput{
 			Name:                    strings.TrimSpace(in.Name),
 			TemplateID:              strings.TrimSpace(in.TemplateID),
@@ -416,6 +424,8 @@ func (s *Server) dispatchTool(ctx context.Context, name string, rawArgs json.Raw
 			DesiredState:            strings.TrimSpace(in.DesiredState),
 			AutoSuspendAfterSeconds: in.AutoSuspendAfterSeconds,
 			MaxRunMinutes:           in.MaxRunMinutes,
+			DeleteAfterSeconds:      in.DeleteAfterSeconds,
+			ArchiveSeconds:          in.ArchiveSeconds,
 			Env:                     in.Env,
 		})
 		if err != nil {
@@ -440,6 +450,9 @@ func (s *Server) dispatchTool(ctx context.Context, name string, rawArgs json.Raw
 			Name                    *string `json:"name"`
 			AutoSuspendAfterSeconds *int    `json:"autoSuspendAfterSeconds"`
 			MaxRunMinutes           *int    `json:"maxRunMinutes"`
+			VCPUs                   int     `json:"vcpus"`
+			MemMiB                  int     `json:"memMiB"`
+			CancelScheduled         bool    `json:"cancelScheduled"`
 			Apply                   string  `json:"apply"`
 			Keepalive               *bool   `json:"keepalive"`
 			WaitSeconds             int     `json:"waitSeconds"`
@@ -453,11 +466,14 @@ func (s *Server) dispatchTool(ctx context.Context, name string, rawArgs json.Raw
 		}
 		out := map[string]any{"accountId": accID, "machineId": mRec.MachineID}
 
-		if in.Name != nil || in.AutoSuspendAfterSeconds != nil || in.MaxRunMinutes != nil || in.Apply != "" {
+		if in.Name != nil || in.AutoSuspendAfterSeconds != nil || in.MaxRunMinutes != nil || in.VCPUs != 0 || in.MemMiB != 0 || in.CancelScheduled || in.Apply != "" {
 			upd, uErr := s.poller.UpdateMachine(ctx, accID, mRec.MachineID, instabox.UpdateMachineInput{
 				Name:                    in.Name,
+				VCPUs:                   in.VCPUs,
+				MemMiB:                  in.MemMiB,
 				AutoSuspendAfterSeconds: in.AutoSuspendAfterSeconds,
 				MaxRunMinutes:           in.MaxRunMinutes,
+				CancelScheduled:         in.CancelScheduled,
 				Apply:                   in.Apply,
 			})
 			if uErr != nil {
@@ -502,6 +518,52 @@ func (s *Server) dispatchTool(ctx context.Context, name string, rawArgs json.Raw
 			}
 		}
 		return out, false
+
+	case "fork_machine":
+		var in struct {
+			AccountID               string            `json:"accountId"`
+			MachineID               string            `json:"machineId"`
+			Name                    string            `json:"name"`
+			VCPUs                   int               `json:"vcpus"`
+			MemMiB                  int               `json:"memMiB"`
+			AutoSuspendAfterSeconds *int              `json:"autoSuspendAfterSeconds"`
+			MaxRunMinutes           *int              `json:"maxRunMinutes"`
+			DeleteAfterSeconds      int               `json:"deleteAfterSeconds"`
+			Metadata                map[string]string `json:"metadata"`
+			WaitSeconds             int               `json:"waitSeconds"`
+		}
+		if err := json.Unmarshal(rawArgs, &in); err != nil {
+			return errPayload(err), true
+		}
+		if in.DeleteAfterSeconds != 0 && (in.DeleteAfterSeconds < 60 || in.DeleteAfterSeconds > 86400) {
+			return errPayload(errors.New("deleteAfterSeconds must be 0 or 60-86400")), true
+		}
+		accID, mRec, err := s.resolveAccountMachine(ctx, in.AccountID, in.MachineID)
+		if err != nil {
+			return errPayload(err), true
+		}
+		res, err := s.poller.ForkMachine(ctx, accID, mRec.MachineID, instabox.ForkMachineInput{
+			Name:                    strings.TrimSpace(in.Name),
+			VCPUs:                   in.VCPUs,
+			MemMiB:                  in.MemMiB,
+			AutoSuspendAfterSeconds: in.AutoSuspendAfterSeconds,
+			MaxRunMinutes:           in.MaxRunMinutes,
+			DeleteAfterSeconds:      in.DeleteAfterSeconds,
+			Metadata:                in.Metadata,
+		})
+		if err != nil {
+			return errPayload(err), true
+		}
+		if in.WaitSeconds > 0 && res.Operation != nil && res.Operation.ID != "" && res.Operation.State != "succeeded" && res.Operation.State != "failed" {
+			if op, wErr := s.waitForOperation(ctx, accID, res.Operation.ID, in.WaitSeconds); wErr == nil && op != nil {
+				res.Operation = op
+			}
+		}
+		var forked *store.MachineRecord
+		if res.Operation != nil && res.Operation.MachineID != "" {
+			forked, _ = s.store.GetMachine(ctx, accID, res.Operation.MachineID)
+		}
+		return map[string]any{"operation": res.Operation, "machine": forked}, false
 
 	case "delete_machine":
 		var in struct {
@@ -858,8 +920,10 @@ func buildToolDefs() []toolDef {
 					"vcpus":                   map[string]any{"type": "integer"},
 					"memMiB":                  map[string]any{"type": "integer"},
 					"desiredState":            map[string]any{"type": "string", "enum": []string{"running", "stopped"}},
-					"autoSuspendAfterSeconds": map[string]any{"type": "integer"},
-					"maxRunMinutes":           map[string]any{"type": "integer"},
+					"autoSuspendAfterSeconds": map[string]any{"type": "integer", "description": "Paid plans: whole minutes 300-1800s or 0=never; free plan: fixed 1800"},
+					"maxRunMinutes":           map[string]any{"type": "integer", "description": "-1 unlimited, positive minutes caps each run"},
+					"deleteAfterSeconds":      map[string]any{"type": "integer", "description": "Hard self-delete deadline 60-86400s; replaces the retired timeout/onTimeout lifetime fields"},
+					"archiveSeconds":          map[string]any{"type": "integer", "description": "Stop the VM after 60-86400s, files kept"},
 					"env":                     map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
 					"waitSeconds":             map[string]any{"type": "integer", "description": "Optional seconds (up to 120) to wait for create operation completion"},
 				},
@@ -877,11 +941,35 @@ func buildToolDefs() []toolDef {
 					"machineId":               map[string]any{"type": "string"},
 					"action":                  map[string]any{"type": "string", "enum": []string{"start", "stop", "suspend", "wake", "resume"}},
 					"name":                    map[string]any{"type": "string", "description": "New lowercase machine name"},
-					"autoSuspendAfterSeconds": map[string]any{"type": "integer"},
-					"maxRunMinutes":           map[string]any{"type": "integer"},
-					"apply":                   map[string]any{"type": "string", "enum": []string{"restart"}},
+					"autoSuspendAfterSeconds": map[string]any{"type": "integer", "description": "Paid: whole minutes 300-1800s or 0=never; free: fixed 1800"},
+					"maxRunMinutes":           map[string]any{"type": "integer", "description": "-1 unlimited; positive minutes caps each run even while busy"},
+					"vcpus":                   map[string]any{"type": "integer", "description": "Resize a stopped VM (with memMiB); one of the account's allowedSpecs"},
+					"memMiB":                  map[string]any{"type": "integer", "description": "New memory in MiB of a stopped VM (with vcpus)"},
+					"cancelScheduled":         map[string]any{"type": "boolean", "description": "Clear a stop/delete scheduled for a macOS VM lease end"},
+					"apply":                   map[string]any{"type": "string", "enum": []string{"restart"}, "description": "resize a running/paused VM by stop+resize+start in one operation"},
 					"keepalive":               map[string]any{"type": "boolean", "description": "Enable/disable automatic keep-awake & 8h power-cycle service"},
 					"waitSeconds":             map[string]any{"type": "integer", "description": "Optional seconds (up to 120) to wait for lifecycle operation"},
+				},
+			},
+		},
+		{
+			Name:        "fork_machine",
+			Description: "Copy a running or stopped VM's disks into a new machine in seconds (instabox.sh fork). Processes and memory are not copied; the fork boots fresh. Useful for parallel agent experiments.",
+			Annotations: &toolAnnotations{DestructiveHint: boolPtr(false)},
+			InputSchema: map[string]any{
+				"type":     "object",
+				"required": []string{"machineId"},
+				"properties": map[string]any{
+					"accountId":               map[string]any{"type": "string"},
+					"machineId":               map[string]any{"type": "string"},
+					"name":                    map[string]any{"type": "string", "description": "Name of the fork; empty = <source>-fork-<hex4>"},
+					"vcpus":                   map[string]any{"type": "integer"},
+					"memMiB":                  map[string]any{"type": "integer"},
+					"autoSuspendAfterSeconds": map[string]any{"type": "integer"},
+					"maxRunMinutes":           map[string]any{"type": "integer"},
+					"deleteAfterSeconds":      map[string]any{"type": "integer", "description": "Hard self-delete deadline 60-86400s for the fork"},
+					"metadata":                map[string]any{"type": "object", "additionalProperties": map[string]any{"type": "string"}},
+					"waitSeconds":             map[string]any{"type": "integer", "description": "Optional seconds (up to 120) to wait for fork operation completion"},
 				},
 			},
 		},
