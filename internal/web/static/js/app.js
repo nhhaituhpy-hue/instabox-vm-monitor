@@ -221,13 +221,28 @@ function scheduleNextTransition(vm) {
     return { s: sh * 60 + sm, e: endMin };
   });
   const inside = parsed.find((w) => shifted >= w.s && shifted < w.e);
-  if (inside) return { kind: 'stop', inMin: inside.e - shifted };
+  if (inside) {
+    const endMin = inside.e;
+    return {
+      kind: 'stop',
+      inMin: inside.e - shifted,
+      hhmm: `${String(Math.floor(endMin / 60) % 24).padStart(2, '0')}:${String(endMin % 60).padStart(2, '0')}`,
+      tomorrow: endMin >= 1440
+    };
+  }
   let best = Infinity;
+  let bestStart = 0;
   for (const w of parsed) {
     const d = shifted < w.s ? w.s - shifted : 1440 - shifted + w.s;
-    if (d < best) best = d;
+    if (d < best) { best = d; bestStart = w.s; }
   }
-  return Number.isFinite(best) ? { kind: 'start', inMin: best } : null;
+  if (!Number.isFinite(best)) return null;
+  return {
+    kind: 'start',
+    inMin: best,
+    hhmm: `${String(Math.floor(bestStart / 60)).padStart(2, '0')}:${String(bestStart % 60).padStart(2, '0')}`,
+    tomorrow: best > (1440 - shifted)
+  };
 }
 
 function fmtCompactDuration(totalSeconds) {
@@ -1431,7 +1446,10 @@ function createVmCardController(initialVm) {
       if (nxt) {
         schedMeta.hidden = false;
         schedMeta.dataset.tone = nxt.kind === 'stop' ? 'ok' : 'muted';
-        setTextIfChanged(schedMeta, `${t(nxt.kind === 'stop' ? 'schedStopIn' : 'schedStartIn')} ${fmtCompactDuration(nxt.inMin * 60)}`);
+        const key = nxt.kind === 'stop'
+          ? (nxt.tomorrow ? 'schedStopAtTomorrow' : 'schedStopAt')
+          : (nxt.tomorrow ? 'schedStartAtTomorrow' : 'schedStartAt');
+        setTextIfChanged(schedMeta, t(key, { time: nxt.hhmm, wait: fmtCompactDuration(nxt.inMin * 60) }));
       } else if (vm.scheduleLastAction === 'cooldown_wait') {
         schedMeta.hidden = false;
         schedMeta.dataset.tone = 'warn';
@@ -3827,7 +3845,13 @@ function validateWindowRows(rows) {
   return { entries };
 }
 
-async function openScheduleDialog(vm) {
+async function openScheduleDialog(vmRef) {
+  // The card closure's `vm` object is never refreshed — always re-read the latest
+  // record from state so edits start from what is actually saved, not from a
+  // possibly ancient snapshot (which previously re-introduced windows the user
+  // never configured or overwrote newer edits).
+  const fresh = state.machines.find((x) => x.accountId === vmRef.accountId && x.id === vmRef.id);
+  const vm = fresh || vmRef;
   const shell = ensureScheduleDialogShell();
   const { rowsHost, addBtn, errEl, cancelBtn, saveBtn, descEl } = shell;
 
@@ -3844,7 +3868,6 @@ async function openScheduleDialog(vm) {
   const addRow = (start, end) => {
     const row = scheduleWindowRow(start, end, () => {
       row.remove();
-      if (rowsHost.children.length === 0) addRow('06:00', '08:00');
     });
     rowsHost.append(row);
     return row;
@@ -3854,6 +3877,7 @@ async function openScheduleDialog(vm) {
   if (Array.isArray(seeded) && seeded.length > 0) {
     for (const w of seeded) addRow(w.start, w.end === '00:00' ? '00:00' : w.end);
   } else {
+    // Only a machine that never had any window configured gets the starter row.
     addRow('06:00', '08:00');
   }
   addBtn.onclick = () => {

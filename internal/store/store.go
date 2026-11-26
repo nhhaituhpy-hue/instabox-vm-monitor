@@ -868,9 +868,12 @@ func (s *Store) SetMachineSchedule(ctx context.Context, accountID, machineID str
 			WHERE account_id = ? AND machine_id = ?
 		`, windowsJSON, tzOffsetMin, accountID, machineID)
 	} else {
+		// Disabling keeps the configured windows: users expect their schedule
+		// back when re-enabling or opening the editor, and wiping config on a
+		// pause toggle is destructive.
 		res, err = s.db.ExecContext(ctx, `
 			UPDATE machines
-			SET schedule_enabled = 0, schedule_windows = '', schedule_last_action = '',
+			SET schedule_enabled = 0, schedule_last_action = '',
 			    schedule_last_at = 0, schedule_last_error = ''
 			WHERE account_id = ? AND machine_id = ?
 		`, accountID, machineID)
