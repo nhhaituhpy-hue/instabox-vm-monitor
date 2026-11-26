@@ -116,6 +116,11 @@ func NewRouter(st *store.Store, client *instabox.Client, poller *monitor.Poller,
 	mux.HandleFunc("POST /api/machines/{accountId}/{machineId}/snapshots", s.withAuth(true, s.handleCreateSnapshot))
 	mux.HandleFunc("POST /api/machines/{accountId}/{machineId}/restore", s.withAuth(true, s.handleRestoreMachine))
 	mux.HandleFunc("POST /api/machines/{accountId}/{machineId}/fork", s.withAuth(true, s.handleForkMachine))
+	mux.HandleFunc("GET /api/ci-boxes", s.withAuth(false, s.handleListCIBoxes))
+	mux.HandleFunc("PUT /api/accounts/{id}/ci-box", s.withAuth(true, s.handleSetupCIBox))
+	mux.HandleFunc("DELETE /api/accounts/{id}/ci-box", s.withAuth(true, s.handleDeleteCIBox))
+	mux.HandleFunc("POST /api/accounts/{id}/ci-box/start", s.withAuth(true, s.handleStartCIBox))
+	mux.HandleFunc("POST /api/accounts/{id}/ci-box/stop", s.withAuth(true, s.handleStopCIBox))
 	mux.HandleFunc("GET /api/machines/{accountId}/{machineId}/terminal", s.withSessionAuth(false, s.handleMachineTerminal))
 
 	mux.HandleFunc("POST /mcp", s.withAuth(false, s.mcpHandler.ServeHTTP))
@@ -702,6 +707,84 @@ func isValidMachineName(name string) bool {
 		}
 	}
 	return true
+}
+
+
+// ---------- CI box handlers ----------
+
+func (s *Server) handleListCIBoxes(w http.ResponseWriter, r *http.Request) {
+	boxes, err := s.store.ListCIBoxes(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "store_error", "failed to list ci boxes")
+		return
+	}
+	if boxes == nil {
+		boxes = []store.CIBox{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ciBoxes": boxes})
+}
+
+func (s *Server) handleSetupCIBox(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	var req struct {
+		Repo  string `json:"repo"`
+		Token string `json:"token"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	box, err := s.poller.SetupCIBox(r.Context(), accountID, strings.TrimSpace(req.Repo), strings.TrimSpace(req.Token))
+	if err != nil {
+		if errors.Is(err, store.ErrAccountNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", "account not found")
+			return
+		}
+		writeError(w, http.StatusBadRequest, "ci_setup_failed", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ciBox": box})
+}
+
+func (s *Server) handleStartCIBox(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	box, err := s.poller.StartCIBox(r.Context(), accountID)
+	if err != nil {
+		s.writeCIBoxError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ciBox": box})
+}
+
+func (s *Server) handleStopCIBox(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	box, err := s.poller.StopCIBox(r.Context(), accountID)
+	if err != nil {
+		s.writeCIBoxError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ciBox": box})
+}
+
+func (s *Server) handleDeleteCIBox(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	if err := s.poller.DeleteCIBoxConfig(r.Context(), accountID); err != nil {
+		s.writeCIBoxError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) writeCIBoxError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, store.ErrAccountNotFound):
+		writeError(w, http.StatusNotFound, "not_found", "account not found")
+	case errors.Is(err, monitor.ErrCIBoxNotConfigured):
+		writeError(w, http.StatusBadRequest, "ci_not_configured", err.Error())
+	case errors.Is(err, monitor.ErrCIBoxBusy):
+		writeError(w, http.StatusConflict, "ci_busy", err.Error())
+	default:
+		writeError(w, http.StatusBadGateway, "ci_error", err.Error())
+	}
 }
 
 func (s *Server) handleAccountMachineOptions(w http.ResponseWriter, r *http.Request) {

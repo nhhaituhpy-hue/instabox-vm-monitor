@@ -273,6 +273,23 @@ func (s *Store) migrate(ctx context.Context) error {
 		last_used_at INTEGER NOT NULL DEFAULT 0,
 		created_at INTEGER NOT NULL
 	);
+
+	CREATE TABLE IF NOT EXISTS ci_boxes (
+		id TEXT PRIMARY KEY,
+		account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+		repo TEXT NOT NULL DEFAULT '',
+		workflow_file TEXT NOT NULL DEFAULT 'ci-box.yml',
+		branch TEXT NOT NULL DEFAULT 'main',
+		gh_token_enc TEXT NOT NULL DEFAULT '',
+		gh_login TEXT NOT NULL DEFAULT '',
+		state TEXT NOT NULL DEFAULT 'idle',
+		run_id INTEGER NOT NULL DEFAULT 0,
+		run_url TEXT NOT NULL DEFAULT '',
+		machine_id TEXT NOT NULL DEFAULT '',
+		last_error TEXT NOT NULL DEFAULT '',
+		created_at INTEGER NOT NULL,
+		updated_at INTEGER NOT NULL
+	);
 	`
 	if _, err := s.db.ExecContext(ctx, schema); err != nil {
 		return err
@@ -683,6 +700,141 @@ func (s *Store) UpdateAccountSyncMeta(ctx context.Context, id string, meta Accou
 		meta.OrgTier, meta.OrgTier,
 		meta.OrgUsageJSON, meta.OrgUsageJSON,
 		now, lastErr, now, id)
+	return err
+}
+
+
+// ---------- CI boxes ----------
+
+type CIBox struct {
+	ID           string `json:"id"`
+	AccountID    string `json:"accountId"`
+	Repo         string `json:"repo"`
+	WorkflowFile string `json:"workflowFile"`
+	Branch       string `json:"branch"`
+	GitHubLogin  string `json:"githubLogin"`
+	State        string `json:"state"` // idle, dispatching, starting, running, stopping, error
+	RunID        int64  `json:"runId"`
+	RunURL       string `json:"runUrl"`
+	MachineID    string `json:"machineId"`
+	LastError    string `json:"lastError"`
+	CreatedAt    int64  `json:"createdAt"`
+	UpdatedAt    int64  `json:"updatedAt"`
+}
+
+func (s *Store) UpsertCIBox(ctx context.Context, accountID, repo, workflowFile, branch, token, ghLogin string) (*CIBox, error) {
+	enc := ""
+	if token != "" {
+		var err error
+		enc, err = crypto.EncryptSecret(s.masterKey, token)
+		if err != nil {
+			return nil, err
+		}
+	}
+	now := time.Now().Unix()
+	if workflowFile == "" {
+		workflowFile = "ci-box.yml"
+	}
+	if branch == "" {
+		branch = "main"
+	}
+	existing, err := s.GetCIBox(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil {
+		// keep the stored token when the caller did not send a new one
+		if enc == "" {
+			old, _ := s.getCIBoxToken(ctx, existing.ID)
+			if old != "" {
+				enc, _ = crypto.EncryptSecret(s.masterKey, old)
+			}
+		}
+		_, err = s.db.ExecContext(ctx, `
+			UPDATE ci_boxes SET repo=?, workflow_file=?, branch=?, gh_token_enc=?, gh_login=?, updated_at=? WHERE id=?
+		`, repo, workflowFile, branch, enc, ghLogin, now, existing.ID)
+		if err != nil {
+			return nil, err
+		}
+		return s.GetCIBox(ctx, accountID)
+	}
+	id := crypto.NewUUID()
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO ci_boxes(id, account_id, repo, workflow_file, branch, gh_token_enc, gh_login, state, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?)
+	`, id, accountID, repo, workflowFile, branch, enc, ghLogin, now, now)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetCIBox(ctx, accountID)
+}
+
+func (s *Store) GetCIBox(ctx context.Context, accountID string) (*CIBox, error) {
+	var b CIBox
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, account_id, repo, workflow_file, branch, gh_login, state, run_id, run_url, machine_id, last_error, created_at, updated_at
+		FROM ci_boxes WHERE account_id = ?
+	`, accountID).Scan(&b.ID, &b.AccountID, &b.Repo, &b.WorkflowFile, &b.Branch, &b.GitHubLogin,
+		&b.State, &b.RunID, &b.RunURL, &b.MachineID, &b.LastError, &b.CreatedAt, &b.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &b, nil
+}
+
+func (s *Store) ListCIBoxes(ctx context.Context) ([]CIBox, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, account_id, repo, workflow_file, branch, gh_login, state, run_id, run_url, machine_id, last_error, created_at, updated_at
+		FROM ci_boxes ORDER BY created_at
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []CIBox{}
+	for rows.Next() {
+		var b CIBox
+		if err := rows.Scan(&b.ID, &b.AccountID, &b.Repo, &b.WorkflowFile, &b.Branch, &b.GitHubLogin,
+			&b.State, &b.RunID, &b.RunURL, &b.MachineID, &b.LastError, &b.CreatedAt, &b.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) getCIBoxToken(ctx context.Context, id string) (string, error) {
+	var enc string
+	err := s.db.QueryRowContext(ctx, `SELECT gh_token_enc FROM ci_boxes WHERE id = ?`, id).Scan(&enc)
+	if err != nil {
+		return "", err
+	}
+	if enc == "" {
+		return "", nil
+	}
+	return crypto.DecryptSecret(s.masterKey, enc)
+}
+
+func (s *Store) GetCIBoxToken(ctx context.Context, accountID string) (string, error) {
+	b, err := s.GetCIBox(ctx, accountID)
+	if err != nil || b == nil {
+		return "", err
+	}
+	return s.getCIBoxToken(ctx, b.ID)
+}
+
+func (s *Store) UpdateCIBoxState(ctx context.Context, id, state string, runID int64, runURL, machineID, lastError string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE ci_boxes SET state=?, run_id=?, run_url=?, machine_id=?, last_error=?, updated_at=? WHERE id=?
+	`, state, runID, runURL, machineID, lastError, time.Now().Unix(), id)
+	return err
+}
+
+func (s *Store) DeleteCIBox(ctx context.Context, accountID string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM ci_boxes WHERE account_id = ?`, accountID)
 	return err
 }
 

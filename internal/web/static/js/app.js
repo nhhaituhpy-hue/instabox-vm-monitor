@@ -1738,11 +1738,12 @@ function populateStatsStrip(strip) {
 function updateDashboardHero(heroEl) {
   const hero = heroEl || document.getElementById('dashboard-hero');
   if (!hero || !hero._refs) return;
-  const { brandTitle, addBtnText, syncBtnText } = hero._refs;
+  const { brandTitle, addBtnText, syncBtnText, ciBoxBtnText } = hero._refs;
 
   setTextIfChanged(brandTitle, t('appName'));
   setTextIfChanged(addBtnText, t('addMachineBtn'));
   setTextIfChanged(syncBtnText, t('refreshAll'));
+  if (ciBoxBtnText) setTextIfChanged(ciBoxBtnText, t('ciBoxBtn'));
 }
 
 function renderDashboard() {
@@ -1761,6 +1762,7 @@ function renderDashboard() {
     el('span', { className: 'btn-sync-glyph btn-sync-glyph-check' }, [ICONS.check()])
   ]);
 
+  const ciBoxBtnText = el('span');
   const hero = el('section', { id: 'dashboard-hero', className: 'dashboard-hero' }, [
     el('div', { className: 'hero-text' }, [heroBrand]),
     el('div', { className: 'hero-actions' }, [
@@ -1770,6 +1772,11 @@ function renderDashboard() {
         onClick: () => openAddMachineDialog()
       }, [ICONS.plus(), addBtnText]),
       el('button', {
+        type: 'button',
+        className: 'btn',
+        onClick: () => openCIBoxDialog()
+      }, [ICONS.sliders(), ciBoxBtnText]),
+      el('button', {
         id: 'sync-all-btn',
         type: 'button',
         className: 'btn-ghost-link btn-sync',
@@ -1777,7 +1784,7 @@ function renderDashboard() {
       }, [syncIconWrap, syncBtnText])
     ])
   ]);
-  hero._refs = { brandTitle, addBtnText, syncBtnText };
+  hero._refs = { brandTitle, addBtnText, syncBtnText, ciBoxBtnText };
   updateDashboardHero(hero);
   main.append(hero);
 
@@ -2732,6 +2739,202 @@ function openRenameMachineDialog(vm) {
   });
 }
 
+
+
+// ---------- CI box dialog ----------
+// Drives the GitHub-Actions-based CI box lifecycle: setup once, then start/stop
+// on demand. Each account can hold one configuration.
+let ciBoxDialog = null;
+function openCIBoxDialog() {
+  if (!ciBoxDialog) {
+    ciBoxDialog = el('dialog', {
+      className: 'app-dialog',
+      'aria-labelledby': 'cibox-title'
+    });
+    enableDialogLightDismiss(ciBoxDialog);
+    document.body.append(ciBoxDialog);
+  }
+
+  const render = async () => {
+    const header = el('div', { className: 'dialog-header' }, [
+      el('h2', { id: 'cibox-title', textContent: t('ciBoxTitle') }),
+      el('button', {
+        type: 'button',
+        className: 'btn btn-icon-only',
+        'aria-label': t('close'),
+        onClick: () => ciBoxDialog.close()
+      }, [ICONS.close()])
+    ]);
+
+    const body = el('div', { className: 'dialog-body' });
+    body.append(el('p', { className: 'hint', textContent: t('ciBoxDesc') }));
+
+    let boxes = [];
+    try {
+      const res = await apiFetch('/api/ci-boxes');
+      boxes = res?.ciBoxes || [];
+    } catch { /* list failure is non-fatal; rows render empty */ }
+
+    const rows = state.accounts.map((acc) => {
+      const box = boxes.find((b) => b.accountId === acc.id) || null;
+      return buildCIBoxRow(acc, box, render);
+    });
+
+    body.append(el('div', { className: 'cibox-list' }, rows));
+    ciBoxDialog.replaceChildren(el('div', { className: 'dialog-inner' }, [header, body]));
+  };
+
+  if (!ciBoxDialog.open) ciBoxDialog.showModal();
+  render();
+}
+
+function buildCIBoxRow(acc, box, rerender) {
+  const stateTone = { running: 'running', starting: 'idle', dispatching: 'idle', stopping: 'idle', error: 'error', idle: 'stopped' };
+  const stateKey = { running: 'ciStateRunning', starting: 'ciStateStarting', dispatching: 'ciStateStarting', stopping: 'ciStateStopping', error: 'ciStateError', idle: 'ciStateIdle' };
+
+  const statusLine = box
+    ? el('span', { className: 'badge', dataset: { tone: stateTone[box.state] || 'stopped' }, textContent: t(stateKey[box.state] || 'ciStateIdle') })
+    : el('span', { className: 'badge', dataset: { tone: 'stopped' }, textContent: t('ciNotConfigured') });
+
+  const detailBits = [];
+  if (box) {
+    if (box.machineId) detailBits.push(`box: ${box.machineId}`);
+    if (box.repo) detailBits.push(box.repo);
+    if (box.lastError) detailBits.push(`! ${box.lastError}`);
+    if (box.runUrl) detailBits.push(box.runUrl);
+  }
+  const detail = el('div', { className: 'hint mono', style: 'word-break:break-all;', textContent: detailBits.join(' · ') });
+
+  const buttons = [];
+  const busy = { 'aria-disabled': 'false' };
+
+  const doAction = async (path, successKey) => {
+    try {
+      await apiFetch(path, { method: 'POST' });
+      if (successKey) showToast(t(successKey));
+      setTimeout(() => { if (ciBoxDialog?.open) rerender(); }, 400);
+      setTimeout(() => refreshMachinesSilently(), 2500);
+    } catch (err) {
+      showToast(err.message, 'error');
+    }
+  };
+
+  if (!box) {
+    buttons.push(el('button', {
+      type: 'button', className: 'btn btn-primary', ...busy,
+      textContent: t('ciSetup'),
+      onClick: () => openCIBoxSetupDialog(acc, rerender)
+    }));
+  } else {
+    const active = box.state === 'dispatching' || box.state === 'starting' || box.state === 'running';
+    buttons.push(el('button', {
+      type: 'button', className: 'btn btn-primary', ...busy,
+      textContent: t('ciStart'),
+      disabled: active,
+      onClick: () => doAction(`/api/accounts/${encodeURIComponent(acc.id)}/ci-box/start`, 'ciStarted')
+    }));
+    buttons.push(el('button', {
+      type: 'button', className: 'btn', ...busy,
+      textContent: t('ciStop'),
+      disabled: !active,
+      onClick: () => doAction(`/api/accounts/${encodeURIComponent(acc.id)}/ci-box/stop`, 'ciStopped')
+    }));
+    buttons.push(el('button', {
+      type: 'button', className: 'btn', ...busy,
+      textContent: t('ciReconfigure'),
+      onClick: () => openCIBoxSetupDialog(acc, rerender)
+    }));
+  }
+
+  return el('div', { className: 'cibox-row' }, [
+    el('div', { className: 'cibox-row-head' }, [
+      el('strong', { textContent: acc.alias || acc.id }),
+      statusLine
+    ]),
+    detail,
+    el('div', { className: 'dialog-actions-row', style: 'justify-content:flex-start;' }, buttons)
+  ]);
+}
+
+let ciBoxSetupDialog = null;
+function openCIBoxSetupDialog(acc, rerender) {
+  if (!ciBoxSetupDialog) {
+    ciBoxSetupDialog = el('dialog', {
+      className: 'app-dialog app-dialog-narrow',
+      'aria-labelledby': 'cibox-setup-title'
+    });
+    enableDialogLightDismiss(ciBoxSetupDialog);
+    document.body.append(ciBoxSetupDialog);
+  }
+
+  const header = el('div', { className: 'dialog-header' }, [
+    el('h2', { id: 'cibox-setup-title', textContent: `${t('ciSetupTitle')} — ${acc.alias || acc.id}` }),
+    el('button', {
+      type: 'button', className: 'btn btn-icon-only', 'aria-label': t('close'),
+      onClick: () => ciBoxSetupDialog.close()
+    }, [ICONS.close()])
+  ]);
+
+  const body = el('div', { className: 'dialog-body' });
+  const errBanner = el('div', { className: 'form-error-banner', role: 'alert', hidden: true });
+  const form = el('form', { novalidate: true });
+
+  const tokenInput = el('input', {
+    className: 'input', id: 'cibox-token', type: 'password',
+    placeholder: 'github_pat_… / ghp_…', autocomplete: 'off'
+  });
+  const tokenField = el('div', { className: 'field', style: 'margin-block-end:0;' }, [
+    el('label', { for: 'cibox-token', textContent: t('ciTokenLabel') }),
+    el('span', { className: 'hint', textContent: t('ciTokenHint') }),
+    tokenInput
+  ]);
+
+  const repoInput = el('input', {
+    className: 'input', id: 'cibox-repo', type: 'text',
+    placeholder: t('ciRepoPlaceholder'), autocapitalize: 'none', spellcheck: 'false'
+  });
+  const repoField = el('div', { className: 'field', style: 'margin-block-end:0;' }, [
+    el('label', { for: 'cibox-repo', textContent: t('ciRepoLabel') }),
+    el('span', { className: 'hint', textContent: t('ciRepoHint') }),
+    repoInput
+  ]);
+
+  const saveBtn = el('button', { type: 'submit', className: 'btn btn-primary', textContent: t('ciSetupSave') });
+  const btnRow = el('div', { className: 'dialog-actions-row' }, [
+    el('button', { type: 'button', className: 'btn', textContent: t('cancelEdit'), onClick: () => ciBoxSetupDialog.close() }),
+    saveBtn
+  ]);
+
+  form.append(errBanner, el('div', { className: 'form-stack' }, [
+    el('p', { className: 'hint', textContent: t('ciSetupDesc') }),
+    tokenField, repoField, btnRow
+  ]));
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    errBanner.hidden = true;
+    if (saveBtn.getAttribute('aria-disabled') === 'true') return;
+    saveBtn.setAttribute('aria-disabled', 'true');
+    try {
+      await apiFetch(`/api/accounts/${encodeURIComponent(acc.id)}/ci-box`, {
+        method: 'PUT',
+        body: JSON.stringify({ token: tokenInput.value.trim(), repo: repoInput.value.trim() })
+      });
+      ciBoxSetupDialog.close();
+      showToast(t('ciSetupDone'));
+      if (rerender) rerender();
+    } catch (err) {
+      errBanner.textContent = err.message;
+      errBanner.hidden = false;
+    } finally {
+      saveBtn.removeAttribute('aria-disabled');
+    }
+  });
+
+  body.append(form);
+  ciBoxSetupDialog.replaceChildren(el('div', { className: 'dialog-inner' }, [header, body]));
+  if (!ciBoxSetupDialog.open) ciBoxSetupDialog.showModal();
+}
 
 let resizeMachineDialog = null;
 function openResizeMachineDialog(vm) {

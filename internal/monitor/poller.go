@@ -178,6 +178,7 @@ func (p *Poller) SyncAll(ctx context.Context) {
 		}(acc.ID)
 	}
 	wg.Wait()
+	p.pollCIBoxes(ctx)
 
 	now := time.Now().Unix()
 	if now-p.lastPruneUnix.Load() >= 3600 {

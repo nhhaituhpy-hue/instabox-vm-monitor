@@ -119,6 +119,27 @@ type TemplateList struct {
 	Templates []Template `json:"templates"`
 }
 
+// GitHubJob is one entry of GET /v1/orgs/{id}/github/jobs — a GitHub Actions
+// job the org's CI boxes ran or are waiting to run.
+type GitHubJob struct {
+	ID             int64  `json:"id"`
+	State          string `json:"state"` // waiting, starting, started, completed, refused, failed
+	Reason         string `json:"reason,omitempty"`
+	Conclusion     string `json:"conclusion,omitempty"`
+	Actor          string `json:"actor,omitempty"`
+	Branch         string `json:"branch,omitempty"`
+	Commit         string `json:"commit,omitempty"`
+	Labels         []string `json:"labels,omitempty"`
+	MachineID      string `json:"machineId,omitempty"`
+	RanOn          string `json:"ranOn,omitempty"`
+	CreatedAt      string `json:"createdAt,omitempty"`
+	ReadyAt        string `json:"readyAt,omitempty"`
+	CompletedAt    string `json:"completedAt,omitempty"`
+	RepositoryName string `json:"repositoryName,omitempty"`
+	WorkflowName   string `json:"workflowName,omitempty"`
+	JobName        string `json:"job,omitempty"`
+}
+
 type CreateMachineInput struct {
 	Name                    string            `json:"name,omitempty"`
 	TemplateID              string            `json:"templateId,omitempty"`
@@ -561,6 +582,22 @@ func (c *Client) ListTemplates(ctx context.Context, apiKey string) ([]Template, 
 		return nil, err
 	}
 	return out.Templates, nil
+}
+
+// ListGitHubJobs returns the org's GitHub Actions jobs, newest first.
+func (c *Client) ListGitHubJobs(ctx context.Context, apiKey, orgID string, limit int) ([]GitHubJob, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	var out struct {
+		Jobs []GitHubJob `json:"jobs"`
+	}
+	path := fmt.Sprintf("/v1/orgs/%s/github/jobs?limit=%d", orgID, limit)
+	_, err := c.doJSON(ctx, http.MethodGet, path, apiKey, nil, false, &out)
+	if err != nil {
+		return nil, err
+	}
+	return out.Jobs, nil
 }
 
 func (c *Client) CreateMachine(ctx context.Context, apiKey string, in CreateMachineInput) (*ActionResult, error) {
