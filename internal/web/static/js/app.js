@@ -204,19 +204,6 @@ function fmtHMS(totalSeconds) {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
 }
 
-function windowsJsonToText(raw) {
-  try {
-    const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) return raw;
-    return arr.map((w) => {
-      const end = w.end === '00:00' ? '00:00' : w.end;
-      return `${w.start}-${end}`;
-    }).join(', ');
-  } catch {
-    return raw || '';
-  }
-}
-
 // Mirrors the backend window logic for the countdown label (schedule tz fixed UTC+7).
 function scheduleNextTransition(vm) {
   if (!vm.scheduleEnabled || !vm.scheduleWindows) return null;
@@ -1156,7 +1143,7 @@ function createVmCardController(initialVm) {
     dataset: { active: 'false' }
   }, [keepaliveInput, keepaliveText, keepaliveMeta]);
 
-  // --- Time-window schedule row: machine runs only inside the given daily windows ---
+  // --- Time-window schedule row: toggle + "view details" link into the editor modal ---
   const schedInputId = `sch-${vm.accountId}-${vm.id}`.replace(/[^a-zA-Z0-9_-]/g, '_');
   let schedBusy = false;
   const schedEnabledInput = el('input', {
@@ -1171,23 +1158,11 @@ function createVmCardController(initialVm) {
     for: schedInputId,
     dataset: { active: 'false' }
   }, [schedEnabledInput, schedText, schedMeta]);
-  const schedWindowsInput = el('input', {
-    type: 'text',
-    className: 'vm-sched-input mono',
-    placeholder: '06:00-08:00, 18:00-19:00',
-    spellcheck: 'false',
-    autocomplete: 'off'
-  });
-  const schedApplyBtn = el('button', {
-    type: 'button',
-    className: 'mini-btn'
-  });
 
   const saveSchedule = async (enabled, windows) => {
-    if (schedBusy) return;
+    if (schedBusy) return false;
     schedBusy = true;
     schedEnabledInput.disabled = true;
-    schedApplyBtn.disabled = true;
     try {
       const res = await apiFetch(
         `/api/machines/${encodeURIComponent(vm.accountId)}/${encodeURIComponent(vm.id)}/schedule`,
@@ -1200,31 +1175,36 @@ function createVmCardController(initialVm) {
       }
       showToast(`${t(enabled ? 'schedEnabledToast' : 'schedDisabledToast')}: ${vm.name}`);
       setTimeout(() => refreshMachinesSilently(), 1200);
+      return true;
     } catch (err) {
       showToast(err.message, 'error');
+      return false;
     } finally {
       schedBusy = false;
       schedEnabledInput.disabled = false;
-      schedApplyBtn.disabled = false;
     }
   };
 
-  schedEnabledInput.addEventListener('change', () => {
-    saveSchedule(schedEnabledInput.checked, schedWindowsInput.value.trim());
-    if (!schedEnabledInput.checked) return;
-  });
-  schedApplyBtn.addEventListener('click', () => {
-    saveSchedule(true, schedWindowsInput.value.trim());
-  });
-  schedWindowsInput.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Enter') {
-      ev.preventDefault();
-      saveSchedule(true, schedWindowsInput.value.trim());
+  schedEnabledInput.addEventListener('change', async () => {
+    const wantOn = schedEnabledInput.checked;
+    if (wantOn && !vm.scheduleWindows) {
+      // Nothing configured yet: the modal is the place to define the first window.
+      schedEnabledInput.checked = false;
+      openScheduleDialog(vm);
+      return;
     }
+    const ok = await saveSchedule(wantOn, vm.scheduleWindows || '');
+    if (!ok) schedEnabledInput.checked = !wantOn;
+  });
+
+  const schedDetailsBtn = el('button', {
+    type: 'button',
+    className: 'vm-sched-details',
+    onClick: () => openScheduleDialog(vm)
   });
 
   const schedRow = el('div', { className: 'vm-sched-row' }, [
-    schedToggle, schedWindowsInput, schedApplyBtn
+    schedToggle, schedDetailsBtn
   ]);
 
   keepaliveInput.addEventListener('change', async () => {
@@ -1390,6 +1370,10 @@ function createVmCardController(initialVm) {
     keepaliveToggle.dataset.active = kaEnabled ? 'true' : 'false';
     setTextIfChanged(keepaliveText, t('keepaliveLabel'));
     keepaliveToggle.title = vm.keepaliveLastError || t('keepaliveDesc');
+    const kaLockedBySched = !!vm.scheduleEnabled && !kaEnabled;
+    keepaliveInput.disabled = keepaliveBusy || kaLockedBySched;
+    keepaliveToggle.dataset.locked = kaLockedBySched ? 'true' : 'false';
+    if (kaLockedBySched) keepaliveToggle.title = t('keepaliveLockedBySchedule');
     if (!kaEnabled) {
       keepaliveMeta.hidden = true;
       delete keepaliveMeta.dataset.tone;
@@ -1422,15 +1406,18 @@ function createVmCardController(initialVm) {
     const schEnabled = !!vm.scheduleEnabled;
     if (!schedBusy) {
       schedEnabledInput.checked = schEnabled;
-      if (vm.scheduleWindows && document.activeElement !== schedWindowsInput) {
-        schedWindowsInput.value = windowsJsonToText(vm.scheduleWindows);
-      }
     }
     schedToggle.dataset.active = schEnabled ? 'true' : 'false';
     setTextIfChanged(schedText, t('schedLabel'));
     schedToggle.title = vm.scheduleLastError || t('schedDesc');
-    setTextIfChanged(schedApplyBtn, t('schedApply'));
-    schedWindowsInput.disabled = schedBusy;
+    // Keep-awake and schedule are opposing modes: whichever is active locks the other.
+    const schLockedByKa = kaEnabled && !schEnabled;
+    schedEnabledInput.disabled = schedBusy || schLockedByKa;
+    schedToggle.dataset.locked = schLockedByKa ? 'true' : 'false';
+    if (schLockedByKa) schedToggle.title = t('schedLockedByKeepalive');
+    const hasWindows = !!vm.scheduleWindows;
+    schedDetailsBtn.hidden = !hasWindows;
+    setTextIfChanged(schedDetailsBtn, t('schedDetails'));
     if (!schEnabled) {
       schedMeta.hidden = true;
       delete schedMeta.dataset.tone;
@@ -3741,6 +3728,179 @@ function ensureTelemetryDialogShell() {
 
   telemetryDialog._shell = { titleEl, subtitleEl, termOpenBtn, body, rangeBtns, cpuBox, ramBox, diskBox, netBox };
   return telemetryDialog._shell;
+}
+
+// --- Schedule editor modal --------------------------------------------------
+// Uizze-style: calm flat surface, one dominant primary action, explicit rows the
+// user can add/edit/delete, inline validation copy — no decorative chrome.
+let scheduleDialog = null;
+
+function ensureScheduleDialogShell() {
+  if (!scheduleDialog) {
+    scheduleDialog = el('dialog', {
+      className: 'app-dialog sched-dialog',
+      'aria-labelledby': 'sched-dialog-title'
+    });
+    enableDialogLightDismiss(scheduleDialog);
+    document.body.append(scheduleDialog);
+  }
+  if (scheduleDialog._shell) return scheduleDialog._shell;
+
+  const titleEl = el('h2', { id: 'sched-dialog-title' });
+  const subtitleEl = el('div', { className: 'hint mono' });
+  const closeBtn = el('button', {
+    type: 'button',
+    className: 'btn btn-icon-only',
+    'aria-label': t('close'),
+    onClick: () => scheduleDialog.close()
+  }, [ICONS.close()]);
+  const header = el('div', { className: 'dialog-header' }, [
+    el('div', {}, [titleEl, subtitleEl]),
+    el('div', { className: 'dialog-header-actions' }, [closeBtn])
+  ]);
+
+  const descEl = el('p', { className: 'sched-modal-desc' });
+  const rowsHost = el('div', { className: 'sched-rows' });
+  const errEl = el('div', { className: 'sched-modal-error', hidden: true });
+
+  const addBtn = el('button', { type: 'button', className: 'btn sched-add-btn' });
+  const cancelBtn = el('button', {
+    type: 'button', className: 'btn',
+    onClick: () => scheduleDialog.close()
+  });
+  const saveBtn = el('button', { type: 'button', className: 'btn sched-save-btn' });
+  const footer = el('div', { className: 'sched-modal-footer' }, [cancelBtn, saveBtn]);
+
+  const body = el('div', { className: 'dialog-body' }, [descEl, rowsHost, addBtn, errEl, footer]);
+  const inner = el('div', { className: 'dialog-inner' }, [header, body]);
+  scheduleDialog.replaceChildren(inner);
+
+  scheduleDialog._shell = { titleEl, subtitleEl, descEl, rowsHost, addBtn, errEl, cancelBtn, saveBtn };
+  return scheduleDialog._shell;
+}
+
+function scheduleWindowRow(start, end, onDelete) {
+  const startInput = el('input', {
+    type: 'time', className: 'sched-time mono', value: start || '06:00',
+    'aria-label': 'start'
+  });
+  const endInput = el('input', {
+    type: 'time', className: 'sched-time mono', value: end || '08:00',
+    'aria-label': 'end'
+  });
+  const delBtn = el('button', {
+    type: 'button', className: 'btn btn-icon-only sched-del',
+    'aria-label': t('schedDelete'),
+    title: t('schedDelete'),
+    onClick: onDelete
+  }, [ICONS.close()]);
+  const dash = el('span', { className: 'sched-dash', textContent: '→' });
+  const row = el('div', { className: 'sched-row' }, [startInput, dash, endInput, delBtn]);
+  row._get = () => ({ start: startInput.value, end: endInput.value });
+  return row;
+}
+
+function validateWindowRows(rows) {
+  const entries = [];
+  for (const row of rows) {
+    const { start, end } = row._get();
+    if (!start || !end) return { error: t('schedErrEmpty') };
+    entries.push({ start, end });
+  }
+  if (entries.length === 0) return { error: t('schedErrNeedOne') };
+  // Sort by start for overlap detection (server re-validates authoritatively).
+  const toMin = (s) => {
+    const [h, m] = s.split(':').map(Number);
+    return h * 60 + m;
+  };
+  const sorted = [...entries].sort((a, b) => toMin(a.start) - toMin(b.start));
+  for (const w of sorted) {
+    let endMin = toMin(w.end);
+    if (endMin === 0) endMin = 1440;
+    if (toMin(w.start) >= endMin) return { error: t('schedErrInverted') };
+    if (endMin - toMin(w.start) < 5) return { error: t('schedErrTooShort') };
+  }
+  for (let i = 1; i < sorted.length; i++) {
+    const prevEnd = toMin(sorted[i - 1].end) === 0 ? 1440 : toMin(sorted[i - 1].end);
+    if (toMin(sorted[i].start) < prevEnd) return { error: t('schedErrOverlap') };
+  }
+  return { entries };
+}
+
+async function openScheduleDialog(vm) {
+  const shell = ensureScheduleDialogShell();
+  const { rowsHost, addBtn, errEl, cancelBtn, saveBtn, descEl } = shell;
+
+  setTextIfChanged(shell.titleEl, `${vm.name} · ${t('schedTitle')}`);
+  setTextIfChanged(shell.subtitleEl, `${vm.accountAlias || vm.accountId} · UTC+7`);
+  setTextIfChanged(descEl, t('schedModalDesc'));
+  setTextIfChanged(addBtn, `+ ${t('schedAdd')}`);
+  setTextIfChanged(cancelBtn, t('cancel'));
+  setTextIfChanged(saveBtn, t('schedSave'));
+  errEl.hidden = true;
+
+  // Seed rows from the stored windows.
+  rowsHost.replaceChildren();
+  const addRow = (start, end) => {
+    const row = scheduleWindowRow(start, end, () => {
+      row.remove();
+      if (rowsHost.children.length === 0) addRow('06:00', '08:00');
+    });
+    rowsHost.append(row);
+    return row;
+  };
+  let seeded = [];
+  try { seeded = JSON.parse(vm.scheduleWindows || '[]'); } catch { seeded = []; }
+  if (Array.isArray(seeded) && seeded.length > 0) {
+    for (const w of seeded) addRow(w.start, w.end === '00:00' ? '00:00' : w.end);
+  } else {
+    addRow('06:00', '08:00');
+  }
+  addBtn.onclick = () => {
+    if (rowsHost.children.length >= 12) {
+      errEl.hidden = false;
+      setTextIfChanged(errEl, t('schedErrTooMany'));
+      return;
+    }
+    errEl.hidden = true;
+    addRow('18:00', '19:00');
+  };
+
+  saveBtn.onclick = async () => {
+    const rows = [...rowsHost.children];
+    const { entries, error } = validateWindowRows(rows);
+    if (error) {
+      errEl.hidden = false;
+      setTextIfChanged(errEl, error);
+      return;
+    }
+    errEl.hidden = true;
+    saveBtn.disabled = true;
+    setTextIfChanged(saveBtn, t('schedSaving'));
+    try {
+      const windowsText = entries.map((w) => `${w.start}-${w.end}`).join(', ');
+      const res = await apiFetch(
+        `/api/machines/${encodeURIComponent(vm.accountId)}/${encodeURIComponent(vm.id)}/schedule`,
+        { method: 'PUT', body: JSON.stringify({ enabled: true, windows: windowsText, tzOffsetMin: 420 }) }
+      );
+      if (res?.machine) {
+        const idx = state.machines.findIndex((x) => x.accountId === vm.accountId && x.id === vm.id);
+        if (idx >= 0) state.machines[idx] = res.machine;
+        updateDashboardInPlace();
+      }
+      showToast(`${t('schedEnabledToast')}: ${vm.name}`);
+      scheduleDialog.close();
+      setTimeout(() => refreshMachinesSilently(), 1200);
+    } catch (err) {
+      errEl.hidden = false;
+      setTextIfChanged(errEl, err.message);
+    } finally {
+      saveBtn.disabled = false;
+      setTextIfChanged(saveBtn, t('schedSave'));
+    }
+  };
+
+  if (!scheduleDialog.open) scheduleDialog.showModal();
 }
 
 async function openTelemetryDialog(vm) {
