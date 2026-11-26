@@ -511,6 +511,8 @@ func TestKeepaliveRenewsLeaseWakesIdlePowerCyclesCapAndPreservesManualStop(t *te
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_lease":
 			v := vms["m_lease"]
 			_, _ = w.Write([]byte(`{"id":"m_lease","name":"vm-lease","state":"` + v.state + `","desiredState":"` + v.state + `","runStartedAt":"` + v.runStartedAt + `","maxRunMinutes":480,"free":true}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_lease/exec":
+			_, _ = w.Write([]byte(`{"stdout":"","stderr":"","exitCode":0}`))
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/machines/m_lease/activity-leases/ibmon-keepalive":
 			events = append(events, "put_lease:m_lease")
 			exp := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
@@ -533,6 +535,8 @@ func TestKeepaliveRenewsLeaseWakesIdlePowerCyclesCapAndPreservesManualStop(t *te
 			vms["m_cap"].runStartedAt = time.Now().UTC().Format(time.RFC3339)
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte(`{"id":"op_start","machineId":"m_cap","state":"succeeded"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_cap/exec":
+			_, _ = w.Write([]byte(`{"stdout":"","stderr":"","exitCode":0}`))
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/machines/m_cap/activity-leases/ibmon-keepalive":
 			events = append(events, "put_lease:m_cap")
 			exp := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
@@ -551,6 +555,8 @@ func TestKeepaliveRenewsLeaseWakesIdlePowerCyclesCapAndPreservesManualStop(t *te
 			vms["m_idle"].autoSuspendedAt = ""
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte(`{"id":"op_res","machineId":"m_idle","state":"succeeded"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_idle/exec":
+			_, _ = w.Write([]byte(`{"stdout":"","stderr":"","exitCode":0}`))
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/machines/m_idle/activity-leases/ibmon-keepalive":
 			events = append(events, "put_lease:m_idle")
 			exp := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
@@ -692,6 +698,8 @@ func TestKeepaliveDisableCancelsAndFencesActiveCycle(t *testing.T) {
 			mu.Unlock()
 			w.WriteHeader(http.StatusAccepted)
 			_, _ = w.Write([]byte(`{"id":"op_res","machineId":"m_race","state":"succeeded"}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_race/exec":
+			_, _ = w.Write([]byte(`{"stdout":"","stderr":"","exitCode":0}`))
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/machines/m_race/activity-leases/ibmon-keepalive":
 			mu.Lock()
 			events = append(events, "put_lease")
@@ -816,6 +824,8 @@ func TestKeepaliveDisableFencesBlockedLockAndRapidDisableEnableRunsForceLease(t 
 			default:
 			}
 			_, _ = w.Write([]byte(`{"id":"m_fast","name":"vm-fast","state":"running","desiredState":"running","runStartedAt":"` + time.Now().UTC().Add(-10*time.Minute).Format(time.RFC3339) + `","maxRunMinutes":480,"free":true}`))
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_fast/exec":
+			_, _ = w.Write([]byte(`{"stdout":"","stderr":"","exitCode":0}`))
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/machines/m_fast/activity-leases/ibmon-keepalive":
 			mu.Lock()
 			events = append(events, "put_lease")
@@ -939,7 +949,7 @@ func TestKeepaliveDisableFencesBlockedLockAndRapidDisableEnableRunsForceLease(t 
 	}
 
 	stored, err := st.GetMachine(ctx, acc.ID, "m_fast")
-	if err != nil || !stored.KeepaliveEnabled || stored.KeepaliveLastAction != "lease_renewed" || stored.KeepaliveLeaseExpiresAt <= 0 {
+	if err != nil || !stored.KeepaliveEnabled || stored.KeepaliveLastAction != "activity_ping" || stored.KeepaliveLeaseExpiresAt <= 0 {
 		t.Fatalf("expected machine keepalive active with renewed lease, got err=%v m=%+v", err, stored)
 	}
 }
@@ -1038,6 +1048,9 @@ func TestKeepalivePowerCycleRecoveryAndShorterFreeMaxRunThreshold(t *testing.T) 
 					v.runStartedAt = time.Now().UTC().Format(time.RFC3339)
 					w.WriteHeader(http.StatusAccepted)
 					_, _ = w.Write([]byte(`{"id":"op_start","machineId":"` + id + `","state":"succeeded"}`))
+					return
+				case r.Method == http.MethodPost && r.URL.Path == base+"/exec":
+					_, _ = w.Write([]byte(`{"stdout":"","stderr":"","exitCode":0}`))
 					return
 				case r.Method == http.MethodPut && r.URL.Path == base+"/activity-leases/ibmon-keepalive":
 					exp := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
@@ -1509,6 +1522,8 @@ func TestKeepaliveLeaseRenewalUsesUpstreamClockUnderHostClockSkew(t *testing.T) 
 				_, _ = w.Write([]byte(`{"metrics":[]}`))
 			case r.Method == http.MethodGet && r.URL.Path == "/v1/machines/m_skew/disk":
 				_, _ = w.Write([]byte(`{"measuredAt":"2026-11-13T12:00:00Z","filesystems":[]}`))
+			case r.Method == http.MethodPost && r.URL.Path == "/v1/machines/m_skew/exec":
+				_, _ = w.Write([]byte(`{"stdout":"","stderr":"","exitCode":0}`))
 			case r.Method == http.MethodPut && r.URL.Path == "/v1/machines/m_skew/activity-leases/ibmon-keepalive":
 				n := putCount.Add(1)
 				exp := upstreamBase.Add(leaseTTLRemaining).Format(time.RFC3339)

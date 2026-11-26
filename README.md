@@ -44,6 +44,7 @@ This monitor tracks the current instabox.sh API and encodes these recent upstrea
 - **Auto-suspend rules**: paid plans accept whole minutes 300-1800s (5-30 min) or `0` (never); free-plan machines are fixed at 1800s. Invalid values are rejected locally before hitting upstream.
 - **Wake semantics**: `/wake` of an idle-paused VM can answer a retryable `409 operation_conflict` naming the in-progress resume; the monitor follows that operation instead of failing the action.
 - **Cooldowns**: max-run cooldowns escalate on the free plan (5-20 / 60-75 / 120-135 min for consecutive pauses) and abuse-lock cooldowns (`cooldownReason` `abuse_*`, up to 24h) are labelled distinctly on the card clock.
+- **Keepalive uses real activity**: since free-plan runs extend only on real use (activity leases no longer count), the per-machine keepalive executes a trivial command in the VM every ~20 minutes instead of just renewing the lease, then proactively stops and restarts the machine before the 8h cap so the escalating max-run cooldown ladder never engages.
 - **Fork**: `POST /v1/machines/{id}/fork` copies disks into a new machine in seconds; exposed via REST, MCP (`fork_machine`) and accepts `deleteAfterSeconds`.
 - **Resize**: `PATCH /v1/machines/{id}` accepts `vcpus`/`memMiB` for stopped machines, or `apply: restart` for a running/paused machine.
 

@@ -1369,6 +1369,13 @@ func (p *Poller) RunKeepaliveCycle(ctx context.Context, accountID, machineID str
 			_ = p.store.SetMachineKeepalivePendingRestart(cycleCtx, accountID, machineID, false)
 		}
 
+		// instabox.sh Nov-2026 free-plan runtime rules: activity leases no longer
+		// extend the run — only real use does (an exec, file access, port traffic,
+		// desktop/SSH input, or >=0.25 vCPU load). So instead of renewing a lease
+		// we run a trivial command in the machine: a single exec counts as use for
+		// its minute, which within the last 30m of a run buys the +30m extension
+		// (and shows as light CPU on the machine's own metrics). The lease is kept
+		// as a secondary guard against the 30-minute idle pause only.
 		prevRS, hasRS := p.keepaliveLeaseRunStart.Load(key)
 		runChanged := m.RunStartedAt != "" && (!hasRS || prevRS.(string) != m.RunStartedAt)
 		expiring := rec.KeepaliveLeaseExpiresAt <= upUnix+keepaliveRenewLeadSeconds
@@ -1379,24 +1386,33 @@ func (p *Poller) RunKeepaliveCycle(ctx context.Context, accountID, machineID str
 			return nil
 		}
 
-		lease, err := p.client.PutActivityLease(cycleCtx, apiKey, machineID, keepaliveLeaseID, keepaliveLeaseTTLSeconds)
-		if err != nil {
-			p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, -1, time.Now().Unix(), "error", err.Error())
-			return err
-		}
-		if !p.keepaliveValid(cycleCtx, key, myGen) {
-			return nil
-		}
 		expUnix := p.upstreamNow().Unix() + keepaliveLeaseTTLSeconds
-		if lease != nil {
+		if lease, err := p.client.PutActivityLease(cycleCtx, apiKey, machineID, keepaliveLeaseID, keepaliveLeaseTTLSeconds); err == nil && lease != nil {
 			if expTime, ok := parseInstaboxTime(lease.ExpiresAt); ok {
 				expUnix = expTime.Unix()
 			}
 		}
+
+		execRes, execErr := p.client.ExecMachine(cycleCtx, apiKey, machineID, instabox.ExecInput{
+			Cmd:            "echo ibmon-activity $(date +%s) >/dev/null 2>&1; true",
+			TimeoutSeconds: 20,
+		})
+		if execErr != nil {
+			p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, -1, time.Now().Unix(), "error", execErr.Error())
+			return execErr
+		}
+		if !p.keepaliveValid(cycleCtx, key, myGen) {
+			return nil
+		}
+		if execRes != nil && execRes.ExitCode != 0 {
+			msg := fmt.Sprintf("activity exec exit %d", execRes.ExitCode)
+			p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, -1, time.Now().Unix(), "error", msg)
+			return errors.New(msg)
+		}
 		if !p.storeKeepaliveLeaseRunStart(cycleCtx, key, myGen, m.RunStartedAt) {
 			return nil
 		}
-		p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, expUnix, time.Now().Unix(), "lease_renewed", "")
+		p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, expUnix, time.Now().Unix(), "activity_ping", "")
 		return nil
 	}
 
