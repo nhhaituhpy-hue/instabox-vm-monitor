@@ -494,6 +494,9 @@ type TemplateOption struct {
 	DefaultSpec instabox.MachineSpec `json:"defaultSpec"`
 	Default     bool                 `json:"default,omitempty"`
 	PlanAllowed bool                 `json:"planAllowed"`
+	// JobOnly marks templates reserved for CI job runners on this plan:
+	// direct creates are refused upstream with 403 template_job_only.
+	JobOnly bool `json:"jobOnly,omitempty"`
 }
 
 type AccountMachineOptions struct {
@@ -563,7 +566,12 @@ func (p *Poller) GetAccountMachineOptions(ctx context.Context, accountID string)
 	templates := make([]TemplateOption, 0, len(byID))
 	for _, tpl := range byID {
 		planAllowed := !strings.EqualFold(orgTier, "free") || isFreeAllowedTemplate(tpl.ID)
+		// instabox.sh now reserves free-plan CI boxes for GitHub Actions jobs:
+		// direct creates of a `ci` box are refused with `403 template_job_only`.
+		// The templates API exposes no flag for this, so encode the known rule.
+		jobOnly := tpl.ID == "ci" && strings.EqualFold(orgTier, "free")
 		templates = append(templates, TemplateOption{
+			JobOnly:     jobOnly,
 			ID:          tpl.ID,
 			Version:     tpl.Version,
 			Description: tpl.Description,

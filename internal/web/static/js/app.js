@@ -37,6 +37,10 @@ const ICONS = {
     { tag: 'rect', x: '14', y: '4', width: '4', height: '16', rx: '1' }
   ]),
   start: () => svgIcon([{ tag: 'polygon', points: '6 4 20 12 6 20 6 4' }]),
+  sliders: () => svgIcon([
+    { d: 'M4 8h10' }, { d: 'M18 8h2' }, { tag: 'circle', cx: '16', cy: '8', r: '2' },
+    { d: 'M4 16h2' }, { d: 'M10 16h10' }, { tag: 'circle', cx: '8', cy: '16', r: '2' }
+  ]),
   stop: () => svgIcon([{ tag: 'rect', x: '5', y: '5', width: '14', height: '14', rx: '2' }]),
   refresh: () => svgIcon([
     { d: 'M21 12a9 9 0 1 1-2.64-6.36' },
@@ -1119,6 +1123,14 @@ function createVmCardController(initialVm) {
       openRenameMachineDialog(vm);
     }
   }, [ICONS.edit()]);
+  const resizeBtn = el('button', {
+    type: 'button',
+    className: 'vm-inline-btn',
+    onClick: (ev) => {
+      ev.stopPropagation();
+      openResizeMachineDialog(vm);
+    }
+  }, [ICONS.sliders()]);
   const deleteBtn = el('button', {
     type: 'button',
     className: 'vm-inline-btn vm-inline-danger',
@@ -1127,7 +1139,7 @@ function createVmCardController(initialVm) {
       openDeleteMachineDialog(vm);
     }
   }, [ICONS.trash()]);
-  const nameRow = el('div', { className: 'vm-name-row' }, [nameBtn, terminalBtn, renameBtn, deleteBtn]);
+  const nameRow = el('div', { className: 'vm-name-row' }, [nameBtn, terminalBtn, renameBtn, resizeBtn, deleteBtn]);
 
   const aliasBadge = el('span', { className: 'badge' });
   const idBadge = el('span', { className: 'badge mono' });
@@ -1355,6 +1367,11 @@ function createVmCardController(initialVm) {
     if (renameBtn.getAttribute('aria-label') !== renameLabel) {
       renameBtn.setAttribute('aria-label', renameLabel);
       renameBtn.title = renameLabel;
+    }
+    const resizeLabel = `${t('resizeMachine')}: ${vm.name}`;
+    if (resizeBtn.getAttribute('aria-label') !== resizeLabel) {
+      resizeBtn.setAttribute('aria-label', resizeLabel);
+      resizeBtn.title = resizeLabel;
     }
     const deleteLabel = `${t('deleteMachine')}: ${vm.name}`;
     if (deleteBtn.getAttribute('aria-label') !== deleteLabel) {
@@ -2269,8 +2286,11 @@ function renderAddMachineDialogContent(initialTab) {
       ];
       if (chosen.default) badges.push(el('span', { className: 'badge', dataset: { tone: 'running' }, textContent: t('defaultTag') }));
       if (!chosen.planAllowed) badges.push(el('span', { className: 'badge', dataset: { tone: 'idle' }, textContent: t('paidPlanTag') }));
+      if (chosen.jobOnly) badges.push(el('span', { className: 'badge', dataset: { tone: 'error' }, textContent: t('jobOnlyTag') }));
       tplPreviewHead.replaceChildren(...badges);
-      tplPreviewDesc.textContent = chosen.description || '';
+      tplPreviewDesc.textContent = chosen.jobOnly
+        ? `${chosen.description || ''} — ${t('jobOnlyHint')}`
+        : (chosen.description || '');
     };
 
     tplSelect.addEventListener('change', renderTemplatePreview);
@@ -2292,7 +2312,9 @@ function renderAddMachineDialogContent(initialTab) {
         currentOptions = opts;
 
         const tplOpts = (opts.templates || []).map((tpl) => {
-          const suffix = tpl.default ? ` (${t('defaultTag')})` : (!tpl.planAllowed ? ` (${t('paidPlanTag')})` : '');
+          const suffix = tpl.jobOnly ? ` (${t('jobOnlyTag')})`
+            : tpl.default ? ` (${t('defaultTag')})`
+            : (!tpl.planAllowed ? ` (${t('paidPlanTag')})` : '');
           return el('option', { value: tpl.id, textContent: `${tpl.id}${suffix}` });
         });
         if (tplOpts.length === 0) {
@@ -2390,6 +2412,12 @@ function renderAddMachineDialogContent(initialTab) {
     createForm.addEventListener('submit', async (e) => {
       e.preventDefault();
       createErrBanner.hidden = true;
+      const chosenTpl = (currentOptions?.templates || []).find((x) => x.id === tplSelect.value);
+      if (chosenTpl?.jobOnly) {
+        createErrBanner.textContent = t('jobOnlyError');
+        createErrBanner.hidden = false;
+        return;
+      }
       if (!syncNameValidity(false)) {
         nameInput.focus();
         return;
@@ -2424,7 +2452,9 @@ function renderAddMachineDialogContent(initialTab) {
         setTimeout(() => refreshMachinesSilently(), 5500);
         setTimeout(() => refreshMachinesSilently(), 11000);
       } catch (err) {
-        createErrBanner.textContent = err.message;
+        createErrBanner.textContent = err.code === 'template_job_only'
+          ? t('jobOnlyError')
+          : err.message;
         createErrBanner.hidden = false;
       } finally {
         createBtn.removeAttribute('aria-disabled');
@@ -2700,6 +2730,159 @@ function openRenameMachineDialog(vm) {
     nameInput.focus();
     nameInput.select();
   });
+}
+
+
+let resizeMachineDialog = null;
+function openResizeMachineDialog(vm) {
+  if (!resizeMachineDialog) {
+    resizeMachineDialog = el('dialog', {
+      className: 'app-dialog app-dialog-narrow',
+      'aria-labelledby': 'resize-vm-title'
+    });
+    enableDialogLightDismiss(resizeMachineDialog);
+    document.body.append(resizeMachineDialog);
+  }
+
+  const header = el('div', { className: 'dialog-header' }, [
+    el('h2', { id: 'resize-vm-title', textContent: t('resizeMachineTitle') }),
+    el('button', {
+      type: 'button',
+      className: 'btn btn-icon-only',
+      'aria-label': t('close'),
+      onClick: () => resizeMachineDialog.close()
+    }, [ICONS.close()])
+  ]);
+
+  const body = el('div', { className: 'dialog-body' });
+  const errBanner = el('div', { className: 'form-error-banner', role: 'alert', hidden: true });
+  const form = el('form', { novalidate: true, 'aria-labelledby': 'resize-vm-title' });
+
+  const specSelect = el('select', { className: 'input', id: 'resize-vm-spec', name: 'spec' });
+  specSelect.replaceChildren(el('option', { value: '', textContent: t('loadingOptions') }));
+  const specField = el('div', { className: 'field', style: 'margin-block-end:0;' }, [
+    el('label', { for: 'resize-vm-spec', textContent: t('resizeSpecLabel') }),
+    el('span', { className: 'hint', textContent: t('resizeSpecHint') }),
+    specSelect
+  ]);
+
+  // Resize a running machine requires a restart: the apply select only offers
+  // the immediate path when the machine is on; stopped machines always apply
+  // at the next boot, which upstream treats as a plain spec update.
+  const machineOn = vm.state === 'running' || vm.state === 'suspended' || vm.state === 'idle';
+  const applySelect = el('select', { className: 'input', id: 'resize-vm-apply', name: 'apply' }, machineOn
+    ? [
+        el('option', { value: 'restart', textContent: t('resizeApplyRestart') }),
+        el('option', { value: '', textContent: t('resizeApplyNextBoot') })
+      ]
+    : [el('option', { value: '', textContent: t('resizeApplyNextBoot') })]);
+  const applyField = el('div', { className: 'field', style: 'margin-block-end:0;' }, [
+    el('label', { for: 'resize-vm-apply', textContent: t('resizeApplyLabel') }),
+    el('span', { className: 'hint', textContent: t('resizeApplyHint') }),
+    applySelect
+  ]);
+
+  const btnRow = el('div', { className: 'dialog-actions-row' }, [
+    el('button', {
+      type: 'button',
+      className: 'btn',
+      textContent: t('cancelEdit'),
+      onClick: () => resizeMachineDialog.close()
+    }),
+    el('button', {
+      type: 'submit',
+      className: 'btn btn-primary',
+      textContent: t('resizeSave')
+    })
+  ]);
+  const saveBtn = btnRow.lastElementChild;
+
+  form.append(errBanner, el('div', { className: 'form-stack' }, [
+    el('div', { className: 'hint mono', textContent: `${vm.accountAlias || vm.accountId} · ${vm.name} · ${vm.vcpus || '?'} vCPU · ${vm.memMiB ? Math.round(vm.memMiB / 1024) : '?'} GiB` }),
+    specField,
+    applyField,
+    btnRow
+  ]));
+
+  // Load allowed specs for the machine's account (shared cache with create).
+  (async () => {
+    try {
+      const cached = state.machineOptionsCache.get(vm.accountId);
+      const opts = cached || (await apiFetch(`/api/accounts/${encodeURIComponent(vm.accountId)}/machine-options`));
+      state.machineOptionsCache.set(vm.accountId, opts);
+      const specs = opts.allowedSpecs || [];
+      if (specs.length === 0) {
+        specSelect.replaceChildren(el('option', { value: '', textContent: t('resizeNoSpecs') }));
+        saveBtn.setAttribute('aria-disabled', 'true');
+        return;
+      }
+      const specOpts = specs.map((sp) => {
+        const ramGiB = (sp.memMiB / 1024).toFixed(sp.memMiB % 1024 === 0 ? 0 : 1);
+        const cur = sp.vcpus === vm.vcpus && sp.memMiB === vm.memMiB ? ` (${t('resizeCurrent')})` : '';
+        return el('option', {
+          value: `${sp.vcpus}:${sp.memMiB}`,
+          textContent: `${sp.vcpus} vCPU · ${ramGiB} GiB RAM${cur}`
+        });
+      });
+      specSelect.replaceChildren(...specOpts);
+      const curIdx = specs.findIndex((sp) => sp.vcpus === vm.vcpus && sp.memMiB === vm.memMiB);
+      specSelect.selectedIndex = curIdx >= 0 ? curIdx : 0;
+    } catch (err) {
+      specSelect.replaceChildren(el('option', { value: '', textContent: t('resizeLoadFailed') }));
+      errBanner.textContent = err.message;
+      errBanner.hidden = false;
+    }
+  })();
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    errBanner.hidden = true;
+    const [vcpusStr, memStr] = (specSelect.value || '').split(':');
+    const vcpus = parseInt(vcpusStr, 10);
+    const memMiB = parseInt(memStr, 10);
+    if (!vcpus || !memMiB) {
+      errBanner.textContent = t('resizeNoSpecs');
+      errBanner.hidden = false;
+      return;
+    }
+    if (vcpus === vm.vcpus && memMiB === vm.memMiB) {
+      resizeMachineDialog.close();
+      return;
+    }
+    if (saveBtn.getAttribute('aria-disabled') === 'true') return;
+    saveBtn.setAttribute('aria-disabled', 'true');
+    try {
+      const payload = { vcpus, memMiB };
+      if (applySelect.value === 'restart') payload.apply = 'restart';
+      const res = await apiFetch(
+        `/api/machines/${encodeURIComponent(vm.accountId)}/${encodeURIComponent(vm.id)}`,
+        { method: 'PATCH', body: JSON.stringify(payload) }
+      );
+      if (res?.machine) {
+        const idx = state.machines.findIndex((x) => x.accountId === vm.accountId && x.id === vm.id);
+        if (idx >= 0) state.machines[idx] = res.machine;
+        if (!updateDashboardInPlace()) render();
+      } else {
+        await loadDashboardData();
+        if (!updateDashboardInPlace()) render();
+      }
+      resizeMachineDialog.close();
+      showToast(t('resizeDone'));
+      if (payload.apply === 'restart') {
+        setTimeout(() => refreshMachinesSilently(), 3000);
+        setTimeout(() => refreshMachinesSilently(), 8000);
+      }
+    } catch (err) {
+      errBanner.textContent = err.message;
+      errBanner.hidden = false;
+    } finally {
+      saveBtn.removeAttribute('aria-disabled');
+    }
+  });
+
+  body.append(form);
+  resizeMachineDialog.replaceChildren(el('div', { className: 'dialog-inner' }, [header, body]));
+  if (!resizeMachineDialog.open) resizeMachineDialog.showModal();
 }
 
 let deleteMachineDialog = null;
