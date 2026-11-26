@@ -1449,7 +1449,7 @@ function createVmCardController(initialVm) {
         const key = nxt.kind === 'stop'
           ? (nxt.tomorrow ? 'schedStopCompactTmrw' : 'schedStopCompact')
           : (nxt.tomorrow ? 'schedStartCompactTmrw' : 'schedStartCompact');
-        setTextIfChanged(schedMeta, t(key, { time: nxt.hhmm, wait: fmtCompactDuration(nxt.inMin * 60) }));
+        setTextIfChanged(schedMeta, t(key, { time: nxt.hhmm }));
       } else if (vm.scheduleLastAction === 'cooldown_wait') {
         schedMeta.hidden = false;
         schedMeta.dataset.tone = 'warn';
