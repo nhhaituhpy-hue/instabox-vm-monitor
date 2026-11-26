@@ -249,7 +249,7 @@ function fmtCompactDuration(totalSeconds) {
   const s = Math.max(0, Math.floor(totalSeconds));
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
-  if (h > 0) return `${h}h ${m}m`;
+  if (h > 0) return m > 0 ? `${h}h${m}` : `${h}h`;
   if (m > 0) return `${m}m`;
   return `${s}s`;
 }
@@ -1447,8 +1447,8 @@ function createVmCardController(initialVm) {
         schedMeta.hidden = false;
         schedMeta.dataset.tone = nxt.kind === 'stop' ? 'ok' : 'muted';
         const key = nxt.kind === 'stop'
-          ? (nxt.tomorrow ? 'schedStopAtTomorrow' : 'schedStopAt')
-          : (nxt.tomorrow ? 'schedStartAtTomorrow' : 'schedStartAt');
+          ? (nxt.tomorrow ? 'schedStopCompactTmrw' : 'schedStopCompact')
+          : (nxt.tomorrow ? 'schedStartCompactTmrw' : 'schedStartCompact');
         setTextIfChanged(schedMeta, t(key, { time: nxt.hhmm, wait: fmtCompactDuration(nxt.inMin * 60) }));
       } else if (vm.scheduleLastAction === 'cooldown_wait') {
         schedMeta.hidden = false;
