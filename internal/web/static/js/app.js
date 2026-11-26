@@ -204,6 +204,45 @@ function fmtHMS(totalSeconds) {
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
 }
 
+function windowsJsonToText(raw) {
+  try {
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) return raw;
+    return arr.map((w) => {
+      const end = w.end === '00:00' ? '00:00' : w.end;
+      return `${w.start}-${end}`;
+    }).join(', ');
+  } catch {
+    return raw || '';
+  }
+}
+
+// Mirrors the backend window logic for the countdown label (schedule tz fixed UTC+7).
+function scheduleNextTransition(vm) {
+  if (!vm.scheduleEnabled || !vm.scheduleWindows) return null;
+  let wins;
+  try { wins = JSON.parse(vm.scheduleWindows); } catch { return null; }
+  if (!Array.isArray(wins) || wins.length === 0) return null;
+  const offsetMin = vm.scheduleTzOffsetMin || 420;
+  const nowUtcMin = Math.floor(upstreamNowMs() / 60000);
+  const shifted = ((nowUtcMin + offsetMin) % 1440 + 1440) % 1440;
+  const parsed = wins.map((w) => {
+    const [sh, sm] = String(w.start).split(':').map(Number);
+    let [eh, em] = String(w.end).split(':').map(Number);
+    let endMin = eh * 60 + em;
+    if (endMin === 0) endMin = 1440;
+    return { s: sh * 60 + sm, e: endMin };
+  });
+  const inside = parsed.find((w) => shifted >= w.s && shifted < w.e);
+  if (inside) return { kind: 'stop', inMin: inside.e - shifted };
+  let best = Infinity;
+  for (const w of parsed) {
+    const d = shifted < w.s ? w.s - shifted : 1440 - shifted + w.s;
+    if (d < best) best = d;
+  }
+  return Number.isFinite(best) ? { kind: 'start', inMin: best } : null;
+}
+
 function fmtCompactDuration(totalSeconds) {
   const s = Math.max(0, Math.floor(totalSeconds));
   const h = Math.floor(s / 3600);
@@ -1117,6 +1156,77 @@ function createVmCardController(initialVm) {
     dataset: { active: 'false' }
   }, [keepaliveInput, keepaliveText, keepaliveMeta]);
 
+  // --- Time-window schedule row: machine runs only inside the given daily windows ---
+  const schedInputId = `sch-${vm.accountId}-${vm.id}`.replace(/[^a-zA-Z0-9_-]/g, '_');
+  let schedBusy = false;
+  const schedEnabledInput = el('input', {
+    type: 'checkbox',
+    id: schedInputId,
+    className: 'vm-keepalive-input'
+  });
+  const schedText = el('span', { className: 'vm-keepalive-text' });
+  const schedMeta = el('span', { className: 'vm-keepalive-meta mono', hidden: true });
+  const schedToggle = el('label', {
+    className: 'vm-keepalive-toggle',
+    for: schedInputId,
+    dataset: { active: 'false' }
+  }, [schedEnabledInput, schedText, schedMeta]);
+  const schedWindowsInput = el('input', {
+    type: 'text',
+    className: 'vm-sched-input mono',
+    placeholder: '06:00-08:00, 18:00-19:00',
+    spellcheck: 'false',
+    autocomplete: 'off'
+  });
+  const schedApplyBtn = el('button', {
+    type: 'button',
+    className: 'mini-btn'
+  });
+
+  const saveSchedule = async (enabled, windows) => {
+    if (schedBusy) return;
+    schedBusy = true;
+    schedEnabledInput.disabled = true;
+    schedApplyBtn.disabled = true;
+    try {
+      const res = await apiFetch(
+        `/api/machines/${encodeURIComponent(vm.accountId)}/${encodeURIComponent(vm.id)}/schedule`,
+        { method: 'PUT', body: JSON.stringify({ enabled, windows, tzOffsetMin: 420 }) }
+      );
+      if (res?.machine) {
+        const idx = state.machines.findIndex((x) => x.accountId === vm.accountId && x.id === vm.id);
+        if (idx >= 0) state.machines[idx] = res.machine;
+        if (!updateDashboardInPlace()) update(res.machine);
+      }
+      showToast(`${t(enabled ? 'schedEnabledToast' : 'schedDisabledToast')}: ${vm.name}`);
+      setTimeout(() => refreshMachinesSilently(), 1200);
+    } catch (err) {
+      showToast(err.message, 'error');
+    } finally {
+      schedBusy = false;
+      schedEnabledInput.disabled = false;
+      schedApplyBtn.disabled = false;
+    }
+  };
+
+  schedEnabledInput.addEventListener('change', () => {
+    saveSchedule(schedEnabledInput.checked, schedWindowsInput.value.trim());
+    if (!schedEnabledInput.checked) return;
+  });
+  schedApplyBtn.addEventListener('click', () => {
+    saveSchedule(true, schedWindowsInput.value.trim());
+  });
+  schedWindowsInput.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') {
+      ev.preventDefault();
+      saveSchedule(true, schedWindowsInput.value.trim());
+    }
+  });
+
+  const schedRow = el('div', { className: 'vm-sched-row' }, [
+    schedToggle, schedWindowsInput, schedApplyBtn
+  ]);
+
   keepaliveInput.addEventListener('change', async () => {
     if (keepaliveBusy) return;
     const nextEnabled = keepaliveInput.checked;
@@ -1168,6 +1278,7 @@ function createVmCardController(initialVm) {
   ]);
   const clockRight = el('div', { className: 'clock-limit mono' });
   const clockRow = el('div', { className: 'vm-clock-row' }, [clockLeft, clockRight]);
+  col1.append(schedRow);
 
   // Column 2: Mini Beszel Charts (CPU, RAM, System (/), Data (/data))
   const cpuLbl = el('span', { className: 'mini-chart-lbl' });
@@ -1305,6 +1416,42 @@ function createVmCardController(initialVm) {
       }
     } else {
       keepaliveMeta.hidden = true;
+    }
+
+    // --- schedule row state sync ---
+    const schEnabled = !!vm.scheduleEnabled;
+    if (!schedBusy) {
+      schedEnabledInput.checked = schEnabled;
+      if (vm.scheduleWindows && document.activeElement !== schedWindowsInput) {
+        schedWindowsInput.value = windowsJsonToText(vm.scheduleWindows);
+      }
+    }
+    schedToggle.dataset.active = schEnabled ? 'true' : 'false';
+    setTextIfChanged(schedText, t('schedLabel'));
+    schedToggle.title = vm.scheduleLastError || t('schedDesc');
+    setTextIfChanged(schedApplyBtn, t('schedApply'));
+    schedWindowsInput.disabled = schedBusy;
+    if (!schEnabled) {
+      schedMeta.hidden = true;
+      delete schedMeta.dataset.tone;
+    } else if (vm.scheduleLastError) {
+      schedMeta.hidden = false;
+      schedMeta.dataset.tone = 'error';
+      setTextIfChanged(schedMeta, '!');
+      schedMeta.title = vm.scheduleLastError;
+    } else {
+      const nxt = scheduleNextTransition(vm);
+      if (nxt) {
+        schedMeta.hidden = false;
+        schedMeta.dataset.tone = nxt.kind === 'stop' ? 'ok' : 'muted';
+        setTextIfChanged(schedMeta, `${t(nxt.kind === 'stop' ? 'schedStopIn' : 'schedStartIn')} ${fmtCompactDuration(nxt.inMin * 60)}`);
+      } else if (vm.scheduleLastAction === 'cooldown_wait') {
+        schedMeta.hidden = false;
+        schedMeta.dataset.tone = 'warn';
+        setTextIfChanged(schedMeta, t('keepaliveWaitCooldown'));
+      } else {
+        schedMeta.hidden = true;
+      }
     }
 
     const diskSummary = vm.rootDiskGiB > 0

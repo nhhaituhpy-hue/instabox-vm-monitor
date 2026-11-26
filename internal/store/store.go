@@ -116,6 +116,12 @@ type MachineRecord struct {
 	KeepaliveLastAction     string          `json:"keepaliveLastAction,omitempty"`
 	KeepaliveLastError      string          `json:"keepaliveLastError,omitempty"`
 	KeepalivePendingRestart bool            `json:"keepalivePendingRestart,omitempty"`
+	ScheduleEnabled         bool            `json:"scheduleEnabled"`
+	ScheduleWindows         string          `json:"scheduleWindows,omitempty"`
+	ScheduleTZOffsetMin     int             `json:"scheduleTzOffsetMin,omitempty"`
+	ScheduleLastAction      string          `json:"scheduleLastAction,omitempty"`
+	ScheduleLastAt          int64           `json:"scheduleLastAt,omitempty"`
+	ScheduleLastError       string          `json:"scheduleLastError,omitempty"`
 	UpdatedAt               int64           `json:"updatedAt"`
 }
 
@@ -309,6 +315,12 @@ func (s *Store) ensureMachineColumns(ctx context.Context) error {
 		{"keepalive_pending_restart", `ALTER TABLE machines ADD COLUMN keepalive_pending_restart INTEGER NOT NULL DEFAULT 0`},
 		{"archive_at", `ALTER TABLE machines ADD COLUMN archive_at TEXT NOT NULL DEFAULT ''`},
 		{"delete_at", `ALTER TABLE machines ADD COLUMN delete_at TEXT NOT NULL DEFAULT ''`},
+		{"schedule_enabled", `ALTER TABLE machines ADD COLUMN schedule_enabled INTEGER NOT NULL DEFAULT 0`},
+		{"schedule_windows", `ALTER TABLE machines ADD COLUMN schedule_windows TEXT NOT NULL DEFAULT ''`},
+		{"schedule_tz_offset_min", `ALTER TABLE machines ADD COLUMN schedule_tz_offset_min INTEGER NOT NULL DEFAULT 420`},
+		{"schedule_last_action", `ALTER TABLE machines ADD COLUMN schedule_last_action TEXT NOT NULL DEFAULT ''`},
+		{"schedule_last_at", `ALTER TABLE machines ADD COLUMN schedule_last_at INTEGER NOT NULL DEFAULT 0`},
+		{"schedule_last_error", `ALTER TABLE machines ADD COLUMN schedule_last_error TEXT NOT NULL DEFAULT ''`},
 	}
 	for _, m := range migrations {
 		if existing[m.name] {
@@ -817,7 +829,7 @@ func (s *Store) SetMachineKeepalive(ctx context.Context, accountID, machineID st
 	if enabled {
 		res, err = s.db.ExecContext(ctx, `
 			UPDATE machines
-			SET keepalive_enabled = ?, keepalive_last_error = ''
+			SET keepalive_enabled = ?, keepalive_last_error = '', schedule_enabled = 0
 			WHERE account_id = ? AND machine_id = ?
 		`, enabledInt, accountID, machineID)
 	} else {
@@ -840,6 +852,47 @@ func (s *Store) SetMachineKeepalive(ctx context.Context, accountID, machineID st
 		return ErrMachineNotFound
 	}
 	return nil
+}
+
+// SetMachineSchedule persists a machine's time-window schedule. windowsJSON is the
+// validated, normalized JSON array of {"start":"HH:MM","end":"HH:MM"} entries.
+// Enabling the schedule disables keepalive (the two driving modes are mutually exclusive).
+func (s *Store) SetMachineSchedule(ctx context.Context, accountID, machineID string, enabled bool, windowsJSON string, tzOffsetMin int) error {
+	var res sql.Result
+	var err error
+	if enabled {
+		res, err = s.db.ExecContext(ctx, `
+			UPDATE machines
+			SET schedule_enabled = 1, schedule_windows = ?, schedule_tz_offset_min = ?,
+			    schedule_last_error = '', keepalive_enabled = 0
+			WHERE account_id = ? AND machine_id = ?
+		`, windowsJSON, tzOffsetMin, accountID, machineID)
+	} else {
+		res, err = s.db.ExecContext(ctx, `
+			UPDATE machines
+			SET schedule_enabled = 0, schedule_windows = '', schedule_last_action = '',
+			    schedule_last_at = 0, schedule_last_error = ''
+			WHERE account_id = ? AND machine_id = ?
+		`, accountID, machineID)
+	}
+	if err != nil {
+		return err
+	}
+	affected, _ := res.RowsAffected()
+	if affected == 0 {
+		return ErrMachineNotFound
+	}
+	return nil
+}
+
+// UpdateMachineScheduleState records the outcome of the latest schedule enforcement step.
+func (s *Store) UpdateMachineScheduleState(ctx context.Context, accountID, machineID string, lastAt int64, action, errMsg string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE machines
+		SET schedule_last_at = ?, schedule_last_action = ?, schedule_last_error = ?
+		WHERE account_id = ? AND machine_id = ?
+	`, lastAt, action, errMsg, accountID, machineID)
+	return err
 }
 
 func (s *Store) UpdateMachineKeepaliveState(ctx context.Context, accountID, machineID string, leaseExpiresAt, lastAt int64, lastAction, lastErr string) error {
@@ -901,6 +954,7 @@ func (s *Store) queryMachines(ctx context.Context, clause string, args ...any) (
 		       m.run_started_at, m.auto_suspended_at, m.cooldown_until, m.cooldown_reason, m.archive_at, m.delete_at, m.operation_id,
 		       m.monthly_running_seconds, m.last_error_code, m.last_error_msg, m.disk_json,
 		       m.keepalive_enabled, m.keepalive_lease_expires_at, m.keepalive_last_at, m.keepalive_last_action, m.keepalive_last_error, m.keepalive_pending_restart,
+		       m.schedule_enabled, m.schedule_windows, m.schedule_tz_offset_min, m.schedule_last_action, m.schedule_last_at, m.schedule_last_error,
 		       m.updated_at
 		FROM machines m
 		JOIN accounts a ON a.id = m.account_id
@@ -913,7 +967,7 @@ func (s *Store) queryMachines(ctx context.Context, clause string, args ...any) (
 	out := make([]MachineRecord, 0)
 	for rows.Next() {
 		var r MachineRecord
-		var freeInt, readyInt, procInt, keepaliveInt, pendingRestartInt int
+		var freeInt, readyInt, procInt, keepaliveInt, pendingRestartInt, scheduleInt int
 		var autoSusp sql.NullInt64
 		var diskStr string
 		if err := rows.Scan(
@@ -923,6 +977,7 @@ func (s *Store) queryMachines(ctx context.Context, clause string, args ...any) (
 			&r.RunStartedAt, &r.AutoSuspendedAt, &r.CooldownUntil, &r.CooldownReason, &r.ArchiveAt, &r.DeleteAt, &r.OperationID,
 			&r.MonthlyRunningSeconds, &r.LastErrorCode, &r.LastErrorMsg, &diskStr,
 			&keepaliveInt, &r.KeepaliveLeaseExpiresAt, &r.KeepaliveLastAt, &r.KeepaliveLastAction, &r.KeepaliveLastError, &pendingRestartInt,
+			&scheduleInt, &r.ScheduleWindows, &r.ScheduleTZOffsetMin, &r.ScheduleLastAction, &r.ScheduleLastAt, &r.ScheduleLastError,
 			&r.UpdatedAt,
 		); err != nil {
 			return nil, err
@@ -932,6 +987,7 @@ func (s *Store) queryMachines(ctx context.Context, clause string, args ...any) (
 		r.ProcessesPreserved = procInt != 0
 		r.KeepaliveEnabled = keepaliveInt != 0
 		r.KeepalivePendingRestart = pendingRestartInt != 0
+		r.ScheduleEnabled = scheduleInt != 0
 		if autoSusp.Valid {
 			v := int(autoSusp.Int64)
 			r.AutoSuspendAfterSeconds = &v

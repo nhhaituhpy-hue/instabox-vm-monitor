@@ -99,6 +99,7 @@ func NewRouter(st *store.Store, client *instabox.Client, poller *monitor.Poller,
 	mux.HandleFunc("POST /api/machines", s.withAuth(true, s.handleCreateMachine))
 	mux.HandleFunc("PATCH /api/machines/{accountId}/{machineId}", s.withAuth(true, s.handleUpdateMachine))
 	mux.HandleFunc("PATCH /api/machines/{accountId}/{machineId}/keepalive", s.withAuth(true, s.handleSetMachineKeepalive))
+	mux.HandleFunc("PUT /api/machines/{accountId}/{machineId}/schedule", s.withAuth(true, s.handleSetMachineSchedule))
 	mux.HandleFunc("DELETE /api/machines/{accountId}/{machineId}", s.withAuth(true, s.handleDeleteMachine))
 	mux.HandleFunc("POST /api/sync", s.withAuth(true, s.handleSyncAll))
 	mux.HandleFunc("GET /api/machines/{accountId}/{machineId}/telemetry", s.withAuth(false, s.handleMachineTelemetry))
@@ -928,6 +929,37 @@ func (s *Server) handleSetMachineKeepalive(w http.ResponseWriter, r *http.Reques
 		}
 		log.Printf("set machine keepalive %s/%s error: %v", accountID, machineID, err)
 		writeError(w, http.StatusInternalServerError, "keepalive_failed", "failed to update keepalive setting")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":      true,
+		"machine": updated,
+	})
+}
+
+func (s *Server) handleSetMachineSchedule(w http.ResponseWriter, r *http.Request) {
+	accountID := r.PathValue("accountId")
+	machineID := r.PathValue("machineId")
+	var req struct {
+		Enabled     bool   `json:"enabled"`
+		Windows     string `json:"windows"`
+		TZOffsetMin int    `json:"tzOffsetMin"`
+	}
+	if !decodeJSON(w, r, &req) {
+		return
+	}
+	if len(req.Windows) > 500 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "windows definition is too long")
+		return
+	}
+	updated, err := s.poller.SetMachineSchedule(r.Context(), accountID, machineID, req.Enabled, req.Windows, req.TZOffsetMin)
+	if err != nil {
+		if errors.Is(err, store.ErrAccountNotFound) || errors.Is(err, store.ErrMachineNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			return
+		}
+		// Window validation failures are user-facing input errors, not server faults.
+		writeError(w, http.StatusBadRequest, "invalid_schedule", err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{

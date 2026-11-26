@@ -455,6 +455,9 @@ func (s *Server) dispatchTool(ctx context.Context, name string, rawArgs json.Raw
 			CancelScheduled         bool    `json:"cancelScheduled"`
 			Apply                   string  `json:"apply"`
 			Keepalive               *bool   `json:"keepalive"`
+			Schedule                *bool   `json:"schedule"`
+			ScheduleWindows         string  `json:"scheduleWindows"`
+			ScheduleTZOffsetMin     int     `json:"scheduleTzOffsetMin"`
 			WaitSeconds             int     `json:"waitSeconds"`
 		}
 		if err := json.Unmarshal(rawArgs, &in); err != nil {
@@ -488,6 +491,18 @@ func (s *Server) dispatchTool(ctx context.Context, name string, rawArgs json.Raw
 				return errPayload(kErr), true
 			}
 			out["machine"] = ka
+		}
+
+		if in.Schedule != nil {
+			windows := in.ScheduleWindows
+			if windows == "" {
+				windows = mRec.ScheduleWindows
+			}
+			sch, sErr := s.poller.SetMachineSchedule(ctx, accID, mRec.MachineID, *in.Schedule, windows, in.ScheduleTZOffsetMin)
+			if sErr != nil {
+				return errPayload(sErr), true
+			}
+			out["machine"] = sch
 		}
 
 		if act := strings.TrimSpace(in.Action); act != "" {
@@ -948,6 +963,9 @@ func buildToolDefs() []toolDef {
 					"cancelScheduled":         map[string]any{"type": "boolean", "description": "Clear a stop/delete scheduled for a macOS VM lease end"},
 					"apply":                   map[string]any{"type": "string", "enum": []string{"restart"}, "description": "resize a running/paused VM by stop+resize+start in one operation"},
 					"keepalive":               map[string]any{"type": "boolean", "description": "Enable/disable automatic keep-awake & 8h power-cycle service"},
+					"schedule":                map[string]any{"type": "boolean", "description": "Enable/disable time-window scheduling (mutually exclusive with keepalive)"},
+					"scheduleWindows":         map[string]any{"type": "string", "description": `Daily run windows, e.g. "06:00-08:00, 11:00-12:00, 18:00-19:00" — machine is auto-started inside windows and stopped outside`},
+					"scheduleTzOffsetMin":     map[string]any{"type": "integer", "description": "Fixed UTC offset in minutes for the windows (default 420 = UTC+7)"},
 					"waitSeconds":             map[string]any{"type": "integer", "description": "Optional seconds (up to 120) to wait for lifecycle operation"},
 				},
 			},

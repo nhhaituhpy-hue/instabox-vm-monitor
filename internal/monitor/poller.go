@@ -250,6 +250,9 @@ func (p *Poller) SyncAccount(ctx context.Context, accountID string) error {
 				p.reconcileSkippedKeepalive(ctx, accountID, m, prev)
 			}
 		}
+		if hadPrev && prev.ScheduleEnabled {
+			p.enforceSchedule(ctx, accountID, apiKey, m, prev)
+		}
 	}
 	return nil
 }

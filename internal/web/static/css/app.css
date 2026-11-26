@@ -1496,6 +1496,54 @@ select:focus-visible,
   border-color: color-mix(in srgb, var(--danger) 40%, transparent);
 }
 
+.vm-sched-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  margin-block-start: 0.35rem;
+}
+
+.vm-sched-row .vm-keepalive-toggle {
+  flex: 0 0 auto;
+}
+
+.vm-sched-input {
+  flex: 1 1 12rem;
+  min-width: 9rem;
+  padding: 0.3rem 0.55rem;
+  border: 1px solid var(--line, rgba(148, 163, 184, 0.35));
+  border-radius: 6px;
+  background: var(--surface, transparent);
+  color: inherit;
+  font-size: 0.82rem;
+}
+
+.vm-sched-input:focus-visible {
+  outline: 2px solid var(--accent, #2563eb);
+  outline-offset: 1px;
+}
+
+.mini-btn {
+  flex: 0 0 auto;
+  padding: 0.3rem 0.7rem;
+  border: 1px solid var(--line, rgba(148, 163, 184, 0.35));
+  border-radius: 6px;
+  background: var(--surface, transparent);
+  color: inherit;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+
+.mini-btn:hover:not(:disabled) {
+  border-color: var(--accent, #2563eb);
+}
+
+.mini-btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 @supports not (accent-color: #2563eb) {
   .vm-keepalive-input {
     position: absolute !important;
