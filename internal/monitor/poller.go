@@ -25,6 +25,14 @@ const (
 	keepaliveLeaseTTLSeconds  = 3600
 	keepaliveRenewLeadSeconds = 2400 // renew when <=40m left on 60m TTL (~every 20m)
 	keepaliveRestartCapMaxSec = 25200
+
+	// Window-scoped maintenance: inside a schedule window the machine is kept
+	// busy enough to extend its run and power-cycled ahead of the cap — but only
+	// for windows at least 29 minutes long, since shorter windows end before the
+	// 30-minute idle suspension could ever trigger.
+	schedMaintMinWindowSec    = 29 * 60
+	schedMaintPingIntervalSec = 20 * 60
+	schedMaintMinWindowLeft   = 20 * 60 // skip power-cycle if the window closes within 20m
 )
 
 type keepaliveCtrl struct {
@@ -55,6 +63,7 @@ type Poller struct {
 	keepaliveCtrls         sync.Map // key: accountID+":"+machineID -> *keepaliveCtrl
 	keepaliveLeaseRunStart sync.Map // key: accountID+":"+machineID -> string
 	keepaliveDelayOverride atomic.Int64
+	keepaliveLastPing      sync.Map // key: accountID+":"+machineID -> int64 unix of last successful activity exec
 
 	deleteChallengeMu sync.Mutex
 	deleteChallenges  map[string]deleteChallengeEntry
@@ -252,6 +261,11 @@ func (p *Poller) SyncAccount(ctx context.Context, accountID string) error {
 		}
 		if hadPrev && prev.ScheduleEnabled {
 			p.enforceSchedule(ctx, accountID, apiKey, m, prev)
+		}
+		if hadPrev && prev.ScheduleEnabled && !prev.KeepaliveEnabled {
+			if p.needsScheduleMaintenance(m, prev) {
+				p.triggerKeepalive(accountID, m.ID, false)
+			}
 		}
 	}
 	return nil
@@ -1044,6 +1058,86 @@ func isTransitionalState(state string) bool {
 	}
 }
 
+// inScheduleWindowNow reports whether the current time falls inside any of the
+// machine's configured schedule windows.
+func (p *Poller) inScheduleWindowNow(rec store.MachineRecord) bool {
+	wins, err := ParseScheduleWindows(rec.ScheduleWindows)
+	if err != nil || len(wins) == 0 {
+		return false
+	}
+	offset := rec.ScheduleTZOffsetMin
+	if offset == 0 {
+		offset = 420
+	}
+	nowMin := minuteOfDayInOffset(p.upstreamNow(), offset)
+	for _, w := range wins {
+		if nowMin >= w.StartMin && nowMin < w.EndMin {
+			return true
+		}
+	}
+	return false
+}
+
+// needsScheduleMaintenance decides whether a schedule-enabled machine currently
+// needs a maintenance cycle (power-cycle ahead of the cap or an activity ping).
+// This runs inline in the poll loop, so enforcement and maintenance are the same
+// sequential decision chain — no parallel actors can fight over one machine.
+func (p *Poller) needsScheduleMaintenance(m instabox.Machine, rec store.MachineRecord) bool {
+	if m.State != "running" {
+		return false // enforcement handles stopped/suspended; nothing to maintain
+	}
+	wins, err := ParseScheduleWindows(rec.ScheduleWindows)
+	if err != nil || len(wins) == 0 {
+		return false
+	}
+	offset := rec.ScheduleTZOffsetMin
+	if offset == 0 {
+		offset = 420
+	}
+	upNow := p.upstreamNow()
+	nowMin := minuteOfDayInOffset(upNow, offset)
+
+	// Current window must exist and be long enough to outlive the idle timer.
+	var cur *scheduleWindow
+	for i := range wins {
+		if nowMin >= wins[i].StartMin && nowMin < wins[i].EndMin {
+			cur = &wins[i]
+			break
+		}
+	}
+	if cur == nil {
+		return false
+	}
+	if (cur.EndMin-cur.StartMin)*60 < schedMaintMinWindowSec {
+		return false
+	}
+
+	// Power-cycle when the run approaches its cap — but never when the window is
+	// about to close: a fresh boot seconds before shutdown wastes a cycle and the
+	// enforcement stop would race the power-cycle's own start.
+	if threshold := keepaliveRestartThresholdSec(m); threshold > 0 {
+		if rs, ok := parseInstaboxTime(m.RunStartedAt); ok {
+			if int64(upNow.Sub(rs).Seconds()) >= threshold {
+				windowLeftSec := int64(cur.EndMin-nowMin) * 60
+				return windowLeftSec > schedMaintMinWindowLeft
+			}
+		}
+	}
+
+	// Activity ping cadence: one small exec every 20 minutes inside the window.
+	// The first ping in a fresh run happens immediately so extensions start early.
+	key := rec.AccountID + ":" + m.ID
+	prevRS, hasRS := p.keepaliveLeaseRunStart.Load(key)
+	if m.RunStartedAt != "" && (!hasRS || prevRS.(string) != m.RunStartedAt) {
+		return true
+	}
+	lastPing := int64(0)
+	if v, ok := p.keepaliveLastPing.Load(key); ok {
+		lastPing = v.(int64)
+	}
+	return time.Now().Unix()-lastPing >= schedMaintPingIntervalSec
+}
+
 func (p *Poller) upstreamNow() time.Time {
 	return time.Now().UTC().Add(time.Duration(p.clockOffsetMs.Load()) * time.Millisecond)
 }
@@ -1320,7 +1414,12 @@ func (p *Poller) RunKeepaliveCycle(ctx context.Context, accountID, machineID str
 	if err != nil {
 		return err
 	}
-	if !rec.KeepaliveEnabled || !p.keepaliveValid(cycleCtx, key, myGen) {
+	// Window maintenance reuses this machinery: the cycle is legitimate when
+	// 24/7 keep-awake is on, or when the machine is inside a schedule window.
+	if !rec.KeepaliveEnabled && !(rec.ScheduleEnabled && p.inScheduleWindowNow(*rec)) {
+		return nil
+	}
+	if !p.keepaliveValid(cycleCtx, key, myGen) {
 		return nil
 	}
 	apiKey, err := p.store.GetAccountAPIKey(cycleCtx, accountID)
@@ -1337,7 +1436,13 @@ func (p *Poller) RunKeepaliveCycle(ctx context.Context, accountID, machineID str
 		return nil
 	}
 	rec, err = p.store.GetMachine(cycleCtx, accountID, machineID)
-	if err != nil || !rec.KeepaliveEnabled || !p.keepaliveValid(cycleCtx, key, myGen) {
+	if err != nil {
+		return nil
+	}
+	if !rec.KeepaliveEnabled && !(rec.ScheduleEnabled && p.inScheduleWindowNow(*rec)) {
+		return nil
+	}
+	if !p.keepaliveValid(cycleCtx, key, myGen) {
 		return nil
 	}
 	if err := p.syncSingleMachine(cycleCtx, accountID, *m); err != nil {
@@ -1356,7 +1461,6 @@ func (p *Poller) RunKeepaliveCycle(ctx context.Context, accountID, machineID str
 
 	nowUnix := time.Now().Unix()
 	upNow := p.upstreamNow()
-	upUnix := upNow.Unix()
 
 	if m.State == "running" {
 		threshold := keepaliveRestartThresholdSec(*m)
@@ -1379,12 +1483,10 @@ func (p *Poller) RunKeepaliveCycle(ctx context.Context, accountID, machineID str
 		// its minute, which within the last 30m of a run buys the +30m extension
 		// (and shows as light CPU on the machine's own metrics). The lease is kept
 		// as a secondary guard against the 30-minute idle pause only.
-		prevRS, hasRS := p.keepaliveLeaseRunStart.Load(key)
-		runChanged := m.RunStartedAt != "" && (!hasRS || prevRS.(string) != m.RunStartedAt)
-		expiring := rec.KeepaliveLeaseExpiresAt <= upUnix+keepaliveRenewLeadSeconds
-		if !forceLease && !runChanged && !expiring {
-			return nil
-		}
+		// Both 24/7 keep-awake and window maintenance reach the ping rarely
+		// (~every 20 minutes, enforced by their callers' cadence), so a cycle
+		// that gets here always performs the activity exec; concurrent triggers
+		// within the same minute are deduped by the in-flight fencing above.
 		if !p.keepaliveValid(cycleCtx, key, myGen) {
 			return nil
 		}
@@ -1415,11 +1517,20 @@ func (p *Poller) RunKeepaliveCycle(ctx context.Context, accountID, machineID str
 		if !p.storeKeepaliveLeaseRunStart(cycleCtx, key, myGen, m.RunStartedAt) {
 			return nil
 		}
+		p.keepaliveLastPing.Store(key, time.Now().Unix())
 		p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, expUnix, time.Now().Unix(), "activity_ping", "")
 		return nil
 	}
 
 	if m.State == "stopped" && rec.KeepalivePendingRestart {
+		// The power-cycle restart must never fire outside a schedule window:
+		// if the window closed while the machine was stopping, drop the restart
+		// and let enforcement keep the machine off.
+		if rec.ScheduleEnabled && !rec.KeepaliveEnabled && !p.inScheduleWindowNow(*rec) {
+			_ = p.store.SetMachineKeepalivePendingRestart(cycleCtx, accountID, machineID, false)
+			p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, 0, nowUnix, "cycle_done", "")
+			return nil
+		}
 		if isCooldownActive(*m, upNow) {
 			p.deleteKeepaliveLeaseRunStart(key)
 			p.updateKeepaliveState(cycleCtx, accountID, machineID, myGen, 0, nowUnix, "cooldown_wait", "")
@@ -1634,6 +1745,15 @@ func (p *Poller) powerCycleForKeepalive(ctx context.Context, accountID, apiKey, 
 func (p *Poller) startForKeepalive(ctx context.Context, accountID, apiKey, machineID, key string, gen uint64, step time.Duration) error {
 	if !p.keepaliveValid(ctx, key, gen) {
 		return nil
+	}
+	// Never start outside a schedule window: the window may have closed while
+	// the machine was stopping, and enforcement owns the machine then.
+	if rec, recErr := p.store.GetMachine(ctx, accountID, machineID); recErr == nil {
+		if rec.ScheduleEnabled && !rec.KeepaliveEnabled && !p.inScheduleWindowNow(*rec) {
+			_ = p.store.SetMachineKeepalivePendingRestart(ctx, accountID, machineID, false)
+			p.updateKeepaliveState(ctx, accountID, machineID, gen, 0, time.Now().Unix(), "cycle_done", "")
+			return nil
+		}
 	}
 	if _, err := p.client.PerformAction(ctx, apiKey, machineID, instabox.ActionStart); err != nil {
 		if !p.keepaliveValid(ctx, key, gen) {
