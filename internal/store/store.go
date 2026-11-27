@@ -740,7 +740,7 @@ func (s *Store) UpsertCIBox(ctx context.Context, accountID, repo, workflowFile, 
 	}
 	existing, err := s.GetCIBox(ctx, accountID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ci-box get: %w", err)
 	}
 	if existing != nil {
 		// keep the stored token when the caller did not send a new one
@@ -754,7 +754,7 @@ func (s *Store) UpsertCIBox(ctx context.Context, accountID, repo, workflowFile, 
 			UPDATE ci_boxes SET repo=?, workflow_file=?, branch=?, gh_token_enc=?, gh_login=?, updated_at=? WHERE id=?
 		`, repo, workflowFile, branch, enc, ghLogin, now, existing.ID)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("ci-box update: %w", err)
 		}
 		return s.GetCIBox(ctx, accountID)
 	}
@@ -764,7 +764,7 @@ func (s *Store) UpsertCIBox(ctx context.Context, accountID, repo, workflowFile, 
 		VALUES (?, ?, ?, ?, ?, ?, ?, 'idle', ?, ?)
 	`, id, accountID, repo, workflowFile, branch, enc, ghLogin, now, now)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("ci-box insert (account %q): %w", accountID, err)
 	}
 	return s.GetCIBox(ctx, accountID)
 }
