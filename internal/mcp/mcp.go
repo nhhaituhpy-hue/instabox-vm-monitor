@@ -130,7 +130,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				"name":    "instabox-vm-monitor",
 				"version": "1.0.0",
 			},
-			"instructions": "Full control plane for saved instabox.sh accounts and VMs. When deleting a machine via delete_machine, you MUST first ask the user for explicit confirmation with the machine name and ID before supplying the confirmationToken.",
+			"instructions": "Full control plane for saved instabox.sh accounts and VMs. When deleting a machine via delete_machine, you MUST first ask the user for explicit confirmation with the machine name and ID before supplying the confirmationToken. | ON-DEMAND CI BOXES (disposable build/dev boxes): free-plan 'ci' machines can only exist as GitHub Actions runners, so they are driven through control_ci_box: action=start dispatches a job that holds a box (~70-90s to running), action=status returns state+machineId, action=stop cancels the job and the box is PERMANENTLY DELETED with all data on it (root and /data alike — verified). Dev-loop usage: start once, then iterate — push/build/test repeatedly with exec_command and the instabox CLI file transfer on the operator host — and only stop when the session ends, because each fresh boot costs ~70s while a reused box is instant. Boxes self-destruct at the ~7h40 job budget. | FILE TRANSFER: this MCP API has no scp. Moving files between the operator host and any box uses the upstream instabox CLI (export INSTABOX_API_KEY=ibk_... of the owning account first): 'instabox cp -r localdir <machineId>:/data/work/' pushes, 'instabox cp <machineId>:/path local' pulls, 'instabox ssh <machineId> --no-paste -- \"cmd\"' runs shell commands — all verified working on CI boxes. On the host, scripts/ci-run.sh in the monitor repo chains the whole loop: reuse-or-start box, push repo, run build/test over ssh, pull artifacts into ./ci-artifacts/, keep the box alive for the next iteration (STOP=1 to end it). Requires MONKEY (a monitor ibmon_ key) and IBK (the upstream ibk_ key).",
 		})
 		return
 
@@ -533,6 +533,44 @@ func (s *Server) dispatchTool(ctx context.Context, name string, rawArgs json.Raw
 			}
 		}
 		return out, false
+
+	case "control_ci_box":
+		var in struct {
+			AccountID string `json:"accountId"`
+			Action    string `json:"action"`
+		}
+		if err := json.Unmarshal(rawArgs, &in); err != nil {
+			return errPayload(err), true
+		}
+		accID := strings.TrimSpace(in.AccountID)
+		if accID == "" {
+			return errPayload(errors.New("accountId is required")), true
+		}
+		switch strings.TrimSpace(in.Action) {
+		case "", "status":
+			box, err := s.store.GetCIBox(ctx, accID)
+			if err != nil {
+				return errPayload(err), true
+			}
+			if box == nil {
+				return map[string]any{"configured": false, "hint": "no CI box setup for this account — configure one in the monitor dashboard (GitHub token + repo) first"}, false
+			}
+			return map[string]any{"configured": true, "ciBox": box}, false
+		case "start":
+			box, err := s.poller.StartCIBox(ctx, accID)
+			if err != nil {
+				return errPayload(err), true
+			}
+			return map[string]any{"ciBox": box, "hint": "job dispatched — poll with action=status until state is running and machineId is set (~70-90s), then use exec_command with that machineId"}, false
+		case "stop":
+			box, err := s.poller.StopCIBox(ctx, accID)
+			if err != nil {
+				return errPayload(err), true
+			}
+			return map[string]any{"ciBox": box, "hint": "run cancelled — the box deletes itself within ~90s, everything on it is permanently lost"}, false
+		default:
+			return errPayload(fmt.Errorf("unsupported action %q; allowed: status, start, stop", in.Action)), true
+		}
 
 	case "fork_machine":
 		var in struct {
@@ -967,6 +1005,19 @@ func buildToolDefs() []toolDef {
 					"scheduleWindows":         map[string]any{"type": "string", "description": `Daily run windows, e.g. "06:00-08:00, 11:00-12:00, 18:00-19:00" — machine is auto-started inside windows and stopped outside`},
 					"scheduleTzOffsetMin":     map[string]any{"type": "integer", "description": "Fixed UTC offset in minutes for the windows (default 420 = UTC+7)"},
 					"waitSeconds":             map[string]any{"type": "integer", "description": "Optional seconds (up to 120) to wait for lifecycle operation"},
+				},
+			},
+		},
+		{
+			Name:        "control_ci_box",
+			Description: "Read or control the account's on-demand CI box (a disposable GitHub-Actions-spawned machine used as a build/dev box). Use action=status first: it returns state, machineId when running, runUrl, and lastError. action=start dispatches the hold job (~70-90s until running — poll status until machineId appears), action=stop cancels the run and the box is permanently deleted with everything on it. Once running, drive it with exec_command/read_files/write_file using the returned machineId. File transfer to/from the box goes through the upstream instabox CLI on the operator's host (instabox cp / instabox ssh), not through this API. Boxes are ephemeral and reused across dev iterations — do NOT stop them between builds; only stop when the work session is over. A box dies on its own when its ~7h40 job budget ends.",
+			Annotations: &toolAnnotations{DestructiveHint: boolPtr(false)},
+			InputSchema: map[string]any{
+				"type":     "object",
+				"required": []string{"accountId"},
+				"properties": map[string]any{
+					"accountId": map[string]any{"type": "string", "description": "Monitor account ID that owns the ci-box setup"},
+					"action":    map[string]any{"type": "string", "enum": []string{"status", "start", "stop"}, "description": "status is read-only and the default"},
 				},
 			},
 		},

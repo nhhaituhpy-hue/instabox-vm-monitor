@@ -88,7 +88,15 @@ mcp_servers:
     enabled: true
 ```
 
-3. Run `/reload-mcp` (or `hermes mcp test instabox`). Available MCP tools: `list_fleet`, `get_account_options`, `create_machine` (with `deleteAfterSeconds`/`archiveSeconds`), `control_machine` (lifecycle + rename + resize + idle/max-run), `fork_machine`, `delete_machine` *(2-step confirmation gated)*, `exec_command`, `read_files`, `write_file`, `manage_ports`, `inspect_machine`, `manage_snapshots`, and `get_operation`.
+3. Run `/reload-mcp` (or `hermes mcp test instabox`). Available MCP tools: `list_fleet`, `get_account_options`, `create_machine` (with `deleteAfterSeconds`/`archiveSeconds`), `control_machine` (lifecycle + rename + resize + idle/max-run), `control_ci_box` (start/status/stop the disposable CI box — see below), `fork_machine`, `delete_machine` *(2-step confirmation gated)*, `exec_command`, `read_files`, `write_file`, `manage_ports`, `inspect_machine`, `manage_snapshots`, and `get_operation`.
+
+### Agent-facing CI box workflow (also embedded in the MCP server instructions)
+
+Connecting agents learn this from the server's `initialize` instructions automatically:
+
+- **Lifecycle**: `control_ci_box` with `action=start` dispatches the hold job (~70-90s to running), `action=status` returns state + machineId, `action=stop` cancels the run — the box is **permanently deleted, root and /data alike**. Nothing survives a stop.
+- **Dev-loop discipline**: start once per work session, iterate against the *same* box (repeat rounds measured at ~18s vs ~110s cold), stop only when done. Each box self-destructs at its ~7h40 job budget regardless.
+- **File transfer is not part of this API**: it uses the upstream `instabox` CLI on the operator host (`instabox cp`/`instabox ssh`, verified working on CI boxes). `scripts/ci-run.sh` chains the entire push → build/test → pull loop in one command.
 
 ## Configuration
 
