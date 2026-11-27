@@ -15,10 +15,13 @@
 # Optional env:
 #   MONITOR (default https://instabox.hainh.io.vn)
 #   ACCOUNT (monitor account id; default: the first account with a ci-box setup)
-#   WORKDIR (default /data/work), KEEP=1 to leave the box running afterwards
+#   WORKDIR (default /data/work), STOP=1 to stop the box when finished
 #
-# Flow: start ci box -> wait running -> push repo -> run command over ssh -> pull artifact -> stop box.
-# The box is always stopped on exit unless KEEP=1.
+# Flow: reuse the running box if there is one (or start it) -> push repo ->
+# run command over ssh -> pull artifact. The box STAYS ALIVE afterwards so the
+# next iteration skips the ~70s boot — pass STOP=1 to end the session, or just
+# press Stop in the dashboard. The box dies on its own when the ~7h40 job budget
+# runs out.
 
 set -euo pipefail
 
@@ -58,30 +61,35 @@ cibox_state() {
 
 MACHINE=""
 cleanup() {
-  if [ -n "$MACHINE" ] && [ "${KEEP:-0}" != "1" ]; then
-    log "stopping box (job cancel)..."
+  if [ -n "$MACHINE" ] && [ "${STOP:-0}" = "1" ]; then
+    log "STOP=1 — stopping box (job cancel)..."
     curl -sS -X POST -H "Authorization: Bearer $MONKEY" \
       "$MONITOR/api/accounts/$ACCOUNT/ci-box/stop" >/dev/null 2>&1 || true
-    log "box stopping — it deletes itself when the job ends"
   elif [ -n "$MACHINE" ]; then
-    log "KEEP=1 — box left running: $MACHINE"
+    log "box stays alive for the next iteration: $MACHINE (STOP=1 or dashboard Stop to end it)"
   fi
 }
 trap cleanup EXIT
 
-# --- 1. start the box ------------------------------------------------------------
-log "starting ci box..."
-curl -fsS -X POST -H "Authorization: Bearer $MONKEY" \
-  "$MONITOR/api/accounts/$ACCOUNT/ci-box/start" >/dev/null
+# --- 1. reuse a running box, or start one -------------------------------------------
+read -r STATE MACHINE < <(cibox_state) || true
+if [ "$STATE" = "running" ] && [ -n "$MACHINE" ]; then
+  log "reusing running box: $MACHINE (no 70s boot wait)"
+else
+  log "starting ci box..."
+  curl -fsS -X POST -H "Authorization: Bearer $MONKEY" \
+    "$MONITOR/api/accounts/$ACCOUNT/ci-box/start" >/dev/null
 
-for i in $(seq 1 20); do
-  sleep 10
-  read -r STATE MACHINE < <(cibox_state) || true
-  log "  [$((i*10))s] state=$STATE"
-  [ "$STATE" = "running" ] && break
-  [ "$STATE" = "error" ] && die "ci box entered error state"
-  [ "$i" = "20" ] && die "timed out waiting for the box (200s)"
-done
+  MACHINE=""
+  for i in $(seq 1 20); do
+    sleep 10
+    read -r STATE MACHINE < <(cibox_state) || true
+    log "  [$((i*10))s] state=$STATE"
+    [ "$STATE" = "running" ] && break
+    [ "$STATE" = "error" ] && die "ci box entered error state"
+    [ "$i" = "20" ] && die "timed out waiting for the box (200s)"
+  done
+fi
 [ -n "$MACHINE" ] || die "box is running but no machine id yet — retry in a few seconds"
 log "machine up: $MACHINE"
 

@@ -54,7 +54,7 @@ This monitor tracks the current instabox.sh API and encodes these recent upstrea
 
 ## ci-run.sh — build/test any local repo on a throwaway CI box
 
-`scripts/ci-run.sh` chains the whole loop in one command: start the CI box via the monitor API, push a local repo with `instabox cp`, run any build/test command over `instabox ssh`, pull the artifacts back into `./ci-artifacts/<timestamp>/`, and stop the box. Full pipeline measured end-to-end on this very repo: ~70s box boot, 3s push (4.8MB), ~40s `go test`+build, ~4s artifact pull.
+`scripts/ci-run.sh` chains the whole loop in one command: start the CI box via the monitor API, push a local repo with `instabox cp`, run any build/test command over `instabox ssh`, pull the artifacts back into `./ci-artifacts/<timestamp>/` — and the box **stays alive** so the next iteration skips the boot (measured: cold round ~110s including boot, repeat rounds ~18s for this repo thanks to the reuse + Go build cache). Pass `STOP=1` to end the session, or press Stop in the dashboard; the box also dies on its own when the ~7h40 job budget runs out.
 
 ```bash
 MONKEY=ibmon_... IBK=ibk_... ./scripts/ci-run.sh . \
@@ -62,7 +62,7 @@ MONKEY=ibmon_... IBK=ibk_... ./scripts/ci-run.sh . \
   /data/work/dist
 ```
 
-`MONKEY` is a monitor API key (dashboard). `IBK` is the upstream instabox API key of the box-owning account (instabox.sh dashboard → API keys). `KEEP=1` leaves the box running; artifacts land in `./ci-artifacts/`. Requires `instabox`, `jq`, `curl` on the host.
+`MONKEY` is a monitor API key (dashboard). `IBK` is the upstream instabox API key of the box-owning account (instabox.sh dashboard → API keys). artifacts land in `./ci-artifacts/`; the box is reused across runs until you pass `STOP=1`. Requires `instabox`, `jq`, `curl` on the host.
 
 ## Quick Start (Docker)
 
