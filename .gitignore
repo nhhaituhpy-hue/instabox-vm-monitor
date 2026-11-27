@@ -1,22 +1,22 @@
-# Binaries & build outputs
-bin/
-dist/
-instabox-vm-monitor
-*.exe
-*.test
-*.out
-coverage.out
 
-# Local data & secrets
+*.bak
+bin/
+# Binaries & build outputs
+ci-artifacts/
+coverage.out
 data/
+*.db
+dist/
+.DS_Store
 .env
 .env.*
 !.env.example
-*.db
-*.sqlite
-*.bak
-
-# OS & editors
-.DS_Store
-.vscode/
+*.exe
 .idea/
+instabox-vm-monitor
+# Local data & secrets
+# OS & editors
+*.out
+*.sqlite
+*.test
+.vscode/
