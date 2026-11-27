@@ -725,7 +725,7 @@ func (s *Server) handleListCIBoxes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSetupCIBox(w http.ResponseWriter, r *http.Request) {
-	accountID := r.PathValue("accountId")
+	accountID := r.PathValue("id")
 	var req struct {
 		Repo  string `json:"repo"`
 		Token string `json:"token"`
@@ -746,7 +746,7 @@ func (s *Server) handleSetupCIBox(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStartCIBox(w http.ResponseWriter, r *http.Request) {
-	accountID := r.PathValue("accountId")
+	accountID := r.PathValue("id")
 	box, err := s.poller.StartCIBox(r.Context(), accountID)
 	if err != nil {
 		s.writeCIBoxError(w, err)
@@ -756,7 +756,7 @@ func (s *Server) handleStartCIBox(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStopCIBox(w http.ResponseWriter, r *http.Request) {
-	accountID := r.PathValue("accountId")
+	accountID := r.PathValue("id")
 	box, err := s.poller.StopCIBox(r.Context(), accountID)
 	if err != nil {
 		s.writeCIBoxError(w, err)
@@ -766,7 +766,7 @@ func (s *Server) handleStopCIBox(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDeleteCIBox(w http.ResponseWriter, r *http.Request) {
-	accountID := r.PathValue("accountId")
+	accountID := r.PathValue("id")
 	if err := s.poller.DeleteCIBoxConfig(r.Context(), accountID); err != nil {
 		s.writeCIBoxError(w, err)
 		return
